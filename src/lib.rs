@@ -1,10 +1,9 @@
 //! 32-bit PowerPC user-mode interpreter.
 //!
 //! Architecture-only: register state, instruction decoder,
-//! dispatch loop, memory-bus trait. No Mac specifics, no PEF, no
-//! Toolbox — consumer crates layer those on top. Mirrors the
-//! shape of the [`m68k`](https://crates.io/crates/m68k) crate for
-//! the classic-Macintosh emulator family.
+//! dispatch loop, and memory-bus trait. No Mac-specific loader or
+//! operating-system services are built into the core; hosts layer
+//! those facilities on top.
 //!
 //! References:
 //!
@@ -710,6 +709,7 @@ impl PpcCpu {
             PpcInstr::Lwzx { ra, rb, .. }
             | PpcInstr::Lwarx { ra, rb, .. }
             | PpcInstr::Lwbrx { ra, rb, .. }
+            | PpcInstr::Lwax { ra, rb, .. }
             | PpcInstr::Lfsx { ra, rb, .. } => {
                 Self::alignment_exception(self.x_form_ea(ra, rb), 4, PpcMemoryAccess::Load)
             }
@@ -721,7 +721,8 @@ impl PpcCpu {
             PpcInstr::Stwx { ra, rb, .. }
             | PpcInstr::Stwcx { ra, rb, .. }
             | PpcInstr::Stwbrx { ra, rb, .. }
-            | PpcInstr::Stfsx { ra, rb, .. } => {
+            | PpcInstr::Stfsx { ra, rb, .. }
+            | PpcInstr::Stfiwx { ra, rb, .. } => {
                 Self::alignment_exception(self.x_form_ea(ra, rb), 4, PpcMemoryAccess::Store)
             }
             PpcInstr::Sthx { ra, rb, .. } | PpcInstr::Sthbrx { ra, rb, .. } => {
@@ -736,8 +737,19 @@ impl PpcCpu {
             PpcInstr::Lwzux { rt, ra, rb } if ra != 0 && ra != rt => {
                 Self::alignment_exception(self.update_indexed_ea(ra, rb), 4, PpcMemoryAccess::Load)
             }
+            PpcInstr::Lwaux { rt, ra, rb } if ra != 0 && ra != rt => {
+                Self::alignment_exception(self.update_indexed_ea(ra, rb), 4, PpcMemoryAccess::Load)
+            }
+            PpcInstr::Lhzux { rt, ra, rb } | PpcInstr::Lhaux { rt, ra, rb }
+                if ra != 0 && ra != rt =>
+            {
+                Self::alignment_exception(self.update_indexed_ea(ra, rb), 2, PpcMemoryAccess::Load)
+            }
             PpcInstr::Stwux { ra, rb, .. } if ra != 0 => {
                 Self::alignment_exception(self.update_indexed_ea(ra, rb), 4, PpcMemoryAccess::Store)
+            }
+            PpcInstr::Sthux { ra, rb, .. } if ra != 0 => {
+                Self::alignment_exception(self.update_indexed_ea(ra, rb), 2, PpcMemoryAccess::Store)
             }
             PpcInstr::Lfsux { ra, rb, .. } if ra != 0 => {
                 Self::alignment_exception(self.update_indexed_ea(ra, rb), 4, PpcMemoryAccess::Load)
@@ -1986,6 +1998,7 @@ impl PpcCpu {
                 | PpcInstr::Stfsux { .. }
                 | PpcInstr::Stfdx { .. }
                 | PpcInstr::Stfdux { .. }
+                | PpcInstr::Stfiwx { .. }
                 | PpcInstr::Fadd { .. }
                 | PpcInstr::Fsub { .. }
                 | PpcInstr::Fmul { .. }
@@ -3320,7 +3333,7 @@ impl PpcCpu {
     /// Run with an import-call trace. Identical to [`Self::run`]
     /// except that whenever the PC enters
     /// `[trap_base, trap_base + import_count * 4)` — the synthetic
-    /// import-trap region a host (e.g. systemless's PEF loader)
+    /// import-trap region a host PEF loader
     /// has installed — the import index is pushed onto `trace`
     /// *before* the trap instruction (typically `blr`) is fetched
     /// and executed. The CPU then continues normally, returning
@@ -3738,6 +3751,16 @@ impl PpcCpu {
             PpcInstr::Mcrf { bf, bfa } => {
                 let value = self.cr_field(bfa);
                 self.set_cr_field(bf, value);
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Mcrxr { bf } => {
+                // XER[SO, OV, CA] map positionally to CR[LT, GT, EQ]
+                // and the reserved CR[SO] bit is written as zero.
+                let value = ((self.xer >> 28) & 0x0E) as u8;
+                self.set_cr_field(bf, value);
+                // mcrxr resets the complete XER field 0 (bits 0..3),
+                // including the architecturally reserved low bit.
+                self.xer &= !0xF000_0000;
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Extsb { ra, rs, rc } => {
@@ -4728,6 +4751,26 @@ impl PpcCpu {
                 }
                 self.pc = self.pc.wrapping_add(4);
             }
+            PpcInstr::Lbzux { rt, ra, rb } => {
+                if ra == 0 || ra == rt {
+                    return Self::illegal_instruction_result(
+                        instr_word,
+                        PpcIllegalInstructionReason::InvalidForm,
+                    );
+                }
+                let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
+                match mem.read_u8(addr) {
+                    Some(v) => self.gpr[rt as usize] = u32::from(v),
+                    None => {
+                        return PpcStepResult::MemoryFault {
+                            addr,
+                            was_write: false,
+                        };
+                    }
+                }
+                self.gpr[ra as usize] = addr;
+                self.pc = self.pc.wrapping_add(4);
+            }
             PpcInstr::Lhbrx { rt, ra, rb } => {
                 let base = if ra == 0 { 0 } else { self.gpr[ra as usize] };
                 let addr = base.wrapping_add(self.gpr[rb as usize]);
@@ -4754,6 +4797,27 @@ impl PpcCpu {
                         };
                     }
                 }
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Lhzux { rt, ra, rb } => {
+                if ra == 0 || ra == rt {
+                    return Self::illegal_instruction_result(
+                        instr_word,
+                        PpcIllegalInstructionReason::InvalidForm,
+                    );
+                }
+                let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
+                let value = match mem.read_u16_be(addr) {
+                    Some(v) => v,
+                    None => {
+                        return PpcStepResult::MemoryFault {
+                            addr,
+                            was_write: false,
+                        };
+                    }
+                };
+                self.gpr[rt as usize] = u32::from(value);
+                self.gpr[ra as usize] = addr;
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Stswi { rs, ra, nb } => {
@@ -4965,6 +5029,27 @@ impl PpcCpu {
                 }
                 self.pc = self.pc.wrapping_add(4);
             }
+            PpcInstr::Sthux { rs, ra, rb } => {
+                if ra == 0 {
+                    return Self::illegal_instruction_result(
+                        instr_word,
+                        PpcIllegalInstructionReason::InvalidForm,
+                    );
+                }
+                let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
+                let value = (self.gpr[rs as usize] & 0xFFFF) as u16;
+                if self
+                    .write_u16_be_observed(mem, write_observer, addr, value)
+                    .is_none()
+                {
+                    return PpcStepResult::MemoryFault {
+                        addr,
+                        was_write: true,
+                    };
+                }
+                self.gpr[ra as usize] = addr;
+                self.pc = self.pc.wrapping_add(4);
+            }
             PpcInstr::Sthbrx { rs, ra, rb } => {
                 let base = if ra == 0 { 0 } else { self.gpr[ra as usize] };
                 let addr = base.wrapping_add(self.gpr[rb as usize]);
@@ -4994,6 +5079,61 @@ impl PpcCpu {
                 };
                 // Sign-extend halfword to 32 bits.
                 self.gpr[rt as usize] = (value as i16) as i32 as u32;
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Lwax { rt, ra, rb } => {
+                let base = if ra == 0 { 0 } else { self.gpr[ra as usize] };
+                let addr = base.wrapping_add(self.gpr[rb as usize]);
+                match mem.read_u32_be(addr) {
+                    Some(v) => self.gpr[rt as usize] = v,
+                    None => {
+                        return PpcStepResult::MemoryFault {
+                            addr,
+                            was_write: false,
+                        };
+                    }
+                }
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Lwaux { rt, ra, rb } => {
+                if ra == 0 || ra == rt {
+                    return Self::illegal_instruction_result(
+                        instr_word,
+                        PpcIllegalInstructionReason::InvalidForm,
+                    );
+                }
+                let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
+                match mem.read_u32_be(addr) {
+                    Some(v) => self.gpr[rt as usize] = v,
+                    None => {
+                        return PpcStepResult::MemoryFault {
+                            addr,
+                            was_write: false,
+                        };
+                    }
+                }
+                self.gpr[ra as usize] = addr;
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Lhaux { rt, ra, rb } => {
+                if ra == 0 || ra == rt {
+                    return Self::illegal_instruction_result(
+                        instr_word,
+                        PpcIllegalInstructionReason::InvalidForm,
+                    );
+                }
+                let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
+                let value = match mem.read_u16_be(addr) {
+                    Some(v) => v,
+                    None => {
+                        return PpcStepResult::MemoryFault {
+                            addr,
+                            was_write: false,
+                        };
+                    }
+                };
+                self.gpr[rt as usize] = (value as i16) as i32 as u32;
+                self.gpr[ra as usize] = addr;
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Lwzux { rt, ra, rb } => {
@@ -5036,6 +5176,20 @@ impl PpcCpu {
                     };
                 }
                 self.gpr[ra as usize] = addr;
+                self.pc = self.pc.wrapping_add(4);
+            }
+            PpcInstr::Stfiwx { frs, ra, rb } => {
+                let addr = self.x_form_ea(ra, rb);
+                let value = self.fpr[frs as usize] as u32;
+                if self
+                    .write_u32_be_observed(mem, write_observer, addr, value)
+                    .is_none()
+                {
+                    return PpcStepResult::MemoryFault {
+                        addr,
+                        was_write: true,
+                    };
+                }
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Mtspr { spr, rs } => {

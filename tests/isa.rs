@@ -1,10 +1,6 @@
 //! ISA-level tests for the PowerPC interpreter — every
-//! mnemonic the decoder/dispatcher recognises, plus memory
-//! bus + run loop coverage. Migrated from
-//! systemless/src/cpu/ppc/tests.rs as part of the crate
-//! split; the PEF-aware tests stay in systemless because
-//! they exercise its Mac-specific loader and RunLoaded
-//! extension trait.
+//! mnemonic the decoder/dispatcher recognises, plus memory-bus
+//! and run-loop coverage.
 
 use ppc::*;
 
@@ -6229,4 +6225,308 @@ fn step_fcmpo_writes_lt_gt_eq_like_fcmpu() {
     cpu.fpr[3] = f64::NAN.to_bits();
     cpu.step_instruction(word);
     assert_eq!(cpu.cr_field(2), 0b0001); // UNO
+}
+
+#[test]
+fn decode_remaining_32_bit_user_indexed_forms() {
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 119, false)),
+        Ok(PpcInstr::Lbzux {
+            rt: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 311, false)),
+        Ok(PpcInstr::Lhzux {
+            rt: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 341, false)),
+        Ok(PpcInstr::Lwax {
+            rt: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 373, false)),
+        Ok(PpcInstr::Lwaux {
+            rt: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 375, false)),
+        Ok(PpcInstr::Lhaux {
+            rt: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 3, 4, 5, 439, false)),
+        Ok(PpcInstr::Sthux {
+            rs: 3,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 6, 4, 5, 983, false)),
+        Ok(PpcInstr::Stfiwx {
+            frs: 6,
+            ra: 4,
+            rb: 5
+        })
+    );
+    assert_eq!(
+        decode(x_form(31, 8, 0, 0, 512, false)),
+        Ok(PpcInstr::Mcrxr { bf: 2 })
+    );
+}
+
+#[test]
+fn decode_remaining_32_bit_user_forms_reject_record_variants() {
+    for xo in [
+        23, 55, 87, 119, 151, 183, 215, 247, 279, 311, 341, 343, 373, 375, 407, 439, 533, 535, 567,
+        597, 599, 631, 661, 663, 695, 725, 727, 759, 790, 918, 983, 512,
+    ] {
+        assert_eq!(
+            decode(x_form(31, 3, 4, 5, xo, true)),
+            Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+                primary: 31,
+                secondary: xo,
+            })
+        );
+    }
+}
+
+#[test]
+fn step_lbzux_loads_and_updates_base_register() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 4;
+    let mut mem = VecMem {
+        base: 0x1004,
+        data: vec![0xAB],
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 5, 119, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.gpr[3], 0xAB);
+    assert_eq!(cpu.gpr[4], 0x1004);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_lhzux_loads_and_updates_base_register() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 2;
+    let mut mem = VecMem {
+        base: 0x1002,
+        data: 0xCAFEu16.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 5, 311, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.gpr[3], 0xCAFE);
+    assert_eq!(cpu.gpr[4], 0x1002);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_lwax_loads_word_with_zero_base_register_encoding() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[0] = 0xDEAD_BEEF;
+    cpu.gpr[5] = 0x1000;
+    let mut mem = VecMem {
+        base: 0x1000,
+        data: 0x8000_0001u32.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 0, 5, 341, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.gpr[3], 0x8000_0001);
+    assert_eq!(cpu.gpr[0], 0xDEAD_BEEF);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_lwaux_loads_word_and_updates_base_register() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 4;
+    let mut mem = VecMem {
+        base: 0x1004,
+        data: 0x1234_5678u32.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 5, 373, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.gpr[3], 0x1234_5678);
+    assert_eq!(cpu.gpr[4], 0x1004);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_lhaux_sign_extends_and_updates_base_register() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 2;
+    let mut mem = VecMem {
+        base: 0x1002,
+        data: 0xFFFEu16.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 5, 375, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.gpr[3], 0xFFFF_FFFE);
+    assert_eq!(cpu.gpr[4], 0x1002);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_sthux_stores_halfword_and_updates_base_register() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[3] = 0xAABB_CCDD;
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 2;
+    let mut mem = VecMem {
+        base: 0x1002,
+        data: vec![0; 2],
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 5, 439, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(mem.data, [0xCC, 0xDD]);
+    assert_eq!(cpu.gpr[4], 0x1002);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_mcrxr_moves_xer_flags_to_cr_and_clears_them() {
+    let mut cpu = PpcCpu::new();
+    cpu.cr = 0xAAAA_BBBB;
+    cpu.xer = 0xF000_1234;
+
+    assert_eq!(
+        cpu.step_instruction(x_form(31, 8, 0, 0, 512, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.cr_field(2), 0xE);
+    assert_eq!(cpu.cr_field(1), 0xA);
+    assert_eq!(cpu.xer, 0x0000_1234);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_stfiwx_stores_low_fpr_word_without_conversion() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 4;
+    cpu.fpr[6] = 0x1122_3344_AABB_CCDDu64;
+    let mut mem = VecMem {
+        base: 0x1004,
+        data: vec![0; 4],
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 6, 4, 5, 983, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(mem.data, [0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(cpu.pc, 4);
+}
+
+#[test]
+fn step_stfiwx_requires_floating_point_facility() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_msr_fp_available(false);
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[5] = 4;
+    let mut mem = VecMem {
+        base: 0x1004,
+        data: vec![0; 4],
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 6, 4, 5, 983, false)),
+        PpcStepResult::Exception(PpcException::FloatingPointUnavailable)
+    );
+    assert_eq!(cpu.pc, 0);
+    assert_eq!(mem.data, [0; 4]);
+}
+
+#[test]
+fn step_remaining_update_forms_reject_invalid_base_registers() {
+    let words = [
+        x_form(31, 3, 0, 5, 119, false),
+        x_form(31, 3, 3, 5, 119, false),
+        x_form(31, 3, 0, 5, 311, false),
+        x_form(31, 3, 3, 5, 375, false),
+        x_form(31, 3, 0, 5, 439, false),
+    ];
+    for word in words {
+        let mut cpu = PpcCpu::new();
+        let mut mem = VecMem {
+            base: 0,
+            data: vec![0; 16],
+        };
+        let res = cpu.step(&mut mem, word);
+        assert_illegal_instruction(res, word, PpcIllegalInstructionReason::InvalidForm);
+        assert_eq!(cpu.pc, 0);
+    }
+}
+
+#[test]
+fn step_remaining_indexed_memory_forms_enforce_alignment() {
+    let cases = [
+        (311, 2, PpcMemoryAccess::Load),
+        (341, 4, PpcMemoryAccess::Load),
+        (373, 4, PpcMemoryAccess::Load),
+        (375, 2, PpcMemoryAccess::Load),
+        (439, 2, PpcMemoryAccess::Store),
+        (983, 4, PpcMemoryAccess::Store),
+    ];
+
+    for (xo, size, access) in cases {
+        let mut cpu = PpcCpu::new();
+        cpu.pc = 0x100;
+        cpu.gpr[4] = 0x1001;
+        let mut mem = VecMem {
+            base: 0x1000,
+            data: vec![0; 8],
+        };
+        let word = x_form(31, 3, 4, 5, xo, false);
+
+        assert_eq!(
+            cpu.step(&mut mem, word),
+            PpcStepResult::Exception(PpcException::Alignment {
+                addr: 0x1001,
+                size,
+                access,
+            })
+        );
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(mem.data, vec![0; 8]);
+    }
 }

@@ -6,15 +6,13 @@
 //! instruction words.
 //!
 //! Encodings cited from *PowerPC User Instruction Set Architecture,
-//! Book I*, Version 2.01 (transcribed in
-//! `systemless-inside-macintosh-md/PowerPC_User_ISA_Book_I_v2_01.md`).
+//! Book I*, Version 2.01.
 
 /// One decoded PowerPC instruction. The decoder produces these
 /// from raw 32-bit instruction words; the dispatcher consumes them.
 ///
 /// Encodings cited from *PowerPC User Instruction Set Architecture,
-/// Book I*, Version 2.01 (transcribed in
-/// `systemless-inside-macintosh-md/PowerPC_User_ISA_Book_I_v2_01.md`).
+/// Book I*, Version 2.01.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpcInstr {
     /// `twi TO, RA, SI` — D-form, OPCD = 3. (§3.3.16)
@@ -182,6 +180,10 @@ pub enum PpcInstr {
     /// CR-field selectors (0..7); the other CR fields are
     /// untouched.
     Mcrf { bf: u8, bfa: u8 },
+    /// `mcrxr BF` — X-form, OPCD = 31, XO = 512. (§3.3.13)
+    /// Move XER[SO, OV, CA] into CR field `BF` and clear those
+    /// XER bits. The reserved low CR bit is written as zero.
+    Mcrxr { bf: u8 },
     /// `extsb RA, RS` — X-form, OPCD = 31, XO = 954. (§3.3.11)
     /// Sign-extend the low 8 bits of RS into RA. The RB slot is
     /// reserved (must be zero per spec).
@@ -750,8 +752,16 @@ pub enum PpcInstr {
     Lwarx { rt: u8, ra: u8, rb: u8 },
     /// `lbzx RT, RA, RB` — X-form, OPCD = 31, XO = 87. (§3.3.2)
     Lbzx { rt: u8, ra: u8, rb: u8 },
+    /// `lbzux RT, RA, RB` — X-form, OPCD = 31, XO = 119.
+    /// Load byte and zero with update; RA must be nonzero and
+    /// distinct from RT.
+    Lbzux { rt: u8, ra: u8, rb: u8 },
     /// `lhzx RT, RA, RB` — X-form, OPCD = 31, XO = 279. (§3.3.2)
     Lhzx { rt: u8, ra: u8, rb: u8 },
+    /// `lhzux RT, RA, RB` — X-form, OPCD = 31, XO = 311.
+    /// Load halfword and zero with update; RA must be nonzero and
+    /// distinct from RT.
+    Lhzux { rt: u8, ra: u8, rb: u8 },
     /// `lwbrx RT, RA, RB` - X-form, OPCD = 31, XO = 534.
     /// Indexed load word with byte-reversal.
     Lwbrx { rt: u8, ra: u8, rb: u8 },
@@ -808,6 +818,19 @@ pub enum PpcInstr {
     /// D-form sister `lha` but the displacement comes from RB.
     /// Sign-extends the 16-bit halfword to 32 bits.
     Lhax { rt: u8, ra: u8, rb: u8 },
+    /// `lwax RT, RA, RB` — X-form, OPCD = 31, XO = 341.
+    /// Load word algebraic indexed. In the 32-bit core the sign
+    /// extension is represented by the same 32-bit bit pattern as
+    /// the loaded word.
+    Lwax { rt: u8, ra: u8, rb: u8 },
+    /// `lwaux RT, RA, RB` — X-form, OPCD = 31, XO = 373.
+    /// Load word algebraic with update; RA must be nonzero and
+    /// distinct from RT.
+    Lwaux { rt: u8, ra: u8, rb: u8 },
+    /// `lhaux RT, RA, RB` — X-form, OPCD = 31, XO = 375.
+    /// Load halfword algebraic with update; RA must be nonzero and
+    /// distinct from RT.
+    Lhaux { rt: u8, ra: u8, rb: u8 },
     /// `lwzux RT, RA, RB` — X-form, OPCD = 31, XO = 55. (§3.3.2)
     /// Load Word and Zero with Update Indexed. Same RA=0/RA=RT
     /// invalid-form rule as `lwzu`.
@@ -815,6 +838,12 @@ pub enum PpcInstr {
     /// `stwux RS, RA, RB` — X-form, OPCD = 31, XO = 183.
     /// (§3.3.2) Store Word with Update Indexed. RA=0 invalid.
     Stwux { rs: u8, ra: u8, rb: u8 },
+    /// `sthux RS, RA, RB` — X-form, OPCD = 31, XO = 439.
+    /// Store halfword with update; RA must be nonzero.
+    Sthux { rs: u8, ra: u8, rb: u8 },
+    /// `stfiwx FRS, RA, RB` — X-form, OPCD = 31, XO = 983.
+    /// Store the low-order 32 bits of an FPR without conversion.
+    Stfiwx { frs: u8, ra: u8, rb: u8 },
 }
 
 /// PowerPC instruction decode error. Returned by [`decode`] when
@@ -1374,12 +1403,13 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 0 => Ok(PpcInstr::Cmp { bf, l, ra, rb }),
                 4 => Ok(PpcInstr::Tw { to: rt, ra, rb }),
                 20 if !rc => Ok(PpcInstr::Lwarx { rt, ra, rb }),
-                23 => Ok(PpcInstr::Lwzx { rt, ra, rb }),
+                23 if !rc => Ok(PpcInstr::Lwzx { rt, ra, rb }),
                 24 => Ok(PpcInstr::Slw { ra, rs: rt, rb, rc }),
                 26 => Ok(PpcInstr::Cntlzw { ra, rs: rt, rc }),
                 28 => Ok(PpcInstr::And { ra, rs: rt, rb, rc }),
                 32 => Ok(PpcInstr::Cmpl { bf, l, ra, rb }),
-                87 => Ok(PpcInstr::Lbzx { rt, ra, rb }),
+                87 if !rc => Ok(PpcInstr::Lbzx { rt, ra, rb }),
+                119 if !rc => Ok(PpcInstr::Lbzux { rt, ra, rb }),
                 60 => Ok(PpcInstr::Andc { ra, rs: rt, rb, rc }),
                 124 => Ok(PpcInstr::Nor { ra, rs: rt, rb, rc }),
                 284 => Ok(PpcInstr::Eqv { ra, rs: rt, rb, rc }),
@@ -1389,21 +1419,28 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 922 => Ok(PpcInstr::Extsh { ra, rs: rt, rc }),
                 954 => Ok(PpcInstr::Extsb { ra, rs: rt, rc }),
                 150 if rc => Ok(PpcInstr::Stwcx { rs: rt, ra, rb }),
-                151 => Ok(PpcInstr::Stwx { rs: rt, ra, rb }),
-                215 => Ok(PpcInstr::Stbx { rs: rt, ra, rb }),
-                247 => Ok(PpcInstr::Stbux { rs: rt, ra, rb }),
-                279 => Ok(PpcInstr::Lhzx { rt, ra, rb }),
+                151 if !rc => Ok(PpcInstr::Stwx { rs: rt, ra, rb }),
+                215 if !rc => Ok(PpcInstr::Stbx { rs: rt, ra, rb }),
+                247 if !rc => Ok(PpcInstr::Stbux { rs: rt, ra, rb }),
+                279 if !rc => Ok(PpcInstr::Lhzx { rt, ra, rb }),
+                311 if !rc => Ok(PpcInstr::Lhzux { rt, ra, rb }),
                 // lswi RT, RA, NB — NB is the 5-bit value at the
                 // RB slot (MSB=0 bits 16..20 → host bits 11..15).
                 // Reuse `rb` since the bit field is identical.
-                597 => Ok(PpcInstr::Lswi { rt, ra, nb: rb }),
-                725 => Ok(PpcInstr::Stswi { rs: rt, ra, nb: rb }),
+                597 if !rc => Ok(PpcInstr::Lswi { rt, ra, nb: rb }),
+                725 if !rc => Ok(PpcInstr::Stswi { rs: rt, ra, nb: rb }),
                 533 if !rc => Ok(PpcInstr::Lswx { rt, ra, rb }),
                 661 if !rc => Ok(PpcInstr::Stswx { rs: rt, ra, rb }),
-                407 => Ok(PpcInstr::Sthx { rs: rt, ra, rb }),
-                343 => Ok(PpcInstr::Lhax { rt, ra, rb }),
-                55 => Ok(PpcInstr::Lwzux { rt, ra, rb }),
-                183 => Ok(PpcInstr::Stwux { rs: rt, ra, rb }),
+                407 if !rc => Ok(PpcInstr::Sthx { rs: rt, ra, rb }),
+                439 if !rc => Ok(PpcInstr::Sthux { rs: rt, ra, rb }),
+                343 if !rc => Ok(PpcInstr::Lhax { rt, ra, rb }),
+                341 if !rc => Ok(PpcInstr::Lwax { rt, ra, rb }),
+                373 if !rc => Ok(PpcInstr::Lwaux { rt, ra, rb }),
+                375 if !rc => Ok(PpcInstr::Lhaux { rt, ra, rb }),
+                55 if !rc => Ok(PpcInstr::Lwzux { rt, ra, rb }),
+                183 if !rc => Ok(PpcInstr::Stwux { rs: rt, ra, rb }),
+                512 if !rc => Ok(PpcInstr::Mcrxr { bf }),
+                983 if !rc => Ok(PpcInstr::Stfiwx { frs: rt, ra, rb }),
                 534 if !rc => Ok(PpcInstr::Lwbrx { rt, ra, rb }),
                 662 if !rc => Ok(PpcInstr::Stwbrx { rs: rt, ra, rb }),
                 790 if !rc => Ok(PpcInstr::Lhbrx { rt, ra, rb }),
@@ -1555,14 +1592,14 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 // (RA|0) + RB for the non-update variants;
                 // EA = RA + RB and RA := EA for the *ux variants.
                 // PEM §4.6.2 / §4.6.3.
-                535 => Ok(PpcInstr::Lfsx { frt: rt, ra, rb }),
-                567 => Ok(PpcInstr::Lfsux { frt: rt, ra, rb }),
-                599 => Ok(PpcInstr::Lfdx { frt: rt, ra, rb }),
-                631 => Ok(PpcInstr::Lfdux { frt: rt, ra, rb }),
-                663 => Ok(PpcInstr::Stfsx { frs: rt, ra, rb }),
-                695 => Ok(PpcInstr::Stfsux { frs: rt, ra, rb }),
-                727 => Ok(PpcInstr::Stfdx { frs: rt, ra, rb }),
-                759 => Ok(PpcInstr::Stfdux { frs: rt, ra, rb }),
+                535 if !rc => Ok(PpcInstr::Lfsx { frt: rt, ra, rb }),
+                567 if !rc => Ok(PpcInstr::Lfsux { frt: rt, ra, rb }),
+                599 if !rc => Ok(PpcInstr::Lfdx { frt: rt, ra, rb }),
+                631 if !rc => Ok(PpcInstr::Lfdux { frt: rt, ra, rb }),
+                663 if !rc => Ok(PpcInstr::Stfsx { frs: rt, ra, rb }),
+                695 if !rc => Ok(PpcInstr::Stfsux { frs: rt, ra, rb }),
+                727 if !rc => Ok(PpcInstr::Stfdx { frs: rt, ra, rb }),
+                759 if !rc => Ok(PpcInstr::Stfdux { frs: rt, ra, rb }),
                 _ => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
                     primary: 31,
                     secondary: xo,

@@ -13,7 +13,7 @@ services.
 ## Features
 
 - **32-bit PowerPC state**: 32 general-purpose registers, 32 floating-point registers, CR, LR, CTR, XER, FPSCR, MSR, PC, and load/store reservation state
-- **Broad user ISA coverage**: integer arithmetic, logical and rotate operations, branches, compares, multiply/divide, byte-reversed and string memory operations, atomic reservation forms, cache hints, and common floating-point instructions
+- **Broad user ISA coverage**: integer arithmetic, logical and rotate operations, branches, compares, multiply/divide, indexed update forms, byte-reversed and string memory operations, atomic reservation forms, cache hints, XER/CR transfers, and common floating-point instructions
 - **Structured exceptions**: alignment, memory, illegal-instruction, system-call, trap, and floating-point-unavailable exits leave the faulting PC available to the host
 - **HLE-ready imports**: synthetic import ranges can return values, preserve GPR3, charge skipped guest cycles, enter native guest callbacks, halt, or raise host-import exceptions
 - **Observable execution**: optional instruction-fetch histograms and guest-write observers support coverage audits, tracing, and compatibility work
