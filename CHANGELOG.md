@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.3.0...ppc-v0.3.1) (2026-08-16)
+
+
+### Performance Improvements
+
+* cache immutable PowerPC basic blocks ([#8](https://github.com/benletchford/ppc-rs/issues/8)) ([9bb9bdb](https://github.com/benletchford/ppc-rs/commit/9bb9bdbbe8c0accedcfffb9444fa94c1cd8fd079))
+
 ## [0.3.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.2.0...ppc-v0.3.0) (2026-08-16)
 
 
