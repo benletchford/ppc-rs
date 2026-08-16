@@ -1,12 +1,8 @@
-PEF inventory fixtures generated from `systemless-games/nanosaur.sit`.
-
-Regenerate after intentional `ppc-inspect` JSON schema changes:
+These PEF inventory fixtures capture representative Classic Mac PowerPC
+application fragments. Regenerate them after intentional `ppc-inspect` JSON
+schema changes by providing local paths to the corresponding PEF files:
 
 ```sh
-tmpdir=$(mktemp -d /tmp/systemless-nanosaur-fixtures.XXXXXX)
-unar -q -o "$tmpdir" systemless-games/nanosaur.sit
-default_app=$(find "$tmpdir/nanosaur" -maxdepth 1 -type f -name 'Nanosaur*' ! -name '*2MB*' ! -name '*.pdf' -print -quit)
-low_mem_app=$(find "$tmpdir/nanosaur" -maxdepth 1 -type f -name 'Nanosaur*2MB*' -print -quit)
-cargo run --quiet --manifest-path ppc-rs/Cargo.toml --bin ppc-inspect -- --no-path "$default_app" > ppc-rs/fixtures/pef/nanosaur.json
-cargo run --quiet --manifest-path ppc-rs/Cargo.toml --bin ppc-inspect -- --no-path "$low_mem_app" > ppc-rs/fixtures/pef/nanosaur-2mb.json
+cargo run --quiet --bin ppc-inspect -- --no-path path/to/Nanosaur > fixtures/pef/nanosaur.json
+cargo run --quiet --bin ppc-inspect -- --no-path path/to/Nanosaur-2MB > fixtures/pef/nanosaur-2mb.json
 ```
