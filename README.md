@@ -211,10 +211,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Maintainers must configure the GitHub Actions publishing secret described in
-the [release setup instructions](CONTRIBUTING.md#required-github-setup) before
-merging the first release pull request.
-
 ## References
 
 - *PowerPC User Instruction Set Architecture, Book I, Version 2.01*
