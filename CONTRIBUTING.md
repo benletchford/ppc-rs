@@ -42,8 +42,7 @@ cargo package --locked
 After CI succeeds on `master`, release-please creates or updates a release pull
 request from the conventional commits since the previous release. Merging that
 pull request causes CI to run again, then release-please creates the Git tag and
-GitHub release. The tagged crate is verified and published to crates.io using
-the `CARGO_REGISTRY_TOKEN` GitHub Actions secret.
+GitHub release. The tagged crate is verified and published to crates.io.
 
 Do not edit `CHANGELOG.md`, package versions, or
 `.release-please-manifest.json` for a normal release; release-please owns those
