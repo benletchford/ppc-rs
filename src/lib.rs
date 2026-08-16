@@ -43,6 +43,17 @@ type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
 const PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES: usize = 1024;
 const PPC_CFM_IMPORT_STUB_CACHE_INDEX_MASK: usize = PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES - 1;
 type PpcCfmImportStubCacheEntry = Option<(u32, u32)>;
+const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 1024;
+const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
+const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
+
+#[derive(Debug, Clone)]
+struct PpcBasicBlockCacheEntry {
+    start_pc: u32,
+    memory_token: u64,
+    words: [u32; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
+    len: u8,
+}
 
 /// Host policy for unaligned memory accesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +374,8 @@ pub struct PpcCpu {
     decode_cache: Box<[PpcDecodeCacheEntry]>,
 
     cfm_import_stub_cache: Box<[PpcCfmImportStubCacheEntry]>,
+
+    basic_block_cache: Box<[Option<PpcBasicBlockCacheEntry>]>,
 }
 
 /// How a native import callback should finalize GPR3 when it
@@ -398,6 +411,15 @@ enum PpcFastImportStubResult {
     Stop(PpcRunResult),
 }
 
+enum PpcBasicBlockRunResult {
+    Advanced(u64),
+    Stop {
+        pc: u32,
+        completed: u64,
+        result: PpcStepResult,
+    },
+}
+
 impl Default for PpcCpu {
     fn default() -> Self {
         Self::new()
@@ -426,6 +448,7 @@ impl PpcCpu {
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             cfm_import_stub_cache: vec![None; PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES]
                 .into_boxed_slice(),
+            basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
         }
     }
 
@@ -2637,6 +2660,116 @@ impl PpcCpu {
         PpcRunResult::CycleLimit { cycles }
     }
 
+    #[inline]
+    fn basic_block_cache_index(pc: u32) -> usize {
+        ((pc >> 2) as usize) & PPC_BASIC_BLOCK_CACHE_INDEX_MASK
+    }
+
+    #[inline]
+    fn instruction_ends_basic_block(word: u32) -> bool {
+        let primary = word >> 26;
+        primary == 16
+            || primary == 17
+            || primary == 18
+            || (primary == 19 && matches!((word >> 1) & 0x03ff, 16 | 528))
+    }
+
+    #[inline]
+    fn is_import_trap(pc: u32, trap_base: u32, import_count: u32) -> bool {
+        if import_count == 0 || pc < trap_base {
+            return false;
+        }
+        let offset = pc.wrapping_sub(trap_base);
+        (offset & 3) == 0 && (offset >> 2) < import_count
+    }
+
+    fn run_cached_basic_block<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        max_cycles: u64,
+        halt_pc: u32,
+        trap_base: u32,
+        import_count: u32,
+    ) -> Option<PpcBasicBlockRunResult> {
+        let start_pc = self.pc;
+        let memory_token = mem.instruction_cache_token(start_pc)?;
+        let cache_index = Self::basic_block_cache_index(start_pc);
+        let cache_hit = self.basic_block_cache[cache_index]
+            .as_ref()
+            .is_some_and(|entry| entry.start_pc == start_pc && entry.memory_token == memory_token);
+
+        if !cache_hit {
+            let mut words = [0; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
+            let mut len = 0usize;
+            let mut pc = start_pc;
+            while len < words.len() && mem.instruction_cache_token(pc) == Some(memory_token) {
+                let Some(word) = mem.read_instruction_u32_be(pc) else {
+                    break;
+                };
+                if import_count > 0 && (word & 0xffff_0000) == 0x8182_0000 {
+                    break;
+                }
+                words[len] = word;
+                len += 1;
+                if Self::instruction_ends_basic_block(word) {
+                    break;
+                }
+                pc = pc.wrapping_add(4);
+            }
+            if len == 0 {
+                return None;
+            }
+            self.basic_block_cache[cache_index] = Some(PpcBasicBlockCacheEntry {
+                start_pc,
+                memory_token,
+                words,
+                len: len as u8,
+            });
+        }
+
+        let block_len = usize::from(self.basic_block_cache[cache_index].as_ref()?.len);
+        let mut completed = 0u64;
+        for instruction_index in 0..block_len {
+            if completed >= max_cycles {
+                break;
+            }
+            let expected_pc = start_pc.wrapping_add((instruction_index as u32).wrapping_mul(4));
+            if self.pc != expected_pc
+                || self.pc == halt_pc
+                || Self::is_import_trap(self.pc, trap_base, import_count)
+                || self
+                    .import_call_stack
+                    .last()
+                    .is_some_and(|frame| self.pc == frame.return_pc)
+            {
+                break;
+            }
+            let word = self.basic_block_cache[cache_index].as_ref()?.words[instruction_index];
+            let pc = self.pc;
+            let step_result = self
+                .step_fast_unobserved(mem, word)
+                .unwrap_or_else(|| self.step(mem, word));
+            match step_result {
+                PpcStepResult::Stepped => {
+                    completed += 1;
+                    if Self::instruction_ends_basic_block(word)
+                        || self.pc != expected_pc.wrapping_add(4)
+                    {
+                        break;
+                    }
+                }
+                result => {
+                    return Some(PpcBasicBlockRunResult::Stop {
+                        pc,
+                        completed,
+                        result,
+                    });
+                }
+            }
+        }
+        Some(PpcBasicBlockRunResult::Advanced(completed))
+    }
+
     /// Run with a per-import dispatcher. Whenever the PC enters
     /// the synthetic import-trap region
     /// `[trap_base, trap_base + import_count * 4)`, `handler` is
@@ -2833,6 +2966,47 @@ impl PpcCpu {
                     exception,
                     cycles,
                 };
+            }
+            if let Some(block_result) = self.run_cached_basic_block(
+                mem,
+                max_cycles.saturating_sub(cycles),
+                halt_pc,
+                trap_base,
+                import_count,
+            ) {
+                match block_result {
+                    PpcBasicBlockRunResult::Advanced(completed) if completed > 0 => {
+                        cycles = cycles.saturating_add(completed);
+                        continue;
+                    }
+                    PpcBasicBlockRunResult::Advanced(_) => {}
+                    PpcBasicBlockRunResult::Stop {
+                        pc,
+                        completed,
+                        result,
+                    } => {
+                        cycles = cycles.saturating_add(completed);
+                        return match result {
+                            PpcStepResult::Stepped => unreachable!(),
+                            PpcStepResult::Unimplemented(error) => {
+                                PpcRunResult::Unimplemented { pc, error, cycles }
+                            }
+                            PpcStepResult::MemoryFault { addr, was_write } => {
+                                PpcRunResult::MemoryFault {
+                                    pc,
+                                    addr,
+                                    was_write,
+                                    cycles,
+                                }
+                            }
+                            PpcStepResult::Exception(exception) => PpcRunResult::Exception {
+                                pc,
+                                exception,
+                                cycles,
+                            },
+                        };
+                    }
+                }
             }
             let word = match mem.read_instruction_u32_be(pc) {
                 Some(w) => w,
@@ -5688,10 +5862,72 @@ impl PpcCpu {
 mod tests {
     use super::*;
 
+    struct CountingImmutableMemory {
+        base: u32,
+        bytes: Vec<u8>,
+        instruction_reads: usize,
+    }
+
+    impl CountingImmutableMemory {
+        fn new(base: u32, words: &[u32]) -> Self {
+            Self {
+                base,
+                bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                instruction_reads: 0,
+            }
+        }
+    }
+
+    impl PpcMemory for CountingImmutableMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            self.bytes.get(offset).copied()
+        }
+
+        fn write_u8(&mut self, _addr: u32, _value: u8) -> Option<()> {
+            None
+        }
+
+        fn read_instruction_u32_be(&mut self, addr: u32) -> Option<u32> {
+            self.instruction_reads += 1;
+            self.read_u32_be(addr)
+        }
+
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            (self.bytes.len().saturating_sub(offset) >= 4).then_some(1)
+        }
+    }
+
     #[test]
     fn cpu_keeps_large_host_caches_off_the_stack() {
         let size = std::mem::size_of::<PpcCpu>();
         assert!(size <= 1024, "PpcCpu grew to {size} stack bytes");
+    }
+
+    #[test]
+    fn immutable_basic_block_cache_avoids_repeated_instruction_fetches() {
+        let base = 0x1000;
+        let mut memory = CountingImmutableMemory::new(
+            base,
+            &[
+                0x3863_0001,
+                0x3863_0001,
+                0x3863_0001,
+                0x3863_0001,
+                0x4bff_fff0,
+            ],
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+
+        let result = cpu.run_with_imports(&mut memory, 100, 0, 0, 0, |_, _, _| {
+            unreachable!("test program has no imports")
+        });
+
+        assert_eq!(result, PpcRunResult::CycleLimit { cycles: 100 });
+        assert_eq!(cpu.gpr[3], 80);
+        assert_eq!(memory.instruction_reads, 5);
     }
 
     #[test]
