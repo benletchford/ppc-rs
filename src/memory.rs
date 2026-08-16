@@ -78,6 +78,16 @@ pub trait PpcMemory {
         self.read_u32_be(addr)
     }
 
+    /// Return a token for an immutable executable mapping containing `addr`.
+    ///
+    /// The CPU may reuse instruction words while the token remains unchanged.
+    /// Memory implementations that can contain writable or self-modifying code
+    /// should keep the default `None` result for those addresses.
+    #[inline]
+    fn instruction_cache_token(&mut self, _addr: u32) -> Option<u64> {
+        None
+    }
+
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -132,6 +142,7 @@ pub struct PpcSectionMem {
     overlap_span_cache: [Option<(u32, u32, usize)>; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES],
     region_cache: [Option<usize>; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
     instruction_cache: Box<[Option<(u32, u32)>]>,
+    instruction_mapping_generation: u64,
     has_overlapping_regions: bool,
 }
 
@@ -174,6 +185,7 @@ impl Default for PpcSectionMem {
             region_cache: [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
             instruction_cache: vec![None; PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES]
                 .into_boxed_slice(),
+            instruction_mapping_generation: 0,
             has_overlapping_regions: false,
         }
     }
@@ -518,6 +530,7 @@ impl PpcSectionMem {
         self.overlap_span_cache = [None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES];
         self.region_cache = [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES];
         self.instruction_cache.fill(None);
+        self.instruction_mapping_generation = self.instruction_mapping_generation.wrapping_add(1);
     }
 
     #[inline]
@@ -672,6 +685,25 @@ impl PpcMemory for PpcSectionMem {
         ]);
         self.instruction_cache[slot] = Some((addr, word));
         Some(word)
+    }
+
+    #[inline]
+    fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+        let (region_index, offset) = self.locate_cached(addr)?;
+        let region = &self.regions[region_index];
+        if region.writable || region.bytes.len().saturating_sub(offset) < 4 {
+            return None;
+        }
+        if self.has_overlapping_regions {
+            let instruction_last = addr.checked_add(3)?;
+            if !matches!(
+                self.visible_region_span(region_index, addr),
+                Some((_, end, _)) if end > instruction_last
+            ) {
+                return None;
+            }
+        }
+        Some(self.instruction_mapping_generation)
     }
 
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {
