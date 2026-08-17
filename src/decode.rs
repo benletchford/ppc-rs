@@ -228,6 +228,9 @@ pub enum PpcInstr {
     /// Reads the named SPR into `RT`. Extended mnemonics
     /// `mfxer`, `mflr`, `mfctr`.
     Mfspr { rt: u8, spr: u16 },
+    /// `mftb RT, TBR` — XFX-form, OPCD = 31, XO = 371. Reads the
+    /// lower (`TBR=268`) or upper (`TBR=269`) half of the time base.
+    Mftb { rt: u8, tbr: u16 },
     /// `mfcr RT` — XFX-form, OPCD = 31, XO = 19. (§3.3.13)
     /// Move From Condition Register: copies the entire 32-bit CR
     /// into RT.
@@ -1461,14 +1464,18 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 // instr bits 16..20 (host 16..20). The encoded
                 // value swaps them to maintain compatibility
                 // with the original POWER 5-bit SPR layout.
-                339 | 467 => {
+                339 | 371 | 467 => {
                     let high_5 = ((instr >> 11) & 0x1F) as u16;
                     let low_5 = ((instr >> 16) & 0x1F) as u16;
                     let spr = (high_5 << 5) | low_5;
-                    if xo == 339 {
-                        Ok(PpcInstr::Mfspr { rt, spr })
-                    } else {
-                        Ok(PpcInstr::Mtspr { spr, rs: rt })
+                    match xo {
+                        339 => Ok(PpcInstr::Mfspr { rt, spr }),
+                        371 if matches!(spr, 268 | 269) => Ok(PpcInstr::Mftb { rt, tbr: spr }),
+                        371 => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+                            primary: opcd,
+                            secondary: xo,
+                        }),
+                        _ => Ok(PpcInstr::Mtspr { spr, rs: rt }),
                     }
                 }
                 // mfcr RT — XFX-form. RT at bits 6..10 already
