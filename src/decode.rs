@@ -710,7 +710,7 @@ pub enum PpcInstr {
     /// Floating reciprocal estimate single. The architectural result
     /// is an implementation-dependent single-precision estimate of
     /// `1 / FRB`; this interpreter returns the correctly rounded
-    /// single-precision reciprocal for deterministic game logic.
+    /// single-precision reciprocal for deterministic emulation.
     Fres { frt: u8, frb: u8, rc: bool },
     /// `frsqrte FRT, FRB` — A-form, OPCD = 63, XO = 26.
     /// Floating reciprocal square-root estimate double. The

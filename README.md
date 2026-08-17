@@ -162,7 +162,7 @@ The test suite covers:
 - read-only, writable, overlapping, cached, and cross-region memory accesses;
 - normal, observed, and import-intercepted run loops;
 - callback entry/return behavior and ABI state restoration;
-- PEF inspection CLI fixtures captured from real application fragments.
+- deterministic PEF inspection CLI output from a synthetic application fragment.
 
 Run the same local checks used by CI:
 
@@ -185,8 +185,8 @@ ppc-rs/
 │   └── bin/
 │       ├── ppc-inspect.rs
 │       └── ppc-disasm-window.rs
-├── tests/                    # ISA, runner, public API, and CLI integration tests
-└── fixtures/pef/             # Compact PEF inspection expectations
+└── tests/                    # ISA, runner, public API, and CLI integration tests
+    └── fixtures/pef/         # Synthetic PEF inspection expectations
 ```
 
 ### Key Types
