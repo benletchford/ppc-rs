@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.3.1...ppc-v0.4.0) (2026-08-17)
+
+
+### Features
+
+* implement PowerPC time-base reads ([#14](https://github.com/benletchford/ppc-rs/issues/14)) ([f2b115f](https://github.com/benletchford/ppc-rs/commit/f2b115f477155ed4f81a7e6c8e01920f99773839))
+
 ## [0.3.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.3.0...ppc-v0.3.1) (2026-08-16)
 
 
