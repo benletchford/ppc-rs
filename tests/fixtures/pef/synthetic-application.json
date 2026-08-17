@@ -1,0 +1,122 @@
+{
+  "size": 276,
+  "tag1": "Joy!",
+  "tag2": "peff",
+  "architecture": "pwpc",
+  "format_version": 1,
+  "section_count": 3,
+  "instantiated_section_count": 2,
+  "sections": [
+    {
+      "index": 0,
+      "name_offset": -1,
+      "default_address": 0,
+      "total_size": 12,
+      "unpacked_size": 12,
+      "packed_size": 12,
+      "container_offset": 256,
+      "kind": 0,
+      "kind_name": "code",
+      "share_kind": 4,
+      "alignment": 4
+    },
+    {
+      "index": 1,
+      "name_offset": -1,
+      "default_address": 0,
+      "total_size": 32,
+      "unpacked_size": 4,
+      "packed_size": 4,
+      "container_offset": 272,
+      "kind": 2,
+      "kind_name": "pattern_data",
+      "share_kind": 1,
+      "alignment": 4
+    },
+    {
+      "index": 2,
+      "name_offset": -1,
+      "default_address": 0,
+      "total_size": 0,
+      "unpacked_size": 0,
+      "packed_size": 126,
+      "container_offset": 128,
+      "kind": 4,
+      "kind_name": "loader",
+      "share_kind": 4,
+      "alignment": 4
+    }
+  ],
+  "loader": {
+    "main_section": 1,
+    "main_offset": 16,
+    "init_section": -1,
+    "init_offset": 0,
+    "term_section": -1,
+    "term_offset": 0,
+    "imported_library_count": 1,
+    "total_imported_symbol_count": 2,
+    "reloc_section_count": 1,
+    "reloc_instr_offset": 64,
+    "loader_strings_offset": 88,
+    "export_hash_offset": 0,
+    "export_hash_table_power": 0,
+    "exported_symbol_count": 0,
+    "imported_libraries": [
+      {
+        "name": "InterfaceLib",
+        "old_imp_version": 0,
+        "current_version": 0,
+        "imported_symbol_count": 2,
+        "first_imported_symbol": 0,
+        "options": 0,
+        "symbols": [
+          {
+            "index": 0,
+            "class": 2,
+            "class_name": "tvector",
+            "weak": false,
+            "name": "Gestalt"
+          },
+          {
+            "index": 1,
+            "class": 2,
+            "class_name": "tvector",
+            "weak": false,
+            "name": "GetSharedLibrary"
+          }
+        ]
+      }
+    ]
+  },
+  "code_histograms": [
+    {
+      "section_index": 0,
+      "decode": {
+        "total_words": 3,
+        "decoded_words": 2,
+        "unsupported_words": 1,
+        "unsupported_primary": {
+          "0": 1
+        },
+        "unsupported_secondary": [
+        ]
+      },
+      "primary": {
+        "0": 1,
+        "14": 1,
+        "19": 1
+      },
+      "op19_secondary": {
+        "16": 1
+      },
+      "op31_secondary": {
+      },
+      "op59_secondary": {
+      },
+      "op63_secondary": {
+      }
+    }
+  ]
+
+}

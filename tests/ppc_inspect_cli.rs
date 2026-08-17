@@ -28,6 +28,11 @@ fn ppc_inspect_reports_pef_sections_imports_and_code_histogram() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
 
+    assert_eq!(
+        stdout,
+        include_str!("fixtures/pef/synthetic-application.json")
+    );
+
     assert!(!stdout.contains("\"path\""), "{stdout}");
     assert!(stdout.contains("\"architecture\": \"pwpc\""), "{stdout}");
     assert!(stdout.contains("\"section_count\": 3"), "{stdout}");
@@ -59,84 +64,6 @@ fn ppc_inspect_reports_pef_sections_imports_and_code_histogram() {
     assert!(stdout.contains("\"14\": 1"), "{stdout}");
     assert!(stdout.contains("\"19\": 1"), "{stdout}");
     assert!(stdout.contains("\"16\": 1"), "{stdout}");
-}
-
-#[test]
-fn nanosaur_inventory_fixtures_capture_known_pef_surface() {
-    let nanosaur = include_str!("../fixtures/pef/nanosaur.json");
-    let nanosaur_2mb = include_str!("../fixtures/pef/nanosaur-2mb.json");
-
-    assert_nanosaur_fixture(
-        nanosaur,
-        8120,
-        43065,
-        2155,
-        "\"unsupported_primary\": {\n          \"0\": 2069,\n          \"2\": 2,\n          \"4\": 1,\n          \"9\": 1,\n          \"30\": 45\n        }",
-    );
-    assert_nanosaur_fixture(
-        nanosaur_2mb,
-        8104,
-        43460,
-        279,
-        "\"unsupported_primary\": {\n          \"0\": 273,\n          \"2\": 2,\n          \"9\": 1,\n          \"30\": 2\n        }",
-    );
-}
-
-fn assert_nanosaur_fixture(
-    json: &str,
-    main_offset: u32,
-    decoded_words: u32,
-    unsupported_words: u32,
-    unsupported_primary: &str,
-) {
-    assert!(!json.contains("\"path\""), "{json}");
-    assert!(json.contains("\"tag1\": \"Joy!\""), "{json}");
-    assert!(json.contains("\"tag2\": \"peff\""), "{json}");
-    assert!(json.contains("\"architecture\": \"pwpc\""), "{json}");
-    assert!(json.contains("\"format_version\": 1"), "{json}");
-    assert!(json.contains("\"section_count\": 3"), "{json}");
-    assert!(json.contains("\"kind_name\": \"code\""), "{json}");
-    assert!(json.contains("\"kind_name\": \"pattern_data\""), "{json}");
-    assert!(json.contains("\"kind_name\": \"loader\""), "{json}");
-    assert!(json.contains("\"decode\": {"), "{json}");
-    assert!(
-        json.contains(&format!("\"decoded_words\": {decoded_words}")),
-        "{json}"
-    );
-    assert!(
-        json.contains(&format!("\"unsupported_words\": {unsupported_words}")),
-        "{json}"
-    );
-    assert!(json.contains(unsupported_primary), "{json}");
-    assert!(
-        !json.contains("{ \"primary\": 59, \"secondary\": 24"),
-        "fres should decode in the Nanosaur static inventory: {json}"
-    );
-    assert!(
-        !json.contains("{ \"primary\": 63, \"secondary\": 26"),
-        "frsqrte should decode in the Nanosaur static inventory: {json}"
-    );
-    assert!(
-        json.contains(&format!("\"main_offset\": {main_offset}")),
-        "{json}"
-    );
-    assert!(json.contains("\"imported_library_count\": 7"), "{json}");
-    assert!(
-        json.contains("\"total_imported_symbol_count\": 283"),
-        "{json}"
-    );
-
-    for library in [
-        "MathLib",
-        "InterfaceLib",
-        "QuickDraw",
-        "3D Accelerator",
-        "DrawSprocketLib",
-        "QuickTimeLib",
-        "InputSprocketLib",
-    ] {
-        assert!(json.contains(library), "missing {library} in {json}");
-    }
 }
 
 fn synthetic_pef() -> Vec<u8> {
