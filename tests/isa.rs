@@ -1865,6 +1865,26 @@ fn decode_mfxer_extracts_spr_1() {
 }
 
 #[test]
+fn decode_mftb_extracts_lower_time_base_register() {
+    let word = xfx_form(31, 4, 268, 371);
+    assert_eq!(decode(word), Ok(PpcInstr::Mftb { rt: 4, tbr: 268 }));
+}
+
+#[test]
+fn step_mftb_reads_deterministic_lower_and_upper_halves() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_time_base(0x1234_5678_9abc_def0);
+
+    cpu.step_instruction(xfx_form(31, 4, 268, 371));
+    assert_eq!(cpu.gpr[4], 0x9abc_def0);
+    assert_eq!(cpu.time_base(), 0x1234_5678_9abc_def1);
+
+    cpu.step_instruction(xfx_form(31, 5, 269, 371));
+    assert_eq!(cpu.gpr[5], 0x1234_5678);
+    assert_eq!(cpu.time_base(), 0x1234_5678_9abc_def2);
+}
+
+#[test]
 fn step_mtlr_writes_lr_from_gpr() {
     // mtlr r3 with GPR3 = 0x1000 → LR = 0x1000.
     let mut cpu = PpcCpu::new();

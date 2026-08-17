@@ -367,6 +367,10 @@ pub struct PpcCpu {
 
     reservation_addr: Option<u32>,
 
+    /// Deterministic guest time base, advanced once per successfully
+    /// executed instruction.
+    time_base: u64,
+
     import_call_stack: Vec<PpcImportReturnFrame>,
 
     // These host-only caches are heap-backed so PpcCpu and every enclosing
@@ -444,6 +448,7 @@ impl PpcCpu {
             pc: 0,
             alignment_policy: PpcAlignmentPolicy::Trap,
             reservation_addr: None,
+            time_base: 0,
             import_call_stack: Vec::new(),
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             cfm_import_stub_cache: vec![None; PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES]
@@ -467,6 +472,16 @@ impl PpcCpu {
         let shift = 28 - (n as u32) * 4;
         let mask = 0x0F_u32 << shift;
         self.cr = (self.cr & !mask) | ((u32::from(value) & 0x0F) << shift);
+    }
+
+    /// Read the deterministic 64-bit guest time base.
+    pub fn time_base(&self) -> u64 {
+        self.time_base
+    }
+
+    /// Set the deterministic guest time base, for state restoration and tests.
+    pub fn set_time_base(&mut self, value: u64) {
+        self.time_base = value;
     }
 
     /// Read the 32-bit Floating-point Status and Control Register.
@@ -809,6 +824,18 @@ impl PpcCpu {
     }
 
     fn step_fast_unobserved<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        instr_word: u32,
+    ) -> Option<PpcStepResult> {
+        let result = self.step_fast_unobserved_inner(mem, instr_word);
+        if matches!(result, Some(PpcStepResult::Stepped)) {
+            self.time_base = self.time_base.wrapping_add(1);
+        }
+        result
+    }
+
+    fn step_fast_unobserved_inner<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
         instr_word: u32,
@@ -5448,6 +5475,14 @@ impl PpcCpu {
                 self.gpr[rt as usize] = value;
                 self.pc = self.pc.wrapping_add(4);
             }
+            PpcInstr::Mftb { rt, tbr } => {
+                self.gpr[rt as usize] = match tbr {
+                    268 => self.time_base as u32,
+                    269 => (self.time_base >> 32) as u32,
+                    _ => unreachable!("decoder rejects unsupported time-base registers"),
+                };
+                self.pc = self.pc.wrapping_add(4);
+            }
             PpcInstr::Lwz { rt, ra, d } => {
                 // RA=0 means literal 0 per ISA Book I §3.3.2.
                 let base = if ra == 0 { 0u32 } else { self.gpr[ra as usize] };
@@ -5854,6 +5889,7 @@ impl PpcCpu {
                 self.pc = self.pc.wrapping_add(4);
             }
         }
+        self.time_base = self.time_base.wrapping_add(1);
         PpcStepResult::Stepped
     }
 }
