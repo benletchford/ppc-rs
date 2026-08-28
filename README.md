@@ -19,7 +19,7 @@ services.
 - **Observable execution**: optional instruction-fetch histograms and guest-write observers support coverage audits, tracing, and compatibility work
 - **Host-controlled alignment**: strict architectural traps by default, with optional unaligned data-access emulation for operating systems that provide fixups
 - **Ready-made memory bus**: `PpcSectionMem` maps arbitrary read-only and writable guest regions, including deliberate overlays
-- **No runtime dependencies**: the interpreter is self-contained and written in safe Rust
+- **Deterministic software floating point**: scalar arithmetic honors FPSCR rounding and exception status without relying on the host FPU mode
 
 ## Quick Start
 

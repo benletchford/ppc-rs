@@ -260,6 +260,35 @@ fn decode_sc_and_step_surfaces_system_call_exception() {
 }
 
 #[test]
+fn malformed_fixed_form_instructions_are_illegal() {
+    let words = [
+        0x4400_0003,
+        xl_form(19, 1, 0, 150, false),
+        x_form(31, 1, 0, 0, 598, false),
+        x_form_mtfsfi(1, 2, false) | (1 << 16),
+        xfl_form_mtfsf(0x80, 3, false) | (1 << 25),
+        0x7c22_1809, // tw with reserved Rc set
+        0x7c42_1800, // cmp with reserved bit 9 set
+        0x7c60_02a7, // mfspr with reserved Rc set
+        0x7c6f_f921, // mtcrf with reserved bits set
+    ];
+
+    for word in words {
+        assert!(matches!(
+            decode(word),
+            Err(PpcDecodeError::InvalidInstructionForm { .. })
+        ));
+        let mut cpu = PpcCpu::new();
+        assert_illegal_instruction(
+            cpu.step_instruction(word),
+            word,
+            PpcIllegalInstructionReason::InvalidForm,
+        );
+        assert_eq!(cpu.pc, 0);
+    }
+}
+
+#[test]
 fn step_addi_with_ra_eq_0_treats_operand_as_literal_zero() {
     // li r3, 42  ==  addi r3, 0, 42
     // Per §3.3.8, RA=0 means literal 0, NOT GPR0.
@@ -988,9 +1017,9 @@ fn decode_cache_management_rejects_reserved_field_forms() {
         let secondary = ((word >> 1) & 0x3FF) as u16;
         assert_eq!(
             decode(word),
-            Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+            Err(PpcDecodeError::InvalidInstructionForm {
                 primary: 31,
-                secondary
+                secondary: Some(secondary),
             })
         );
     }
@@ -3077,6 +3106,62 @@ impl PpcMemoryWriteObserver for WriteObserverLog {
     }
 }
 
+struct AtomicWordMemory {
+    bytes: [u8; 4],
+    byte_writes: usize,
+    word_writes: usize,
+}
+
+impl PpcMemory for AtomicWordMemory {
+    fn read_u8(&mut self, addr: u32) -> Option<u8> {
+        self.bytes.get(addr as usize).copied()
+    }
+
+    fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+        self.byte_writes += 1;
+        *self.bytes.get_mut(addr as usize)? = value;
+        Some(())
+    }
+
+    fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
+        self.word_writes += 1;
+        let start = usize::try_from(addr).ok()?;
+        self.bytes
+            .get_mut(start..start + 4)?
+            .copy_from_slice(&value.to_be_bytes());
+        Some(())
+    }
+}
+
+#[test]
+fn observed_word_store_preserves_memory_bus_transaction_semantics() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[3] = 0xAABB_CCDD;
+    let mut mem = AtomicWordMemory {
+        bytes: [0; 4],
+        byte_writes: 0,
+        word_writes: 0,
+    };
+    let mut writes = WriteObserverLog::default();
+
+    assert_eq!(
+        cpu.step_with_write_observer(&mut mem, d_form(36, 3, 0, 0), &mut writes),
+        PpcStepResult::Stepped
+    );
+
+    assert_eq!(mem.bytes, [0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(mem.word_writes, 1);
+    assert_eq!(mem.byte_writes, 0);
+    assert_eq!(
+        writes
+            .0
+            .iter()
+            .map(|entry| (entry.4, entry.5))
+            .collect::<Vec<_>>(),
+        vec![(0, 0xAA), (1, 0xBB), (2, 0xCC), (3, 0xDD)]
+    );
+}
+
 #[test]
 fn run_with_import_observers_records_guest_store_bytes_with_context() {
     let mut mem = PpcSectionMem::new();
@@ -3965,11 +4050,13 @@ fn step_fp_arithmetic_updates_fpscr_result_flags() {
 #[test]
 fn step_fp_negative_zero_sets_fpscr_class_descriptor() {
     let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(15, true);
+    cpu.set_fpscr_field(4, 0b0101);
     cpu.fpr[5] = 0.0f64.to_bits();
     cpu.step_instruction(x_form_fp_move(63, 3, 5, 40, false));
     assert_eq!(cpu.fpr[3], (-0.0f64).to_bits());
-    assert_eq!(cpu.fpscr_field(4), 0b0010); // zero result
-    assert!(cpu.fpscr_bit(15)); // negative zero class descriptor
+    assert_eq!(cpu.fpscr_field(4), 0b0101);
+    assert!(cpu.fpscr_bit(15));
 }
 
 #[test]
@@ -3980,7 +4067,8 @@ fn step_fp_record_form_copies_fpscr_exception_summary_to_cr1() {
     cpu.fpr[5] = 2.0f64.to_bits();
     cpu.step_instruction(a_form_fp(63, 3, 4, 5, 0, 21, true));
     assert_eq!(f64::from_bits(cpu.fpr[3]), 3.0);
-    assert_eq!(cpu.cr_field(1), 0b1010);
+    // FEX and VX are derived from the sticky exception and enable bits.
+    assert_eq!(cpu.cr_field(1), 0b1000);
 }
 
 #[test]
@@ -4030,6 +4118,100 @@ fn step_fdiv_by_zero_produces_infinity() {
     cpu.step_instruction(a_form_fp(63, 3, 4, 5, 0, 18, false));
     let v = f64::from_bits(cpu.fpr[3]);
     assert!(v.is_infinite() && v.is_sign_positive());
+}
+
+#[test]
+fn step_fp_arithmetic_honors_rounding_and_sets_sticky_status() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_field(7, 2); // round toward +infinity
+    cpu.fpr[4] = 1.0f64.to_bits();
+    cpu.fpr[5] = 2.0f64.powi(-53).to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 5, 0, 21, false));
+
+    assert_eq!(cpu.fpr[3], 1.0f64.to_bits() + 1);
+    assert!(cpu.fpscr_bit(0)); // FX
+    assert!(cpu.fpscr_bit(6)); // XX
+    assert!(cpu.fpscr_bit(14)); // FI
+    assert!(cpu.fpscr_bit(13)); // FR
+}
+
+#[test]
+fn step_fp_enabled_divide_by_zero_sets_fex_summary() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(27, true); // ZE
+    cpu.fpr[4] = 1.0f64.to_bits();
+    cpu.fpr[5] = 0.0f64.to_bits();
+    cpu.fpr[3] = 123.0f64.to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 5, 0, 18, false));
+
+    assert!(cpu.fpscr_bit(0)); // FX
+    assert!(cpu.fpscr_bit(1)); // FEX
+    assert!(cpu.fpscr_bit(5)); // ZX
+    assert_eq!(cpu.fpr[3], 123.0f64.to_bits());
+    assert!(!cpu.fpscr_bit(13)); // FR
+    assert!(!cpu.fpscr_bit(14)); // FI
+}
+
+#[test]
+fn step_fp_enabled_invalid_preserves_destination_and_fprf() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(24, true); // VE
+    cpu.set_fpscr_bit(15, true);
+    cpu.set_fpscr_field(4, 0b0101);
+    cpu.fpr[3] = 123.0f64.to_bits();
+    cpu.fpr[5] = (-4.0f64).to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 0, 5, 0, 22, false));
+
+    assert_eq!(cpu.fpr[3], 123.0f64.to_bits());
+    assert_eq!(cpu.fpscr_field(4), 0b0101);
+    assert!(cpu.fpscr_bit(15));
+    assert!(!cpu.fpscr_bit(13));
+    assert!(!cpu.fpscr_bit(14));
+}
+
+#[test]
+fn step_fp_enabled_overflow_delivers_exponent_adjusted_result() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(25, true); // OE
+    cpu.fpr[4] = f64::MAX.to_bits();
+    cpu.fpr[5] = f64::MAX.to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 0, 5, 25, false));
+
+    assert!(cpu.fpscr_bit(3));
+    assert!(cpu.fpscr_bit(1));
+    assert!(f64::from_bits(cpu.fpr[3]).is_finite());
+}
+
+#[test]
+fn step_fp_enabled_exact_underflow_delivers_exponent_adjusted_result() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(26, true); // UE
+    cpu.fpr[4] = f64::MIN_POSITIVE.to_bits();
+    cpu.fpr[5] = 0.5f64.to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 0, 5, 25, false));
+
+    assert!(cpu.fpscr_bit(4));
+    assert!(cpu.fpscr_bit(1));
+    assert!(f64::from_bits(cpu.fpr[3]).is_finite());
+    assert!(f64::from_bits(cpu.fpr[3]) > 1.0);
+}
+
+#[test]
+fn step_fsqrt_negative_sets_invalid_square_root_status() {
+    let mut cpu = PpcCpu::new();
+    cpu.fpr[5] = (-4.0f64).to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 0, 5, 0, 22, false));
+
+    assert!(f64::from_bits(cpu.fpr[3]).is_nan());
+    assert!(cpu.fpscr_bit(0)); // FX
+    assert!(cpu.fpscr_bit(2)); // VX
+    assert!(cpu.fpscr_bit(22)); // VXSQRT
 }
 
 #[test]
@@ -4306,6 +4488,48 @@ fn step_fnmadd_negates_fmadd_result() {
 }
 
 #[test]
+fn step_fnmadds_negates_after_single_precision_rounding() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_field(7, 2); // round toward +infinity
+    cpu.fpr[4] = 1.0f64.to_bits();
+    cpu.fpr[5] = 1.0f64.to_bits();
+    cpu.fpr[6] = (f32::from_bits(1) as f64).to_bits();
+
+    cpu.step_instruction(a_form_fp(59, 3, 4, 6, 5, 31, false));
+
+    assert_eq!(
+        cpu.fpr[3],
+        (-(f32::from_bits(1.0f32.to_bits() + 1) as f64)).to_bits()
+    );
+}
+
+#[test]
+fn step_fnmadd_preserves_propagated_nan_sign() {
+    let mut cpu = PpcCpu::new();
+    let negative_qnan = 0xfff8_0000_0000_0123;
+    cpu.fpr[4] = negative_qnan;
+    cpu.fpr[5] = 1.0f64.to_bits();
+    cpu.fpr[6] = 1.0f64.to_bits();
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 6, 5, 31, false));
+
+    assert_eq!(cpu.fpr[3], negative_qnan);
+}
+
+#[test]
+fn step_fmadd_records_all_invalid_causes() {
+    let mut cpu = PpcCpu::new();
+    cpu.fpr[4] = f64::INFINITY.to_bits();
+    cpu.fpr[5] = 0.0f64.to_bits();
+    cpu.fpr[6] = 0x7ff0_0000_0000_0001; // signaling NaN
+
+    cpu.step_instruction(a_form_fp(63, 3, 4, 6, 5, 29, false));
+
+    assert!(cpu.fpscr_bit(7)); // VXSNAN
+    assert!(cpu.fpscr_bit(11)); // VXIMZ
+}
+
+#[test]
 fn step_fnmsub_negates_fmsub_result() {
     let mut cpu = PpcCpu::new();
     cpu.fpr[4] = 2.0f64.to_bits();
@@ -4342,6 +4566,19 @@ fn step_fctiwz_truncates_toward_zero() {
     cpu.fpr[5] = (-3.7f64).to_bits();
     cpu.step_instruction(x_form_fp_move(63, 3, 5, 15, false));
     assert_eq!(cpu.fpr[3] as u32 as i32, -3);
+}
+
+#[test]
+fn step_fctiw_enabled_invalid_preserves_destination() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(24, true); // VE
+    cpu.fpr[3] = 0xdead_beef_cafe_babe;
+    cpu.fpr[5] = f64::NAN.to_bits();
+
+    cpu.step_instruction(x_form_fp_move(63, 3, 5, 14, false));
+
+    assert_eq!(cpu.fpr[3], 0xdead_beef_cafe_babe);
+    assert!(cpu.fpscr_bit(23)); // VXCVI
 }
 
 #[test]
@@ -4506,7 +4743,7 @@ fn step_frsqrte_returns_double_precision_reciprocal_sqrt() {
     let result = f64::from_bits(cpu.fpr[3]);
     assert_eq!(result, 0.5);
     assert_eq!(cpu.fpscr_field(4), 0b0100);
-    assert_eq!(cpu.cr_field(1), 0b0101);
+    assert_eq!(cpu.cr_field(1), 0b0001);
 }
 
 #[test]
@@ -4674,17 +4911,50 @@ fn step_mcrfs_copies_fpscr_field_to_cr_field() {
 }
 
 #[test]
+fn step_mcrfs_copies_then_clears_selected_exception_status() {
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(4, true); // UX
+    cpu.set_fpscr_bit(5, true); // ZX
+    cpu.set_fpscr_bit(6, true); // XX
+    cpu.set_fpscr_bit(7, true); // VXSNAN
+
+    cpu.step_instruction(x_form_mcrfs(2, 1));
+
+    assert_eq!(cpu.cr_field(2), 0xF);
+    for bit in 4..=7 {
+        assert!(!cpu.fpscr_bit(bit));
+    }
+    assert!(!cpu.fpscr_bit(2)); // derived VX
+}
+
+#[test]
+fn step_mcrfs_field_five_clears_extended_invalid_status() {
+    let mut cpu = PpcCpu::new();
+    for bit in 21..=23 {
+        cpu.set_fpscr_bit(bit, true);
+    }
+
+    cpu.step_instruction(x_form_mcrfs(2, 5));
+
+    assert_eq!(cpu.cr_field(2), 0b0111);
+    for bit in 21..=23 {
+        assert!(!cpu.fpscr_bit(bit));
+    }
+    assert!(!cpu.fpscr_bit(2));
+}
+
+#[test]
 fn step_mtfsb1_mtfsb0_modify_fpscr_bits_and_record_cr1() {
     let mut cpu = PpcCpu::new();
     cpu.step_instruction(x_form_fpscr_bit(38, 3, true));
     assert!(cpu.fpscr_bit(3));
-    assert_eq!(cpu.fpscr_field(0), 0b0001);
-    assert_eq!(cpu.cr_field(1), 0b0001);
+    assert_eq!(cpu.fpscr_field(0), 0b1001);
+    assert_eq!(cpu.cr_field(1), 0b1001);
 
     cpu.step_instruction(x_form_fpscr_bit(70, 3, true));
     assert!(!cpu.fpscr_bit(3));
-    assert_eq!(cpu.fpscr_field(0), 0);
-    assert_eq!(cpu.cr_field(1), 0);
+    assert_eq!(cpu.fpscr_field(0), 0b1000);
+    assert_eq!(cpu.cr_field(1), 0b1000);
 }
 
 #[test]
@@ -4695,8 +4965,8 @@ fn step_mtfsfi_writes_fpscr_field_and_record_cr1() {
     assert_eq!(cpu.fpscr_field(7), 1);
 
     cpu.step_instruction(x_form_mtfsfi(0, 0b1100, true));
-    assert_eq!(cpu.fpscr_field(0), 0b1100);
-    assert_eq!(cpu.cr_field(1), 0b1100);
+    assert_eq!(cpu.fpscr_field(0), 0b1110);
+    assert_eq!(cpu.cr_field(1), 0b1110);
 }
 
 #[test]
@@ -4707,7 +4977,7 @@ fn step_mtfsf_updates_selected_fpscr_fields_from_low_fpr_half() {
 
     cpu.step_instruction(xfl_form_mtfsf(0x91, 5, false));
 
-    assert_eq!(cpu.fpscr(), 0x1FF4_FFF8);
+    assert_eq!(cpu.fpscr(), 0x7FF4_FFF8);
 }
 
 #[test]
@@ -4718,8 +4988,8 @@ fn step_mtfsf_record_form_copies_new_exception_summary_to_cr1() {
 
     cpu.step_instruction(xfl_form_mtfsf(0x80, 5, true));
 
-    assert_eq!(cpu.fpscr_field(0), 0xA);
-    assert_eq!(cpu.cr_field(1), 0xA);
+    assert_eq!(cpu.fpscr_field(0), 0x8);
+    assert_eq!(cpu.cr_field(1), 0x8);
 }
 
 #[test]
@@ -5154,9 +5424,9 @@ fn decode_byte_reversed_indexed_memory_rejects_record_forms() {
         let secondary = ((word >> 1) & 0x3FF) as u16;
         assert_eq!(
             decode(word),
-            Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+            Err(PpcDecodeError::InvalidInstructionForm {
                 primary: 31,
-                secondary
+                secondary: Some(secondary),
             })
         );
     }
@@ -5252,6 +5522,32 @@ fn step_lwarx_then_stwcx_success_writes_word_and_sets_eq() {
     assert_eq!(&mem.data[4..8], &[0x12, 0x34, 0x56, 0x78]);
     assert_eq!(cpu.cr_field(0), 0b0011);
     assert_eq!(cpu.pc, 8);
+}
+
+#[test]
+fn external_reservation_invalidation_makes_stwcx_fail() {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[4] = 0x1000;
+    cpu.gpr[6] = 0x1234_5678;
+    let mut mem = VecMem {
+        base: 0x1000,
+        data: 0xCAFE_BABEu32.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 3, 4, 0, 20, false)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(cpu.reservation_address(), Some(0x1000));
+    cpu.invalidate_reservation();
+    assert_eq!(cpu.reservation_address(), None);
+
+    assert_eq!(
+        cpu.step(&mut mem, x_form(31, 6, 4, 0, 150, true)),
+        PpcStepResult::Stepped
+    );
+    assert_eq!(mem.read_u32_be(0x1000), Some(0xCAFE_BABE));
+    assert_eq!(cpu.cr_field(0) & 0b0010, 0);
 }
 
 #[test]
@@ -5853,6 +6149,16 @@ fn ppc_section_mem_write_bytes_rejects_readonly_ranges_without_partial_writes() 
 }
 
 #[test]
+fn ppc_section_mem_word_write_rejects_readonly_ranges_without_partial_writes() {
+    let mut mem = PpcSectionMem::new();
+    mem.add_region(0x1000, vec![0xAA, 0xBB]);
+    mem.add_readonly_region(0x1002, vec![0xCC, 0xDD]);
+
+    assert_eq!(mem.write_u32_be(0x1000, 0x1122_3344), None);
+    assert_eq!(mem.read_u32_be(0x1000), Some(0xAABB_CCDD));
+}
+
+#[test]
 fn ppc_section_mem_writable_span_reads_and_writes_with_cached_offsets() {
     let mut mem = PpcSectionMem::new();
     mem.add_region(0x1000, vec![0xAA, 0xBB, 0xCC, 0xDD]);
@@ -5980,16 +6286,16 @@ fn decode_lswx_stswx_extract_x_form_fields() {
 fn decode_lswx_stswx_reject_record_forms() {
     assert_eq!(
         decode(x_form(31, 5, 3, 7, 533, true)),
-        Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+        Err(PpcDecodeError::InvalidInstructionForm {
             primary: 31,
-            secondary: 533
+            secondary: Some(533),
         })
     );
     assert_eq!(
         decode(x_form(31, 6, 4, 8, 661, true)),
-        Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+        Err(PpcDecodeError::InvalidInstructionForm {
             primary: 31,
-            secondary: 661
+            secondary: Some(661),
         })
     );
 }
@@ -6248,6 +6554,35 @@ fn step_fcmpo_writes_lt_gt_eq_like_fcmpu() {
 }
 
 #[test]
+fn step_fcmpo_preserves_c_fr_fi_and_honors_ve_for_signaling_nan() {
+    let word = (63u32 << 26) | (2u32 << 23) | (3u32 << 16) | (4u32 << 11) | (32u32 << 1);
+    let mut cpu = PpcCpu::new();
+    cpu.set_fpscr_bit(13, true);
+    cpu.set_fpscr_bit(14, true);
+    cpu.set_fpscr_bit(15, true);
+    cpu.set_fpscr_bit(24, true); // VE
+    cpu.fpr[3] = 0x7ff0_0000_0000_0001;
+    cpu.fpr[4] = 1.0f64.to_bits();
+
+    cpu.step_instruction(word);
+
+    assert_eq!(cpu.cr_field(2), 0b0001);
+    assert_eq!(cpu.fpscr_field(4), 0b0001);
+    assert!(cpu.fpscr_bit(13));
+    assert!(cpu.fpscr_bit(14));
+    assert!(cpu.fpscr_bit(15));
+    assert!(cpu.fpscr_bit(7));
+    assert!(!cpu.fpscr_bit(12));
+
+    let mut disabled = PpcCpu::new();
+    disabled.fpr[3] = 0x7ff0_0000_0000_0001;
+    disabled.fpr[4] = 1.0f64.to_bits();
+    disabled.step_instruction(word);
+    assert!(disabled.fpscr_bit(7));
+    assert!(disabled.fpscr_bit(12));
+}
+
+#[test]
 fn decode_remaining_32_bit_user_indexed_forms() {
     assert_eq!(
         decode(x_form(31, 3, 4, 5, 119, false)),
@@ -6265,22 +6600,15 @@ fn decode_remaining_32_bit_user_indexed_forms() {
             rb: 5
         })
     );
-    assert_eq!(
-        decode(x_form(31, 3, 4, 5, 341, false)),
-        Ok(PpcInstr::Lwax {
-            rt: 3,
-            ra: 4,
-            rb: 5
-        })
-    );
-    assert_eq!(
-        decode(x_form(31, 3, 4, 5, 373, false)),
-        Ok(PpcInstr::Lwaux {
-            rt: 3,
-            ra: 4,
-            rb: 5
-        })
-    );
+    for xo in [341, 373] {
+        assert_eq!(
+            decode(x_form(31, 3, 4, 5, xo, false)),
+            Err(PpcDecodeError::InvalidInstructionForm {
+                primary: 31,
+                secondary: Some(xo),
+            })
+        );
+    }
     assert_eq!(
         decode(x_form(31, 3, 4, 5, 375, false)),
         Ok(PpcInstr::Lhaux {
@@ -6319,9 +6647,9 @@ fn decode_remaining_32_bit_user_forms_reject_record_variants() {
     ] {
         assert_eq!(
             decode(x_form(31, 3, 4, 5, xo, true)),
-            Err(PpcDecodeError::UnsupportedSecondaryOpcode {
+            Err(PpcDecodeError::InvalidInstructionForm {
                 primary: 31,
-                secondary: xo,
+                secondary: Some(xo),
             })
         );
     }
@@ -6366,7 +6694,7 @@ fn step_lhzux_loads_and_updates_base_register() {
 }
 
 #[test]
-fn step_lwax_loads_word_with_zero_base_register_encoding() {
+fn step_lwax_is_illegal_in_32_bit_mode() {
     let mut cpu = PpcCpu::new();
     cpu.gpr[0] = 0xDEAD_BEEF;
     cpu.gpr[5] = 0x1000;
@@ -6375,17 +6703,19 @@ fn step_lwax_loads_word_with_zero_base_register_encoding() {
         data: 0x8000_0001u32.to_be_bytes().to_vec(),
     };
 
-    assert_eq!(
-        cpu.step(&mut mem, x_form(31, 3, 0, 5, 341, false)),
-        PpcStepResult::Stepped
+    let word = x_form(31, 3, 0, 5, 341, false);
+    assert_illegal_instruction(
+        cpu.step(&mut mem, word),
+        word,
+        PpcIllegalInstructionReason::InvalidForm,
     );
-    assert_eq!(cpu.gpr[3], 0x8000_0001);
+    assert_eq!(cpu.gpr[3], 0);
     assert_eq!(cpu.gpr[0], 0xDEAD_BEEF);
-    assert_eq!(cpu.pc, 4);
+    assert_eq!(cpu.pc, 0);
 }
 
 #[test]
-fn step_lwaux_loads_word_and_updates_base_register() {
+fn step_lwaux_is_illegal_in_32_bit_mode() {
     let mut cpu = PpcCpu::new();
     cpu.gpr[4] = 0x1000;
     cpu.gpr[5] = 4;
@@ -6394,13 +6724,15 @@ fn step_lwaux_loads_word_and_updates_base_register() {
         data: 0x1234_5678u32.to_be_bytes().to_vec(),
     };
 
-    assert_eq!(
-        cpu.step(&mut mem, x_form(31, 3, 4, 5, 373, false)),
-        PpcStepResult::Stepped
+    let word = x_form(31, 3, 4, 5, 373, false);
+    assert_illegal_instruction(
+        cpu.step(&mut mem, word),
+        word,
+        PpcIllegalInstructionReason::InvalidForm,
     );
-    assert_eq!(cpu.gpr[3], 0x1234_5678);
-    assert_eq!(cpu.gpr[4], 0x1004);
-    assert_eq!(cpu.pc, 4);
+    assert_eq!(cpu.gpr[3], 0);
+    assert_eq!(cpu.gpr[4], 0x1000);
+    assert_eq!(cpu.pc, 0);
 }
 
 #[test]
@@ -6521,8 +6853,6 @@ fn step_remaining_update_forms_reject_invalid_base_registers() {
 fn step_remaining_indexed_memory_forms_enforce_alignment() {
     let cases = [
         (311, 2, PpcMemoryAccess::Load),
-        (341, 4, PpcMemoryAccess::Load),
-        (373, 4, PpcMemoryAccess::Load),
         (375, 2, PpcMemoryAccess::Load),
         (439, 2, PpcMemoryAccess::Store),
         (983, 4, PpcMemoryAccess::Store),

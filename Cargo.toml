@@ -23,3 +23,5 @@ exclude = [
 ]
 
 [dependencies]
+ieee-apsqrt = "0.1.1"
+rustc_apfloat = "0.2.3"

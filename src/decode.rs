@@ -862,6 +862,10 @@ pub enum PpcDecodeError {
     /// but the secondary opcode is not yet implemented. The
     /// `(primary, secondary)` pair is preserved for diagnostics.
     UnsupportedSecondaryOpcode { primary: u8, secondary: u16 },
+    /// The opcode is implemented, but one or more reserved fields
+    /// contain a nonzero value or the form is unavailable in a
+    /// 32-bit implementation.
+    InvalidInstructionForm { primary: u8, secondary: Option<u16> },
 }
 
 /// Decode a single 32-bit PowerPC instruction word. Caller
@@ -890,6 +894,11 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
     // MSB=0 → host 21) for compares.
     let bf = ((instr >> 23) & 0x07) as u8;
     let l = ((instr >> 21) & 1) != 0;
+
+    let invalid = |secondary| PpcDecodeError::InvalidInstructionForm {
+        primary: opcd,
+        secondary,
+    };
 
     match opcd {
         3 => Ok(PpcInstr::Twi {
@@ -962,9 +971,16 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 lk,
             })
         }
-        17 => Ok(PpcInstr::Sc {
-            lev: ((instr >> 5) & 0x7F) as u8,
-        }),
+        17 => {
+            let variable_mask = 0xFC00_0000 | (0x7F << 5) | 0x2;
+            if (instr & !variable_mask) != 0 || (instr & 0x2) == 0 {
+                Err(invalid(None))
+            } else {
+                Ok(PpcInstr::Sc {
+                    lev: ((instr >> 5) & 0x7F) as u8,
+                })
+            }
+        }
         // I-form `b` / `bl` / `ba` / `bla`. LI is a 24-bit signed
         // value at MSB=0 bits 6..29; concatenated with 0b00 it
         // yields a 26-bit signed PC-relative or absolute target.
@@ -1009,21 +1025,24 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 // 6..8 and BFA in bits 11..13 (3 bits each, MSB=0).
                 // Reuse the bf field already extracted at the top
                 // of decode().
-                0 => {
+                0 if (instr & 0x0063_F801) == 0 => {
                     let bfa = ((instr >> 18) & 0x7) as u8;
                     Ok(PpcInstr::Mcrf { bf, bfa })
                 }
-                16 => Ok(PpcInstr::Bclr { bo, bi, lk }),
-                150 => Ok(PpcInstr::Isync),
-                33 => Ok(PpcInstr::Crnor { bt, ba, bb }),
-                129 => Ok(PpcInstr::Crandc { bt, ba, bb }),
-                193 => Ok(PpcInstr::Crxor { bt, ba, bb }),
-                225 => Ok(PpcInstr::Crnand { bt, ba, bb }),
-                257 => Ok(PpcInstr::Crand { bt, ba, bb }),
-                289 => Ok(PpcInstr::Creqv { bt, ba, bb }),
-                417 => Ok(PpcInstr::Crorc { bt, ba, bb }),
-                449 => Ok(PpcInstr::Cror { bt, ba, bb }),
-                528 => Ok(PpcInstr::Bcctr { bo, bi, lk }),
+                16 if (instr & 0x0000_E000) == 0 => Ok(PpcInstr::Bclr { bo, bi, lk }),
+                150 if (instr & 0x03FF_F801) == 0 => Ok(PpcInstr::Isync),
+                33 if !lk => Ok(PpcInstr::Crnor { bt, ba, bb }),
+                129 if !lk => Ok(PpcInstr::Crandc { bt, ba, bb }),
+                193 if !lk => Ok(PpcInstr::Crxor { bt, ba, bb }),
+                225 if !lk => Ok(PpcInstr::Crnand { bt, ba, bb }),
+                257 if !lk => Ok(PpcInstr::Crand { bt, ba, bb }),
+                289 if !lk => Ok(PpcInstr::Creqv { bt, ba, bb }),
+                417 if !lk => Ok(PpcInstr::Crorc { bt, ba, bb }),
+                449 if !lk => Ok(PpcInstr::Cror { bt, ba, bb }),
+                528 if (instr & 0x0000_E000) == 0 => Ok(PpcInstr::Bcctr { bo, bi, lk }),
+                0 | 16 | 33 | 129 | 150 | 193 | 225 | 257 | 289 | 417 | 449 | 528 => {
+                    Err(invalid(Some(xo)))
+                }
                 _ => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
                     primary: 19,
                     secondary: xo,
@@ -1239,12 +1258,12 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
             let frb = rb;
             let frc = ((instr >> 6) & 0x1F) as u8;
             match xo_5 {
-                18 => Ok(PpcInstr::Fdivs { frt, fra, frb, rc }),
-                20 => Ok(PpcInstr::Fsubs { frt, fra, frb, rc }),
-                21 => Ok(PpcInstr::Fadds { frt, fra, frb, rc }),
-                22 => Ok(PpcInstr::Fsqrts { frt, frb, rc }),
-                24 => Ok(PpcInstr::Fres { frt, frb, rc }),
-                25 => Ok(PpcInstr::Fmuls { frt, fra, frc, rc }),
+                18 if frc == 0 => Ok(PpcInstr::Fdivs { frt, fra, frb, rc }),
+                20 if frc == 0 => Ok(PpcInstr::Fsubs { frt, fra, frb, rc }),
+                21 if frc == 0 => Ok(PpcInstr::Fadds { frt, fra, frb, rc }),
+                22 if fra == 0 && frc == 0 => Ok(PpcInstr::Fsqrts { frt, frb, rc }),
+                24 if fra == 0 && frc == 0 => Ok(PpcInstr::Fres { frt, frb, rc }),
+                25 if frb == 0 => Ok(PpcInstr::Fmuls { frt, fra, frc, rc }),
                 28 => Ok(PpcInstr::Fmsubs {
                     frt,
                     fra,
@@ -1273,6 +1292,7 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                     frb,
                     rc,
                 }),
+                18 | 20 | 21 | 22 | 24 | 25 => Err(invalid(Some(u16::from(xo_5)))),
                 _ => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
                     primary: 59,
                     secondary: u16::from(xo_5),
@@ -1295,10 +1315,10 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
             let frb = rb;
             let frc = ((instr >> 6) & 0x1F) as u8;
             match xo_5 {
-                18 => return Ok(PpcInstr::Fdiv { frt, fra, frb, rc }),
-                20 => return Ok(PpcInstr::Fsub { frt, fra, frb, rc }),
-                21 => return Ok(PpcInstr::Fadd { frt, fra, frb, rc }),
-                22 => return Ok(PpcInstr::Fsqrt { frt, frb, rc }),
+                18 if frc == 0 => return Ok(PpcInstr::Fdiv { frt, fra, frb, rc }),
+                20 if frc == 0 => return Ok(PpcInstr::Fsub { frt, fra, frb, rc }),
+                21 if frc == 0 => return Ok(PpcInstr::Fadd { frt, fra, frb, rc }),
+                22 if fra == 0 && frc == 0 => return Ok(PpcInstr::Fsqrt { frt, frb, rc }),
                 23 => {
                     return Ok(PpcInstr::Fsel {
                         frt,
@@ -1308,8 +1328,8 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                         rc,
                     });
                 }
-                25 => return Ok(PpcInstr::Fmul { frt, fra, frc, rc }),
-                26 => return Ok(PpcInstr::Frsqrte { frt, frb, rc }),
+                25 if frb == 0 => return Ok(PpcInstr::Fmul { frt, fra, frc, rc }),
+                26 if fra == 0 && frc == 0 => return Ok(PpcInstr::Frsqrte { frt, frb, rc }),
                 28 => {
                     return Ok(PpcInstr::Fmsub {
                         frt,
@@ -1346,44 +1366,52 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                         rc,
                     });
                 }
+                18 | 20 | 21 | 22 | 25 | 26 => {
+                    return Err(invalid(Some(u16::from(xo_5))));
+                }
                 _ => {}
             }
             // X-form 10-bit XO fall-through.
             let xo_10 = ((instr >> 1) & 0x3FF) as u16;
             match xo_10 {
-                0 => {
+                0 if (rt & 0x3) == 0 && !rc => {
                     // fcmpu — BF lives in the bf slot, FRA/FRB
                     // in the X-form RA/RB slots.
                     Ok(PpcInstr::Fcmpu { bf, fra, frb })
                 }
-                32 => Ok(PpcInstr::Fcmpo { bf, fra, frb }),
-                12 => Ok(PpcInstr::Frsp { frt, frb, rc }),
-                14 => Ok(PpcInstr::Fctiw { frt, frb, rc }),
-                15 => Ok(PpcInstr::Fctiwz { frt, frb, rc }),
-                38 => Ok(PpcInstr::Mtfsb1 { bt: frt, rc }),
-                40 => Ok(PpcInstr::Fneg { frt, frb, rc }),
-                64 => Ok(PpcInstr::Mcrfs {
-                    bf,
-                    bfa: ((instr >> 18) & 0x07) as u8,
-                }),
-                70 => Ok(PpcInstr::Mtfsb0 { bt: frt, rc }),
-                72 => Ok(PpcInstr::Fmr { frt, frb, rc }),
-                134 => Ok(PpcInstr::Mtfsfi {
+                32 if (rt & 0x3) == 0 && !rc => Ok(PpcInstr::Fcmpo { bf, fra, frb }),
+                12 if fra == 0 => Ok(PpcInstr::Frsp { frt, frb, rc }),
+                14 if fra == 0 => Ok(PpcInstr::Fctiw { frt, frb, rc }),
+                15 if fra == 0 => Ok(PpcInstr::Fctiwz { frt, frb, rc }),
+                38 if fra == 0 && frb == 0 => Ok(PpcInstr::Mtfsb1 { bt: frt, rc }),
+                40 if fra == 0 => Ok(PpcInstr::Fneg { frt, frb, rc }),
+                64 if (rt & 0x3) == 0 && (ra & 0x3) == 0 && frb == 0 && !rc => {
+                    Ok(PpcInstr::Mcrfs {
+                        bf,
+                        bfa: ((instr >> 18) & 0x07) as u8,
+                    })
+                }
+                70 if fra == 0 && frb == 0 => Ok(PpcInstr::Mtfsb0 { bt: frt, rc }),
+                72 if fra == 0 => Ok(PpcInstr::Fmr { frt, frb, rc }),
+                134 if (instr & 0x007F_0800) == 0 => Ok(PpcInstr::Mtfsfi {
                     bf,
                     u: ((instr >> 12) & 0x0F) as u8,
                     rc,
                 }),
-                136 => Ok(PpcInstr::Fnabs { frt, frb, rc }),
-                264 => Ok(PpcInstr::Fabs { frt, frb, rc }),
+                136 if fra == 0 => Ok(PpcInstr::Fnabs { frt, frb, rc }),
+                264 if fra == 0 => Ok(PpcInstr::Fabs { frt, frb, rc }),
                 // Move From FPSCR — Power ISA Book I §4.6.7. Copies
                 // the 32-bit FPSCR into the low 32 bits of FRT;
                 // high 32 bits are undefined per the spec.
-                583 => Ok(PpcInstr::Mffs { frt, rc }),
-                711 => Ok(PpcInstr::Mtfsf {
+                583 if fra == 0 && frb == 0 => Ok(PpcInstr::Mffs { frt, rc }),
+                711 if (instr & 0x0201_0000) == 0 => Ok(PpcInstr::Mtfsf {
                     flm: ((instr >> 17) & 0xFF) as u8,
                     frb,
                     rc,
                 }),
+                0 | 12 | 14 | 15 | 32 | 38 | 40 | 64 | 70 | 72 | 134 | 136 | 264 | 583 | 711 => {
+                    Err(invalid(Some(xo_10)))
+                }
                 _ => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
                     primary: 63,
                     secondary: xo_10,
@@ -1403,14 +1431,14 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
             let xo = ((instr >> 1) & 0x3FF) as u16;
             let rc = (instr & 1) != 0;
             match xo {
-                0 => Ok(PpcInstr::Cmp { bf, l, ra, rb }),
-                4 => Ok(PpcInstr::Tw { to: rt, ra, rb }),
+                0 if !rc && (rt & 0x02) == 0 => Ok(PpcInstr::Cmp { bf, l, ra, rb }),
+                4 if !rc => Ok(PpcInstr::Tw { to: rt, ra, rb }),
                 20 if !rc => Ok(PpcInstr::Lwarx { rt, ra, rb }),
                 23 if !rc => Ok(PpcInstr::Lwzx { rt, ra, rb }),
                 24 => Ok(PpcInstr::Slw { ra, rs: rt, rb, rc }),
-                26 => Ok(PpcInstr::Cntlzw { ra, rs: rt, rc }),
+                26 if rb == 0 => Ok(PpcInstr::Cntlzw { ra, rs: rt, rc }),
                 28 => Ok(PpcInstr::And { ra, rs: rt, rb, rc }),
-                32 => Ok(PpcInstr::Cmpl { bf, l, ra, rb }),
+                32 if !rc && (rt & 0x02) == 0 => Ok(PpcInstr::Cmpl { bf, l, ra, rb }),
                 87 if !rc => Ok(PpcInstr::Lbzx { rt, ra, rb }),
                 119 if !rc => Ok(PpcInstr::Lbzux { rt, ra, rb }),
                 60 => Ok(PpcInstr::Andc { ra, rs: rt, rb, rc }),
@@ -1419,8 +1447,8 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 316 => Ok(PpcInstr::Xor { ra, rs: rt, rb, rc }),
                 412 => Ok(PpcInstr::Orc { ra, rs: rt, rb, rc }),
                 476 => Ok(PpcInstr::Nand { ra, rs: rt, rb, rc }),
-                922 => Ok(PpcInstr::Extsh { ra, rs: rt, rc }),
-                954 => Ok(PpcInstr::Extsb { ra, rs: rt, rc }),
+                922 if rb == 0 => Ok(PpcInstr::Extsh { ra, rs: rt, rc }),
+                954 if rb == 0 => Ok(PpcInstr::Extsb { ra, rs: rt, rc }),
                 150 if rc => Ok(PpcInstr::Stwcx { rs: rt, ra, rb }),
                 151 if !rc => Ok(PpcInstr::Stwx { rs: rt, ra, rb }),
                 215 if !rc => Ok(PpcInstr::Stbx { rs: rt, ra, rb }),
@@ -1437,12 +1465,11 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 407 if !rc => Ok(PpcInstr::Sthx { rs: rt, ra, rb }),
                 439 if !rc => Ok(PpcInstr::Sthux { rs: rt, ra, rb }),
                 343 if !rc => Ok(PpcInstr::Lhax { rt, ra, rb }),
-                341 if !rc => Ok(PpcInstr::Lwax { rt, ra, rb }),
-                373 if !rc => Ok(PpcInstr::Lwaux { rt, ra, rb }),
+                341 | 373 => Err(invalid(Some(xo))),
                 375 if !rc => Ok(PpcInstr::Lhaux { rt, ra, rb }),
                 55 if !rc => Ok(PpcInstr::Lwzux { rt, ra, rb }),
                 183 if !rc => Ok(PpcInstr::Stwux { rs: rt, ra, rb }),
-                512 if !rc => Ok(PpcInstr::Mcrxr { bf }),
+                512 if !rc && (instr & 0x007F_F800) == 0 => Ok(PpcInstr::Mcrxr { bf }),
                 983 if !rc => Ok(PpcInstr::Stfiwx { frs: rt, ra, rb }),
                 534 if !rc => Ok(PpcInstr::Lwbrx { rt, ra, rb }),
                 662 if !rc => Ok(PpcInstr::Stwbrx { rs: rt, ra, rb }),
@@ -1464,7 +1491,7 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 // instr bits 16..20 (host 16..20). The encoded
                 // value swaps them to maintain compatibility
                 // with the original POWER 5-bit SPR layout.
-                339 | 371 | 467 => {
+                339 | 371 | 467 if !rc => {
                     let high_5 = ((instr >> 11) & 0x1F) as u16;
                     let low_5 = ((instr >> 16) & 0x1F) as u16;
                     let spr = (high_5 << 5) | low_5;
@@ -1480,20 +1507,26 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 }
                 // mfcr RT — XFX-form. RT at bits 6..10 already
                 // extracted as `rt`.
-                19 => Ok(PpcInstr::Mfcr { rt }),
+                19 if ra == 0 && rb == 0 && !rc => Ok(PpcInstr::Mfcr { rt }),
                 // mtcrf FXM, RS — XFX-form. RS at bits 6..10
                 // (rt slot); FXM (8-bit mask) at bits 12..19,
                 // i.e. host bits 12..19 (mask 0xFF after shift).
                 144 => {
                     let fxm = ((instr >> 12) & 0xFF) as u8;
-                    Ok(PpcInstr::Mtcrf { fxm, rs: rt })
+                    let one_field = (instr & (1 << 20)) != 0;
+                    let reserved_clear = (instr & (1 << 11)) == 0;
+                    if !rc && reserved_clear && (!one_field || fxm.count_ones() == 1) {
+                        Ok(PpcInstr::Mtcrf { fxm, rs: rt })
+                    } else {
+                        Err(invalid(Some(xo)))
+                    }
                 }
                 54 if rt == 0 && !rc => Ok(PpcInstr::Dcbst { ra, rb }),
                 86 if rt == 0 && !rc => Ok(PpcInstr::Dcbf { ra, rb }),
                 246 if !rc => Ok(PpcInstr::Dcbtst { ct: rt, ra, rb }),
                 278 if !rc => Ok(PpcInstr::Dcbt { ct: rt, ra, rb }),
-                598 => Ok(PpcInstr::Sync),
-                854 => Ok(PpcInstr::Eieio),
+                598 if rt == 0 && ra == 0 && rb == 0 && !rc => Ok(PpcInstr::Sync),
+                854 if rt == 0 && ra == 0 && rb == 0 && !rc => Ok(PpcInstr::Eieio),
                 982 if rt == 0 && !rc => Ok(PpcInstr::Icbi { ra, rb }),
                 1014 if rt == 0 && !rc => Ok(PpcInstr::Dcbz { ra, rb }),
                 // XO-form arithmetic: 9-bit XO with OE in bit 9 of
@@ -1542,31 +1575,31 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                     oe: xo == 648,
                     rc,
                 }),
-                202 | 714 => Ok(PpcInstr::Addze {
+                202 | 714 if rb == 0 => Ok(PpcInstr::Addze {
                     rt,
                     ra,
                     oe: xo == 714,
                     rc,
                 }),
-                234 | 746 => Ok(PpcInstr::Addme {
+                234 | 746 if rb == 0 => Ok(PpcInstr::Addme {
                     rt,
                     ra,
                     oe: xo == 746,
                     rc,
                 }),
-                200 | 712 => Ok(PpcInstr::Subfze {
+                200 | 712 if rb == 0 => Ok(PpcInstr::Subfze {
                     rt,
                     ra,
                     oe: xo == 712,
                     rc,
                 }),
-                232 | 744 => Ok(PpcInstr::Subfme {
+                232 | 744 if rb == 0 => Ok(PpcInstr::Subfme {
                     rt,
                     ra,
                     oe: xo == 744,
                     rc,
                 }),
-                104 | 616 => Ok(PpcInstr::Neg {
+                104 | 616 if rb == 0 => Ok(PpcInstr::Neg {
                     rt,
                     ra,
                     oe: xo == 616,
@@ -1607,6 +1640,11 @@ pub fn decode(instr: u32) -> Result<PpcInstr, PpcDecodeError> {
                 695 if !rc => Ok(PpcInstr::Stfsux { frs: rt, ra, rb }),
                 727 if !rc => Ok(PpcInstr::Stfdx { frs: rt, ra, rb }),
                 759 if !rc => Ok(PpcInstr::Stfdux { frs: rt, ra, rb }),
+                0 | 4 | 19 | 23 | 26 | 32 | 54 | 55 | 86 | 87 | 104 | 119 | 151 | 183 | 200
+                | 202 | 215 | 232 | 234 | 246 | 247 | 278 | 279 | 311 | 343 | 375 | 407 | 439
+                | 512 | 533 | 339 | 371 | 467 | 534 | 535 | 567 | 597 | 598 | 599 | 616 | 631
+                | 661 | 662 | 663 | 695 | 712 | 714 | 725 | 727 | 744 | 746 | 759 | 790 | 854
+                | 918 | 922 | 954 | 982 | 983 | 1014 => Err(invalid(Some(xo))),
                 _ => Err(PpcDecodeError::UnsupportedSecondaryOpcode {
                     primary: 31,
                     secondary: xo,

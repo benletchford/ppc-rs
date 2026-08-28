@@ -728,30 +728,20 @@ impl PpcMemory for PpcSectionMem {
         if self.write_same_region_u16(addr, value).is_some() {
             return Some(());
         }
-        let bytes = value.to_be_bytes();
-        self.write_u8(addr, bytes[0])?;
-        self.write_u8(addr.wrapping_add(1), bytes[1])?;
-        Some(())
+        self.write_bytes(addr, &value.to_be_bytes())
     }
 
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
         if self.write_same_region_u32(addr, value).is_some() {
             return Some(());
         }
-        let bytes = value.to_be_bytes();
-        self.write_u8(addr, bytes[0])?;
-        self.write_u8(addr.wrapping_add(1), bytes[1])?;
-        self.write_u8(addr.wrapping_add(2), bytes[2])?;
-        self.write_u8(addr.wrapping_add(3), bytes[3])?;
-        Some(())
+        self.write_bytes(addr, &value.to_be_bytes())
     }
 
     fn write_u64_be(&mut self, addr: u32, value: u64) -> Option<()> {
         if self.write_same_region_u64(addr, value).is_some() {
             return Some(());
         }
-        self.write_u32_be(addr, (value >> 32) as u32)?;
-        self.write_u32_be(addr.wrapping_add(4), value as u32)?;
-        Some(())
+        self.write_bytes(addr, &value.to_be_bytes())
     }
 }
