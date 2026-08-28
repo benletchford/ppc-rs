@@ -37,6 +37,26 @@
 
 use std::collections::BTreeMap;
 
+use rustc_apfloat::{
+    Float, FloatConvert, Round as ApRound, Status as ApStatus, StatusAnd,
+    ieee::{Double as ApDouble, Quad as ApQuad, Single as ApSingle},
+};
+
+#[derive(Clone, Copy)]
+enum FpBinaryOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+#[derive(Clone, Copy)]
+struct FpMulAddControl {
+    subtract_b: bool,
+    negate_result: bool,
+    single: bool,
+}
+
 const PPC_DECODE_CACHE_MAX_ENTRIES: usize = 4096;
 const PPC_DECODE_CACHE_INDEX_MASK: usize = PPC_DECODE_CACHE_MAX_ENTRIES - 1;
 type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
@@ -243,6 +263,19 @@ impl PpcFetchHistogram {
                         .unsupported_secondary
                         .entry((primary, secondary))
                         .or_default() += count;
+                }
+                Err(crate::decode::PpcDecodeError::InvalidInstructionForm {
+                    primary,
+                    secondary,
+                }) => {
+                    if let Some(secondary) = secondary {
+                        *summary
+                            .unsupported_secondary
+                            .entry((primary, secondary))
+                            .or_default() += count;
+                    } else {
+                        *summary.unsupported_primary.entry(primary).or_default() += count;
+                    }
                 }
             }
         }
@@ -482,6 +515,21 @@ impl PpcCpu {
     /// Set the deterministic guest time base, for state restoration and tests.
     pub fn set_time_base(&mut self, value: u64) {
         self.time_base = value;
+    }
+
+    /// Return the effective address currently reserved by `lwarx`, if any.
+    /// Hosts can use this when coordinating shared-memory activity.
+    pub fn reservation_address(&self) -> Option<u32> {
+        self.reservation_addr
+    }
+
+    /// Invalidate the current load-and-reserve state.
+    ///
+    /// A host must call this when another CPU, DMA device, import handler, or
+    /// other external agent writes the reservation granule. The next `stwcx.`
+    /// will then fail and update CR0 accordingly.
+    pub fn invalidate_reservation(&mut self) {
+        self.reservation_addr = None;
     }
 
     /// Read the 32-bit Floating-point Status and Control Register.
@@ -1843,8 +1891,7 @@ impl PpcCpu {
                             access: PpcMemoryAccess::Store,
                         }));
                     }
-                    let double = f64::from_bits(self.fpr[frs]);
-                    match mem.write_u32_be(addr, (double as f32).to_bits()) {
+                    match mem.write_u32_be(addr, self.fp_single_bits(self.fpr[frs])) {
                         Some(()) => {
                             self.pc = self.pc.wrapping_add(4);
                             Some(PpcStepResult::Stepped)
@@ -1898,8 +1945,7 @@ impl PpcCpu {
                             access: PpcMemoryAccess::Store,
                         }));
                     }
-                    let double = f64::from_bits(self.fpr[frs]);
-                    match mem.write_u32_be(addr, (double as f32).to_bits()) {
+                    match mem.write_u32_be(addr, self.fp_single_bits(self.fpr[frs])) {
                         Some(()) => {
                             self.gpr[ra] = addr;
                             self.pc = self.pc.wrapping_add(4);
@@ -2094,10 +2140,18 @@ impl PpcCpu {
 
     fn decode_error_illegal_instruction(word: u32, error: PpcDecodeError) -> Option<PpcException> {
         match error {
-            PpcDecodeError::UnsupportedPrimaryOpcode(0) => Some(PpcException::IllegalInstruction {
-                word,
-                reason: PpcIllegalInstructionReason::ReservedOpcode,
-            }),
+            PpcDecodeError::InvalidInstructionForm { .. } => {
+                Some(PpcException::IllegalInstruction {
+                    word,
+                    reason: PpcIllegalInstructionReason::InvalidForm,
+                })
+            }
+            PpcDecodeError::UnsupportedPrimaryOpcode(primary) if primary != 4 => {
+                Some(PpcException::IllegalInstruction {
+                    word,
+                    reason: PpcIllegalInstructionReason::ReservedOpcode,
+                })
+            }
             _ => None,
         }
     }
@@ -2243,7 +2297,492 @@ impl PpcCpu {
     }
 
     fn set_fpscr_compare_result(&mut self, condition: u8) {
-        self.set_fpscr_fprf(false, condition);
+        // Floating-point compares update only FPCC.  The adjacent class
+        // descriptor (C) and rounding indicators (FR/FI) are preserved.
+        self.set_fpscr_field(4, condition);
+    }
+
+    fn fp_rounding_mode(&self) -> ApRound {
+        match self.fpscr & 0x3 {
+            0 => ApRound::NearestTiesToEven,
+            1 => ApRound::TowardZero,
+            2 => ApRound::TowardPositive,
+            _ => ApRound::TowardNegative,
+        }
+    }
+
+    fn is_signaling_nan(bits: u64) -> bool {
+        let exponent = bits & 0x7ff0_0000_0000_0000;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        exponent == 0x7ff0_0000_0000_0000
+            && fraction != 0
+            && (fraction & 0x0008_0000_0000_0000) == 0
+    }
+
+    fn fp_is_nan(bits: u64) -> bool {
+        (bits & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000
+            && (bits & 0x000f_ffff_ffff_ffff) != 0
+    }
+
+    fn fp_is_infinite(bits: u64) -> bool {
+        (bits & 0x7fff_ffff_ffff_ffff) == 0x7ff0_0000_0000_0000
+    }
+
+    fn fp_is_zero(bits: u64) -> bool {
+        (bits & 0x7fff_ffff_ffff_ffff) == 0
+    }
+
+    fn fp_invalid_flags(a: u64, b: Option<u64>, default: u8) -> u32 {
+        if Self::is_signaling_nan(a) || b.is_some_and(Self::is_signaling_nan) {
+            1u32 << FPSCR_VXSNAN
+        } else {
+            1u32 << default
+        }
+    }
+
+    fn fp_adjusted_binary_result(
+        &self,
+        a_bits: u64,
+        b_bits: u64,
+        operation: FpBinaryOperation,
+        single: bool,
+        status: ApStatus,
+    ) -> Option<u64> {
+        let to_quad = |bits: u64| {
+            let mut ignored = false;
+            let converted: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
+                .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+            converted.value
+        };
+        let a = to_quad(a_bits);
+        let b = to_quad(b_bits);
+        let exact = match operation {
+            FpBinaryOperation::Add => a.add_r(b, ApRound::NearestTiesToEven),
+            FpBinaryOperation::Subtract => a.sub_r(b, ApRound::NearestTiesToEven),
+            FpBinaryOperation::Multiply => a.mul_r(b, ApRound::NearestTiesToEven),
+            FpBinaryOperation::Divide => a.div_r(b, ApRound::NearestTiesToEven),
+        };
+        let tiny = exact.value.is_finite()
+            && !exact.value.is_zero()
+            && exact.value.ilogb() < if single { -126 } else { -1022 };
+        let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
+            if single { -192 } else { -1536 }
+        } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {
+            if single { 192 } else { 1536 }
+        } else {
+            return None;
+        };
+        self.fp_narrow_adjusted_quad(exact.value.scalbn(adjustment), single)
+    }
+
+    fn fp_adjusted_mul_add_result(
+        &self,
+        a_bits: u64,
+        c_bits: u64,
+        b_bits: u64,
+        control: FpMulAddControl,
+        status: ApStatus,
+    ) -> Option<u64> {
+        let to_quad = |bits: u64| {
+            let mut ignored = false;
+            let converted: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
+                .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+            converted.value
+        };
+        let mut b = to_quad(b_bits);
+        if control.subtract_b {
+            b = -b;
+        }
+        let mut exact = to_quad(a_bits).mul_add_r(to_quad(c_bits), b, ApRound::NearestTiesToEven);
+        if control.negate_result && !exact.value.is_nan() {
+            exact.value = -exact.value;
+        }
+        let tiny = exact.value.is_finite()
+            && !exact.value.is_zero()
+            && exact.value.ilogb() < if control.single { -126 } else { -1022 };
+        let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
+            if control.single { -192 } else { -1536 }
+        } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {
+            if control.single { 192 } else { 1536 }
+        } else {
+            return None;
+        };
+        self.fp_narrow_adjusted_quad(exact.value.scalbn(adjustment), control.single)
+    }
+
+    fn fp_narrow_adjusted_quad(&self, value: ApQuad, single: bool) -> Option<u64> {
+        let mut ignored = false;
+        if single {
+            let narrowed: StatusAnd<ApSingle> =
+                value.convert_r(self.fp_rounding_mode(), &mut ignored);
+            let widened: StatusAnd<ApDouble> = narrowed
+                .value
+                .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+            Some(widened.value.to_bits() as u64)
+        } else {
+            let narrowed: StatusAnd<ApDouble> =
+                value.convert_r(self.fp_rounding_mode(), &mut ignored);
+            Some(narrowed.value.to_bits() as u64)
+        }
+    }
+
+    fn fp_adjusted_single_conversion(&self, bits: u64, status: ApStatus) -> Option<u64> {
+        let mut ignored = false;
+        let source: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
+            .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+        let tiny =
+            source.value.is_finite() && !source.value.is_zero() && source.value.ilogb() < -126;
+        let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
+            -192
+        } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {
+            192
+        } else {
+            return None;
+        };
+        self.fp_narrow_adjusted_quad(source.value.scalbn(adjustment), true)
+    }
+
+    fn fp_mul_add(
+        &self,
+        a_bits: u64,
+        c_bits: u64,
+        b_bits: u64,
+        subtract_b: bool,
+        negate_result: bool,
+    ) -> (StatusAnd<ApDouble>, ApDouble, u32) {
+        let a = ApDouble::from_bits(u128::from(a_bits));
+        let c = ApDouble::from_bits(u128::from(c_bits));
+        let mut b = ApDouble::from_bits(u128::from(b_bits));
+        if subtract_b {
+            b = -b;
+        }
+        let mut result = a.mul_add_r(c, b, self.fp_rounding_mode());
+        let mut truncated = a.mul_add_r(c, b, ApRound::TowardZero).value;
+        // Negation is applied after rounding, and never changes a NaN sign.
+        if negate_result && !result.value.is_nan() {
+            result.value = -result.value;
+            truncated = -truncated;
+        }
+        let mut invalid = 0;
+        if Self::is_signaling_nan(a_bits)
+            || Self::is_signaling_nan(b_bits)
+            || Self::is_signaling_nan(c_bits)
+        {
+            invalid |= 1u32 << FPSCR_VXSNAN;
+        }
+        if (Self::fp_is_zero(a_bits) && Self::fp_is_infinite(c_bits))
+            || (Self::fp_is_infinite(a_bits) && Self::fp_is_zero(c_bits))
+        {
+            invalid |= 1u32 << FPSCR_VXIMZ;
+        }
+        if invalid == 0 {
+            invalid = 1u32 << FPSCR_VXISI;
+        }
+        (result, truncated, invalid)
+    }
+
+    fn fp_mul_add_single(
+        &self,
+        a_bits: u64,
+        c_bits: u64,
+        b_bits: u64,
+        subtract_b: bool,
+        negate_result: bool,
+    ) -> (StatusAnd<ApDouble>, ApDouble, u32) {
+        let convert = |bits: u64| {
+            let mut loses_info = false;
+            let value: StatusAnd<ApSingle> = ApDouble::from_bits(u128::from(bits))
+                .convert_r(ApRound::NearestTiesToEven, &mut loses_info);
+            value
+        };
+        let a = convert(a_bits);
+        let c = convert(c_bits);
+        let mut b = convert(b_bits);
+        if subtract_b {
+            b.value = -b.value;
+        }
+        let mut single = a.value.mul_add_r(c.value, b.value, self.fp_rounding_mode());
+        single.status |= a.status | b.status | c.status;
+        let mut truncated_single = a
+            .value
+            .mul_add_r(c.value, b.value, ApRound::TowardZero)
+            .value;
+        if negate_result && !single.value.is_nan() {
+            single.value = -single.value;
+            truncated_single = -truncated_single;
+        }
+        let mut ignored = false;
+        let widened: StatusAnd<ApDouble> = single
+            .value
+            .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+        let mut ignored_truncated = false;
+        let widened_truncated: StatusAnd<ApDouble> =
+            truncated_single.convert_r(ApRound::NearestTiesToEven, &mut ignored_truncated);
+
+        let (_, _, invalid) = self.fp_mul_add(a_bits, c_bits, b_bits, subtract_b, false);
+        (
+            StatusAnd {
+                status: single.status,
+                value: widened.value,
+            },
+            widened_truncated.value,
+            invalid,
+        )
+    }
+
+    fn fp_binary_single(
+        &self,
+        a_bits: u64,
+        b_bits: u64,
+        operation: FpBinaryOperation,
+    ) -> (StatusAnd<ApDouble>, ApDouble) {
+        let convert = |bits: u64| {
+            let mut ignored = false;
+            let value: StatusAnd<ApSingle> = ApDouble::from_bits(u128::from(bits))
+                .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+            value
+        };
+        let a = convert(a_bits);
+        let b = convert(b_bits);
+        let calculate = |round| match operation {
+            FpBinaryOperation::Add => a.value.add_r(b.value, round),
+            FpBinaryOperation::Subtract => a.value.sub_r(b.value, round),
+            FpBinaryOperation::Multiply => a.value.mul_r(b.value, round),
+            FpBinaryOperation::Divide => a.value.div_r(b.value, round),
+        };
+        let mut single = calculate(self.fp_rounding_mode());
+        single.status |= a.status | b.status;
+        let truncated = calculate(ApRound::TowardZero);
+        let widen = |value: ApSingle| {
+            let mut ignored = false;
+            let widened: StatusAnd<ApDouble> =
+                value.convert_r(ApRound::NearestTiesToEven, &mut ignored);
+            widened.value
+        };
+        (
+            StatusAnd {
+                status: single.status,
+                value: widen(single.value),
+            },
+            widen(truncated.value),
+        )
+    }
+
+    fn fp_single_bits(&self, bits: u64) -> u32 {
+        let mut loses_info = false;
+        let value: StatusAnd<ApSingle> = ApDouble::from_bits(u128::from(bits))
+            .convert_r(self.fp_rounding_mode(), &mut loses_info);
+        value.value.to_bits() as u32
+    }
+
+    fn recompute_fpscr_summaries(&mut self) {
+        let invalid = (FPSCR_VXSNAN..=FPSCR_VXVC).any(|bit| self.fpscr_bit(bit))
+            || self.fpscr_bit(FPSCR_VXSOFT)
+            || self.fpscr_bit(FPSCR_VXSQRT)
+            || self.fpscr_bit(FPSCR_VXCVI);
+        self.set_fpscr_bit(FPSCR_VX, invalid);
+        let enabled = (invalid && self.fpscr_bit(FPSCR_VE))
+            || (self.fpscr_bit(FPSCR_OX) && self.fpscr_bit(FPSCR_OE))
+            || (self.fpscr_bit(FPSCR_UX) && self.fpscr_bit(FPSCR_UE))
+            || (self.fpscr_bit(FPSCR_ZX) && self.fpscr_bit(FPSCR_ZE))
+            || (self.fpscr_bit(FPSCR_XX) && self.fpscr_bit(FPSCR_XE));
+        self.set_fpscr_bit(FPSCR_FEX, enabled);
+    }
+
+    fn set_fpscr_field_architectural(&mut self, field: u8, value: u8) {
+        for offset in 0..4 {
+            let bit = field * 4 + offset;
+            if !matches!(bit, FPSCR_FEX | FPSCR_VX) {
+                self.set_fpscr_bit(bit, (value & (0x8 >> offset)) != 0);
+            }
+        }
+        self.recompute_fpscr_summaries();
+    }
+
+    fn apply_fp_status(
+        &mut self,
+        status: ApStatus,
+        invalid_flags: u32,
+        fraction_incremented: bool,
+        update_rounding_indicators: bool,
+    ) {
+        let before = self.fpscr;
+        if status.contains(ApStatus::INVALID_OP) {
+            let flags = if invalid_flags == 0 {
+                1u32 << FPSCR_VXSOFT
+            } else {
+                invalid_flags
+            };
+            for bit in 0..32 {
+                if flags & (1u32 << bit) != 0 {
+                    self.set_fpscr_bit(bit, true);
+                }
+            }
+        }
+        if status.contains(ApStatus::DIV_BY_ZERO) {
+            self.set_fpscr_bit(FPSCR_ZX, true);
+        }
+        if status.contains(ApStatus::OVERFLOW) {
+            self.set_fpscr_bit(FPSCR_OX, true);
+        }
+        if status.contains(ApStatus::UNDERFLOW) {
+            self.set_fpscr_bit(FPSCR_UX, true);
+        }
+        if status.contains(ApStatus::INEXACT) {
+            self.set_fpscr_bit(FPSCR_XX, true);
+        }
+        if update_rounding_indicators {
+            self.set_fpscr_bit(FPSCR_FI, status.contains(ApStatus::INEXACT));
+            self.set_fpscr_bit(
+                FPSCR_FR,
+                status.contains(ApStatus::INEXACT) && fraction_incremented,
+            );
+        }
+        self.recompute_fpscr_summaries();
+        let newly_raised = [
+            FPSCR_OX,
+            FPSCR_UX,
+            FPSCR_ZX,
+            FPSCR_XX,
+            FPSCR_VXSNAN,
+            FPSCR_VXISI,
+            FPSCR_VXIDI,
+            FPSCR_VXZDZ,
+            FPSCR_VXIMZ,
+            FPSCR_VXVC,
+            FPSCR_VXSOFT,
+            FPSCR_VXSQRT,
+            FPSCR_VXCVI,
+        ]
+        .into_iter()
+        .any(|bit| (before & (1 << (31 - bit))) == 0 && self.fpscr_bit(bit));
+        if newly_raised {
+            self.set_fpscr_bit(FPSCR_FX, true);
+        }
+    }
+
+    fn finish_ap_double_result(
+        &mut self,
+        frt: u8,
+        result: StatusAnd<ApDouble>,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        self.finish_ap_double_result_rounded(frt, result, result.value, invalid_flags, rc);
+    }
+
+    fn finish_ap_double_result_rounded(
+        &mut self,
+        frt: u8,
+        result: StatusAnd<ApDouble>,
+        truncated: ApDouble,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        self.finish_ap_double_result_adjusted(frt, result, truncated, None, invalid_flags, rc);
+    }
+
+    fn finish_ap_double_result_adjusted(
+        &mut self,
+        frt: u8,
+        mut result: StatusAnd<ApDouble>,
+        truncated: ApDouble,
+        adjusted_bits: Option<u64>,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        if adjusted_bits.is_some()
+            && self.fpscr_bit(FPSCR_UE)
+            && !result.status.contains(ApStatus::OVERFLOW)
+        {
+            result.status |= ApStatus::UNDERFLOW;
+        }
+        let invalid_enabled =
+            result.status.contains(ApStatus::INVALID_OP) && self.fpscr_bit(FPSCR_VE);
+        let zero_divide_enabled =
+            result.status.contains(ApStatus::DIV_BY_ZERO) && self.fpscr_bit(FPSCR_ZE);
+        let rounded_bits = adjusted_bits.unwrap_or(result.value.to_bits() as u64);
+        let truncated_bits = truncated.to_bits() as u64;
+        let fraction_incremented =
+            (rounded_bits & 0x7fff_ffff_ffff_ffff) > (truncated_bits & 0x7fff_ffff_ffff_ffff);
+        self.apply_fp_status(result.status, invalid_flags, fraction_incremented, true);
+        if invalid_enabled || zero_divide_enabled {
+            self.set_fpscr_bit(FPSCR_FR, false);
+            self.set_fpscr_bit(FPSCR_FI, false);
+            self.finish_fp_record(rc);
+        } else {
+            self.finish_fp_result(frt, rounded_bits, rc);
+        }
+    }
+
+    fn finish_ap_single_result(
+        &mut self,
+        frt: u8,
+        result: StatusAnd<ApDouble>,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        self.finish_ap_single_result_rounded(frt, result, result.value, invalid_flags, rc);
+    }
+
+    fn finish_ap_single_result_rounded(
+        &mut self,
+        frt: u8,
+        result: StatusAnd<ApDouble>,
+        truncated: ApDouble,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        self.finish_ap_single_result_adjusted(frt, result, truncated, None, invalid_flags, rc);
+    }
+
+    fn finish_ap_single_result_adjusted(
+        &mut self,
+        frt: u8,
+        mut result: StatusAnd<ApDouble>,
+        truncated: ApDouble,
+        adjusted_bits: Option<u64>,
+        invalid_flags: u32,
+        rc: bool,
+    ) {
+        if adjusted_bits.is_some()
+            && self.fpscr_bit(FPSCR_UE)
+            && !result.status.contains(ApStatus::OVERFLOW)
+        {
+            result.status |= ApStatus::UNDERFLOW;
+        }
+        let mut loses_info = false;
+        let narrowed: StatusAnd<ApSingle> = result
+            .value
+            .convert_r(self.fp_rounding_mode(), &mut loses_info);
+        let mut status = result.status | narrowed.status;
+        if loses_info {
+            status |= ApStatus::INEXACT;
+        }
+        let mut ignored = false;
+        let widened: StatusAnd<ApDouble> = narrowed
+            .value
+            .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+        let mut truncated_loses_info = false;
+        let truncated_single: StatusAnd<ApSingle> =
+            truncated.convert_r(ApRound::TowardZero, &mut truncated_loses_info);
+        let fraction_incremented = (narrowed.value.to_bits() as u32 & 0x7fff_ffff)
+            > (truncated_single.value.to_bits() as u32 & 0x7fff_ffff);
+        let invalid_enabled = status.contains(ApStatus::INVALID_OP) && self.fpscr_bit(FPSCR_VE);
+        let zero_divide_enabled =
+            status.contains(ApStatus::DIV_BY_ZERO) && self.fpscr_bit(FPSCR_ZE);
+        self.apply_fp_status(status, invalid_flags, fraction_incremented, true);
+        if invalid_enabled || zero_divide_enabled {
+            self.set_fpscr_bit(FPSCR_FR, false);
+            self.set_fpscr_bit(FPSCR_FI, false);
+            self.finish_fp_record(rc);
+        } else {
+            self.finish_fp_result(
+                frt,
+                adjusted_bits.unwrap_or(widened.value.to_bits() as u64),
+                rc,
+            );
+        }
     }
 
     fn finish_fp_result(&mut self, frt: u8, bits: u64, rc: bool) {
@@ -2255,6 +2794,11 @@ impl PpcCpu {
         self.pc = self.pc.wrapping_add(4);
     }
 
+    fn finish_fp_move(&mut self, frt: u8, bits: u64, rc: bool) {
+        self.fpr[frt as usize] = bits;
+        self.finish_fp_record(rc);
+    }
+
     fn finish_fp_record(&mut self, rc: bool) {
         if rc {
             self.update_cr1_from_fpscr();
@@ -2262,22 +2806,22 @@ impl PpcCpu {
         self.pc = self.pc.wrapping_add(4);
     }
 
-    fn f64_to_i32_with_rounding_mode(v: f64, rn: u8) -> i32 {
-        if v.is_nan() {
-            return 0;
+    fn fp_convert_to_i32(&mut self, bits: u64, round: ApRound) -> Option<u32> {
+        let mut exact = false;
+        let source = ApDouble::from_bits(u128::from(bits));
+        let result = source.to_i128_r(32, round, &mut exact);
+        let mut truncated_exact = false;
+        let truncated = source.to_i128_r(32, ApRound::TowardZero, &mut truncated_exact);
+        let mut invalid = 1u32 << FPSCR_VXCVI;
+        if Self::is_signaling_nan(bits) {
+            invalid |= 1u32 << FPSCR_VXSNAN;
         }
-        let rounded = match rn & 0x03 {
-            0 => v.round_ties_even(),
-            1 => v.trunc(),
-            2 => v.ceil(),
-            _ => v.floor(),
-        };
-        if rounded >= i32::MAX as f64 {
-            i32::MAX
-        } else if rounded <= i32::MIN as f64 {
-            i32::MIN
+        let fraction_incremented = result.value.unsigned_abs() > truncated.value.unsigned_abs();
+        self.apply_fp_status(result.status, invalid, fraction_incremented, true);
+        if result.status.contains(ApStatus::INVALID_OP) && self.fpscr_bit(FPSCR_VE) {
+            None
         } else {
-            rounded as i32
+            Some(result.value as i32 as u32)
         }
     }
 }
@@ -2292,6 +2836,29 @@ pub use decode::{PpcDecodeError, PpcInstr, decode};
 const XER_SO_MASK: u32 = 1 << 31;
 const XER_OV_MASK: u32 = 1 << 30;
 const XER_CA_MASK: u32 = 1 << 29;
+const FPSCR_FX: u8 = 0;
+const FPSCR_FEX: u8 = 1;
+const FPSCR_VX: u8 = 2;
+const FPSCR_OX: u8 = 3;
+const FPSCR_UX: u8 = 4;
+const FPSCR_ZX: u8 = 5;
+const FPSCR_XX: u8 = 6;
+const FPSCR_VXSNAN: u8 = 7;
+const FPSCR_VXISI: u8 = 8;
+const FPSCR_VXIDI: u8 = 9;
+const FPSCR_VXZDZ: u8 = 10;
+const FPSCR_VXIMZ: u8 = 11;
+const FPSCR_VXVC: u8 = 12;
+const FPSCR_FR: u8 = 13;
+const FPSCR_FI: u8 = 14;
+const FPSCR_VXSOFT: u8 = 21;
+const FPSCR_VXSQRT: u8 = 22;
+const FPSCR_VXCVI: u8 = 23;
+const FPSCR_VE: u8 = 24;
+const FPSCR_OE: u8 = 25;
+const FPSCR_UE: u8 = 26;
+const FPSCR_ZE: u8 = 27;
+const FPSCR_XE: u8 = 28;
 /// MSR bit 18 (`FP`) in PowerPC's MSB=0 numbering.
 pub const PPC_MSR_FP_AVAILABLE_BIT: u8 = 18;
 /// Host-order mask for MSR bit 18 (`FP`).
@@ -2523,9 +3090,17 @@ impl PpcCpu {
         if !observer.observes_writes() {
             return mem.write_u16_be(addr, value);
         }
-        let bytes = value.to_be_bytes();
-        self.write_u8_observed(mem, observer, addr, bytes[0])?;
-        self.write_u8_observed(mem, observer, addr.wrapping_add(1), bytes[1])?;
+        mem.write_u16_be(addr, value)?;
+        for (offset, byte) in value.to_be_bytes().into_iter().enumerate() {
+            observer.on_write(
+                self.pc,
+                self.lr,
+                self.gpr[2],
+                self.gpr[1],
+                addr.wrapping_add(offset as u32),
+                byte,
+            );
+        }
         Some(())
     }
 
@@ -2539,9 +3114,16 @@ impl PpcCpu {
         if !observer.observes_writes() {
             return mem.write_u32_be(addr, value);
         }
-        let bytes = value.to_be_bytes();
-        for (offset, byte) in bytes.into_iter().enumerate() {
-            self.write_u8_observed(mem, observer, addr.wrapping_add(offset as u32), byte)?;
+        mem.write_u32_be(addr, value)?;
+        for (offset, byte) in value.to_be_bytes().into_iter().enumerate() {
+            observer.on_write(
+                self.pc,
+                self.lr,
+                self.gpr[2],
+                self.gpr[1],
+                addr.wrapping_add(offset as u32),
+                byte,
+            );
         }
         Some(())
     }
@@ -2556,9 +3138,16 @@ impl PpcCpu {
         if !observer.observes_writes() {
             return mem.write_u64_be(addr, value);
         }
-        let bytes = value.to_be_bytes();
-        for (offset, byte) in bytes.into_iter().enumerate() {
-            self.write_u8_observed(mem, observer, addr.wrapping_add(offset as u32), byte)?;
+        mem.write_u64_be(addr, value)?;
+        for (offset, byte) in value.to_be_bytes().into_iter().enumerate() {
+            observer.on_write(
+                self.pc,
+                self.lr,
+                self.gpr[2],
+                self.gpr[1],
+                addr.wrapping_add(offset as u32),
+                byte,
+            );
         }
         Some(())
     }
@@ -4354,8 +4943,7 @@ impl PpcCpu {
             PpcInstr::Stfs { frs, ra, d } => {
                 let base = if ra == 0 { 0 } else { self.gpr[ra as usize] };
                 let addr = base.wrapping_add(i32::from(d) as u32);
-                let double = f64::from_bits(self.fpr[frs as usize]);
-                let bits32 = (double as f32).to_bits();
+                let bits32 = self.fp_single_bits(self.fpr[frs as usize]);
                 if self
                     .write_u32_be_observed(mem, write_observer, addr, bits32)
                     .is_none()
@@ -4375,8 +4963,7 @@ impl PpcCpu {
                     );
                 }
                 let addr = self.gpr[ra as usize].wrapping_add(i32::from(d) as u32);
-                let double = f64::from_bits(self.fpr[frs as usize]);
-                let bits32 = (double as f32).to_bits();
+                let bits32 = self.fp_single_bits(self.fpr[frs as usize]);
                 if self
                     .write_u32_be_observed(mem, write_observer, addr, bits32)
                     .is_none()
@@ -4390,47 +4977,119 @@ impl PpcCpu {
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Fadd { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, (a + b).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let result = ApDouble::from_bits(u128::from(a_bits)).add_r(
+                    ApDouble::from_bits(u128::from(b_bits)),
+                    self.fp_rounding_mode(),
+                );
+                let truncated = ApDouble::from_bits(u128::from(a_bits))
+                    .add_r(ApDouble::from_bits(u128::from(b_bits)), ApRound::TowardZero)
+                    .value;
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Add,
+                    false,
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fsub { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, (a - b).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let result = ApDouble::from_bits(u128::from(a_bits)).sub_r(
+                    ApDouble::from_bits(u128::from(b_bits)),
+                    self.fp_rounding_mode(),
+                );
+                let truncated = ApDouble::from_bits(u128::from(a_bits))
+                    .sub_r(ApDouble::from_bits(u128::from(b_bits)), ApRound::TowardZero)
+                    .value;
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Subtract,
+                    false,
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmul { frt, fra, frc, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                self.finish_fp_result(frt, (a * c).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let c_bits = self.fpr[frc as usize];
+                let result = ApDouble::from_bits(u128::from(a_bits)).mul_r(
+                    ApDouble::from_bits(u128::from(c_bits)),
+                    self.fp_rounding_mode(),
+                );
+                let truncated = ApDouble::from_bits(u128::from(a_bits))
+                    .mul_r(ApDouble::from_bits(u128::from(c_bits)), ApRound::TowardZero)
+                    .value;
+                let invalid = Self::fp_invalid_flags(a_bits, Some(c_bits), FPSCR_VXIMZ);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    c_bits,
+                    FpBinaryOperation::Multiply,
+                    false,
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fdiv { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                // IEEE-754 division — Rust's `/` produces
-                // ±infinity / NaN naturally, matching the
-                // FPU semantics for the no-trap default mode.
-                self.finish_fp_result(frt, (a / b).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let result = ApDouble::from_bits(u128::from(a_bits)).div_r(
+                    ApDouble::from_bits(u128::from(b_bits)),
+                    self.fp_rounding_mode(),
+                );
+                let truncated = ApDouble::from_bits(u128::from(a_bits))
+                    .div_r(ApDouble::from_bits(u128::from(b_bits)), ApRound::TowardZero)
+                    .value;
+                let default = if Self::fp_is_zero(a_bits) && Self::fp_is_zero(b_bits) {
+                    FPSCR_VXZDZ
+                } else if Self::fp_is_infinite(a_bits) && Self::fp_is_infinite(b_bits) {
+                    FPSCR_VXIDI
+                } else {
+                    FPSCR_VXSOFT
+                };
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Divide,
+                    false,
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fneg { frt, frb, rc } => {
                 // Toggle the sign bit (bit 63 in MSB=0
                 // numbering = high bit of the u64 pattern).
                 let bits = self.fpr[frb as usize] ^ (1u64 << 63);
-                self.finish_fp_result(frt, bits, rc);
+                self.finish_fp_move(frt, bits, rc);
             }
             PpcInstr::Fmr { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
-                self.finish_fp_result(frt, bits, rc);
+                self.finish_fp_move(frt, bits, rc);
             }
             PpcInstr::Fabs { frt, frb, rc } => {
                 // Clear the sign bit.
                 let bits = self.fpr[frb as usize] & !(1u64 << 63);
-                self.finish_fp_result(frt, bits, rc);
+                self.finish_fp_move(frt, bits, rc);
             }
             PpcInstr::Fnabs { frt, frb, rc } => {
                 // Set the sign bit unconditionally.
                 let bits = self.fpr[frb as usize] | (1u64 << 63);
-                self.finish_fp_result(frt, bits, rc);
+                self.finish_fp_move(frt, bits, rc);
             }
             PpcInstr::Mffs { frt, rc } => {
                 // Move FPSCR into FRT[32..63]; FRT[0..31] is
@@ -4443,18 +5102,64 @@ impl PpcCpu {
             PpcInstr::Mcrfs { bf, bfa } => {
                 let value = self.fpscr_field(bfa);
                 self.set_cr_field(bf, value);
+                match bfa {
+                    0 => {
+                        self.set_fpscr_bit(FPSCR_FX, false);
+                        self.set_fpscr_bit(FPSCR_OX, false);
+                    }
+                    1 => {
+                        for bit in FPSCR_UX..=FPSCR_VXSNAN {
+                            self.set_fpscr_bit(bit, false);
+                        }
+                    }
+                    2 => {
+                        for bit in FPSCR_VXISI..=FPSCR_VXIMZ {
+                            self.set_fpscr_bit(bit, false);
+                        }
+                    }
+                    3 => self.set_fpscr_bit(FPSCR_VXVC, false),
+                    5 => {
+                        for bit in FPSCR_VXSOFT..=FPSCR_VXCVI {
+                            self.set_fpscr_bit(bit, false);
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(bfa, 0..=3 | 5) {
+                    self.recompute_fpscr_summaries();
+                }
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Mtfsb1 { bt, rc } => {
-                self.set_fpscr_bit(bt, true);
+                let was_clear = !self.fpscr_bit(bt);
+                if !matches!(bt, FPSCR_FEX | FPSCR_VX) {
+                    self.set_fpscr_bit(bt, true);
+                }
+                if was_clear
+                    && matches!(
+                        bt,
+                        FPSCR_OX
+                            | FPSCR_UX
+                            | FPSCR_ZX
+                            | FPSCR_XX
+                            | FPSCR_VXSNAN..=FPSCR_VXVC
+                            | FPSCR_VXSOFT..=FPSCR_VXCVI
+                    )
+                {
+                    self.set_fpscr_bit(FPSCR_FX, true);
+                }
+                self.recompute_fpscr_summaries();
                 self.finish_fp_record(rc);
             }
             PpcInstr::Mtfsb0 { bt, rc } => {
-                self.set_fpscr_bit(bt, false);
+                if !matches!(bt, FPSCR_FEX | FPSCR_VX) {
+                    self.set_fpscr_bit(bt, false);
+                }
+                self.recompute_fpscr_summaries();
                 self.finish_fp_record(rc);
             }
             PpcInstr::Mtfsfi { bf, u, rc } => {
-                self.set_fpscr_field(bf, u);
+                self.set_fpscr_field_architectural(bf, u);
                 self.finish_fp_record(rc);
             }
             PpcInstr::Mtfsf { flm, frb, rc } => {
@@ -4462,7 +5167,7 @@ impl PpcCpu {
                 for field in 0u8..8 {
                     if (flm & (0x80u8 >> field)) != 0 {
                         let shift = 28 - (u32::from(field) * 4);
-                        self.set_fpscr_field(field, ((source >> shift) & 0x0F) as u8);
+                        self.set_fpscr_field_architectural(field, ((source >> shift) & 0x0F) as u8);
                     }
                 }
                 self.finish_fp_record(rc);
@@ -4485,50 +5190,138 @@ impl PpcCpu {
                 } else {
                     self.fpr[frb as usize]
                 };
-                self.finish_fp_result(frt, bits, rc);
+                self.finish_fp_move(frt, bits, rc);
             }
             PpcInstr::Fsqrt { frt, frb, rc } => {
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, v.sqrt().to_bits(), rc);
+                let bits = self.fpr[frb as usize];
+                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
+                let (truncated, _) = ieee_apsqrt::sqrt_accurate(bits, ApRound::TowardZero);
+                let result = StatusAnd {
+                    status: sqrt.status,
+                    value: ApDouble::from_bits(u128::from(sqrt.value)),
+                };
+                let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
+                self.finish_ap_double_result_rounded(
+                    frt,
+                    result,
+                    ApDouble::from_bits(u128::from(truncated.value)),
+                    invalid,
+                    rc,
+                );
             }
             PpcInstr::Fsqrts { frt, frb, rc } => {
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, (v.sqrt() as f32 as f64).to_bits(), rc);
+                let bits = self.fpr[frb as usize];
+                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
+                let (truncated, _) = ieee_apsqrt::sqrt_accurate(bits, ApRound::TowardZero);
+                let result = StatusAnd {
+                    status: sqrt.status,
+                    value: ApDouble::from_bits(u128::from(sqrt.value)),
+                };
+                let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
+                self.finish_ap_single_result_rounded(
+                    frt,
+                    result,
+                    ApDouble::from_bits(u128::from(truncated.value)),
+                    invalid,
+                    rc,
+                );
             }
             PpcInstr::Fres { frt, frb, rc } => {
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, ((1.0 / v) as f32 as f64).to_bits(), rc);
+                let bits = self.fpr[frb as usize];
+                let one = ApDouble::from_bits(u128::from(1.0f64.to_bits()));
+                let result = one.div_r(
+                    ApDouble::from_bits(u128::from(bits)),
+                    self.fp_rounding_mode(),
+                );
+                let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSOFT);
+                self.finish_ap_single_result(frt, result, invalid, rc);
             }
             PpcInstr::Frsqrte { frt, frb, rc } => {
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, (1.0 / v.sqrt()).to_bits(), rc);
+                let bits = self.fpr[frb as usize];
+                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
+                let one = ApDouble::from_bits(u128::from(1.0f64.to_bits()));
+                let mut result = one.div_r(
+                    ApDouble::from_bits(u128::from(sqrt.value)),
+                    self.fp_rounding_mode(),
+                );
+                result.status |= sqrt.status;
+                let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
+                self.finish_ap_double_result(frt, result, invalid, rc);
             }
             PpcInstr::Fadds { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                // Round to f32 precision then expand back to f64
-                // for storage. Native `as f32 as f64` is the
-                // canonical way to apply IEEE-754 round-to-single.
-                let r32 = (a + b) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let (result, truncated) =
+                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Add);
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Add,
+                    true,
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fsubs { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let r32 = (a - b) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let (result, truncated) =
+                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Subtract);
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Subtract,
+                    true,
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmuls { frt, fra, frc, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                let r32 = (a * c) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let c_bits = self.fpr[frc as usize];
+                let (result, truncated) =
+                    self.fp_binary_single(a_bits, c_bits, FpBinaryOperation::Multiply);
+                let invalid = Self::fp_invalid_flags(a_bits, Some(c_bits), FPSCR_VXIMZ);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    c_bits,
+                    FpBinaryOperation::Multiply,
+                    true,
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fdivs { frt, fra, frb, rc } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let r32 = (a / b) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let (result, truncated) =
+                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Divide);
+                let default = if Self::fp_is_zero(a_bits) && Self::fp_is_zero(b_bits) {
+                    FPSCR_VXZDZ
+                } else if Self::fp_is_infinite(a_bits) && Self::fp_is_infinite(b_bits) {
+                    FPSCR_VXIDI
+                } else {
+                    FPSCR_VXSOFT
+                };
+                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
+                let adjusted = self.fp_adjusted_binary_result(
+                    a_bits,
+                    b_bits,
+                    FpBinaryOperation::Divide,
+                    true,
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmadd {
                 frt,
@@ -4537,10 +5330,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                self.finish_fp_result(frt, a.mul_add(c, b).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    false,
+                    false,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: false,
+                        negate_result: false,
+                        single: false,
+                    },
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmsub {
                 frt,
@@ -4549,10 +5359,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                self.finish_fp_result(frt, a.mul_add(c, -b).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    true,
+                    false,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: true,
+                        negate_result: false,
+                        single: false,
+                    },
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fnmadd {
                 frt,
@@ -4561,10 +5388,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                self.finish_fp_result(frt, (-a.mul_add(c, b)).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    false,
+                    true,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: false,
+                        negate_result: true,
+                        single: false,
+                    },
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fnmsub {
                 frt,
@@ -4573,10 +5417,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                self.finish_fp_result(frt, (-a.mul_add(c, -b)).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    true,
+                    true,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: true,
+                        negate_result: true,
+                        single: false,
+                    },
+                    result.status,
+                );
+                self.finish_ap_double_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmadds {
                 frt,
@@ -4585,11 +5446,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                let r32 = a.mul_add(c, b) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add_single(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    false,
+                    false,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: false,
+                        negate_result: false,
+                        single: true,
+                    },
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fmsubs {
                 frt,
@@ -4598,11 +5475,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                let r32 = a.mul_add(c, -b) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add_single(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    true,
+                    false,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: true,
+                        negate_result: false,
+                        single: true,
+                    },
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fnmadds {
                 frt,
@@ -4611,11 +5504,27 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                let r32 = (-a.mul_add(c, b)) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add_single(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    false,
+                    true,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: false,
+                        negate_result: true,
+                        single: true,
+                    },
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Fnmsubs {
                 frt,
@@ -4624,32 +5533,72 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
-                let c = f64::from_bits(self.fpr[frc as usize]);
-                let r32 = (-a.mul_add(c, -b)) as f32;
-                self.finish_fp_result(frt, (r32 as f64).to_bits(), rc);
+                let (result, truncated, invalid) = self.fp_mul_add_single(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    true,
+                    true,
+                );
+                let adjusted = self.fp_adjusted_mul_add_result(
+                    self.fpr[fra as usize],
+                    self.fpr[frc as usize],
+                    self.fpr[frb as usize],
+                    FpMulAddControl {
+                        subtract_b: true,
+                        negate_result: true,
+                        single: true,
+                    },
+                    result.status,
+                );
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Frsp { frt, frb, rc } => {
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                self.finish_fp_result(frt, (v as f32 as f64).to_bits(), rc);
+                let bits = self.fpr[frb as usize];
+                let source = ApDouble::from_bits(u128::from(bits));
+                let mut loses_info = false;
+                let narrowed: StatusAnd<ApSingle> =
+                    source.convert_r(self.fp_rounding_mode(), &mut loses_info);
+                let status = narrowed.status
+                    | if Self::is_signaling_nan(bits) {
+                        ApStatus::INVALID_OP
+                    } else {
+                        ApStatus::OK
+                    };
+                let result = StatusAnd {
+                    status,
+                    value: source,
+                };
+                let adjusted = self.fp_adjusted_single_conversion(bits, status);
+                self.finish_ap_single_result_adjusted(
+                    frt,
+                    result,
+                    source,
+                    adjusted,
+                    1u32 << FPSCR_VXSNAN,
+                    rc,
+                );
             }
             PpcInstr::Fctiw { frt, frb, rc } => {
                 // Per ISA Book I §4.6.4.3: convert FRB to a
                 // 32-bit signed integer; result lands in FRT
                 // low 32 bits with high 32 "undefined". We zero
                 // the high half for determinism.
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                let i = Self::f64_to_i32_with_rounding_mode(v, self.fpscr_field(7));
-                self.fpr[frt as usize] = u64::from(i as u32);
+                let bits = self.fpr[frb as usize];
+                if let Some(value) = self.fp_convert_to_i32(bits, self.fp_rounding_mode()) {
+                    self.fpr[frt as usize] = u64::from(value);
+                }
                 self.finish_fp_record(rc);
             }
             PpcInstr::Fctiwz { frt, frb, rc } => {
                 // fctiwz uses round-toward-zero regardless of
                 // FPSCR.RN.
-                let v = f64::from_bits(self.fpr[frb as usize]);
-                let i = Self::f64_to_i32_with_rounding_mode(v, 1);
-                self.fpr[frt as usize] = u64::from(i as u32);
+                let bits = self.fpr[frb as usize];
+                if let Some(value) = self.fp_convert_to_i32(bits, ApRound::TowardZero) {
+                    self.fpr[frt as usize] = u64::from(value);
+                }
                 self.finish_fp_record(rc);
             }
             PpcInstr::Fcmpu { bf, fra, frb } | PpcInstr::Fcmpo { bf, fra, frb } => {
@@ -4657,11 +5606,12 @@ impl PpcCpu {
                 // LT/GT/EQ/UNO into CR field BF. Either operand
                 // being NaN means "unordered" — set bit 3 (the
                 // SO/UNO position). The fcmpu vs fcmpo
-                // distinction is in FPSCR side effects on
-                // signalling NaN, which we don't track —
-                // both surface the same CR write.
-                let a = f64::from_bits(self.fpr[fra as usize]);
-                let b = f64::from_bits(self.fpr[frb as usize]);
+                // distinction is in the FPSCR invalid-operation
+                // side effects for unordered operands.
+                let a_bits = self.fpr[fra as usize];
+                let b_bits = self.fpr[frb as usize];
+                let a = f64::from_bits(a_bits);
+                let b = f64::from_bits(b_bits);
                 let nibble: u8 = if a.is_nan() || b.is_nan() {
                     0b0001 // UNO (the LSB-numbered bit 3 = SO/UNO)
                 } else if a < b {
@@ -4673,6 +5623,16 @@ impl PpcCpu {
                 };
                 self.set_cr_field(bf, nibble);
                 self.set_fpscr_compare_result(nibble);
+                let ordered = matches!(decoded, PpcInstr::Fcmpo { .. });
+                if Self::is_signaling_nan(a_bits) || Self::is_signaling_nan(b_bits) {
+                    let mut invalid = 1u32 << FPSCR_VXSNAN;
+                    if ordered && !self.fpscr_bit(FPSCR_VE) {
+                        invalid |= 1u32 << FPSCR_VXVC;
+                    }
+                    self.apply_fp_status(ApStatus::INVALID_OP, invalid, false, false);
+                } else if ordered && (Self::fp_is_nan(a_bits) || Self::fp_is_nan(b_bits)) {
+                    self.apply_fp_status(ApStatus::INVALID_OP, 1u32 << FPSCR_VXVC, false, false);
+                }
                 self.pc = self.pc.wrapping_add(4);
             }
             PpcInstr::Stfd { frs, ra, d } => {
@@ -4788,8 +5748,7 @@ impl PpcCpu {
             PpcInstr::Stfsx { frs, ra, rb } => {
                 let base = if ra == 0 { 0 } else { self.gpr[ra as usize] };
                 let addr = base.wrapping_add(self.gpr[rb as usize]);
-                let double = f64::from_bits(self.fpr[frs as usize]);
-                let bits32 = (double as f32).to_bits();
+                let bits32 = self.fp_single_bits(self.fpr[frs as usize]);
                 if self
                     .write_u32_be_observed(mem, write_observer, addr, bits32)
                     .is_none()
@@ -4809,8 +5768,7 @@ impl PpcCpu {
                     );
                 }
                 let addr = self.gpr[ra as usize].wrapping_add(self.gpr[rb as usize]);
-                let double = f64::from_bits(self.fpr[frs as usize]);
-                let bits32 = (double as f32).to_bits();
+                let bits32 = self.fp_single_bits(self.fpr[frs as usize]);
                 if self
                     .write_u32_be_observed(mem, write_observer, addr, bits32)
                     .is_none()
@@ -5981,16 +6939,16 @@ mod tests {
     #[test]
     fn decode_cache_reuses_repeated_decode_errors() {
         let mut cpu = PpcCpu::new();
-        let unsupported_primary_one = 0x0400_0000;
+        let unsupported_vector_instruction = 0x1000_0000;
 
         assert_eq!(
-            cpu.step_instruction(unsupported_primary_one),
-            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(1))
+            cpu.step_instruction(unsupported_vector_instruction),
+            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(4))
         );
         assert_eq!(cpu.decode_cache_entry_count(), 1);
         assert_eq!(
-            cpu.step_instruction(unsupported_primary_one),
-            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(1))
+            cpu.step_instruction(unsupported_vector_instruction),
+            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(4))
         );
         assert_eq!(cpu.decode_cache_entry_count(), 1);
     }

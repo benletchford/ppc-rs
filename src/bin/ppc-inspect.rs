@@ -549,6 +549,16 @@ impl CodeHistogram {
                         .entry(SecondaryOpcode { primary, secondary })
                         .or_insert(0) += 1;
                 }
+                Err(PpcDecodeError::InvalidInstructionForm { primary, secondary }) => {
+                    if let Some(secondary) = secondary {
+                        *histogram
+                            .unsupported_secondary
+                            .entry(SecondaryOpcode { primary, secondary })
+                            .or_insert(0) += 1;
+                    } else {
+                        *histogram.unsupported_primary.entry(primary).or_insert(0) += 1;
+                    }
+                }
             }
 
             let primary = ((word >> 26) & 0x3f) as u8;
