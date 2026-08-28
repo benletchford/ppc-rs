@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.4.0...ppc-v0.4.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* enforce 32-bit PowerPC architectural semantics ([#17](https://github.com/benletchford/ppc-rs/issues/17)) ([681f83b](https://github.com/benletchford/ppc-rs/commit/681f83b9e92ab8643c96a9986b5254db05f79b8e))
+
 ## [0.4.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.3.1...ppc-v0.4.0) (2026-08-17)
 
 
