@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.4.1...ppc-v0.5.0) (2026-08-29)
+
+
+### Features
+
+* **import:** continue from handler-arranged CPU state ([#20](https://github.com/benletchford/ppc-rs/issues/20)) ([4743cda](https://github.com/benletchford/ppc-rs/commit/4743cdafbef4f964ff52fc63550e4c64b9f46763))
+
 ## [0.4.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.4.0...ppc-v0.4.1) (2026-08-28)
 
 
