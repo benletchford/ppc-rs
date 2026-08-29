@@ -364,6 +364,44 @@ fn run_with_imports_dispatches_halt_and_return() {
 }
 
 #[test]
+fn run_with_imports_can_continue_from_handler_arranged_cpu_state() {
+    let trap_base = 0x4000;
+    let continuation_pc = 0x200;
+    let halt_pc = continuation_pc + 4;
+    let mut mem = PpcSectionMem::new();
+    mem.add_readonly_region(continuation_pc, d_form(14, 3, 3, 1).to_be_bytes().to_vec());
+
+    let mut cpu = PpcCpu::new();
+    cpu.pc = trap_base;
+    let result = cpu.run_with_imports(
+        &mut mem,
+        8,
+        halt_pc,
+        trap_base,
+        1,
+        |_index, cpu, _memory| {
+            cpu.pc = continuation_pc;
+            cpu.lr = 0x1111_2222;
+            cpu.gpr[2] = 0x3333_4444;
+            cpu.gpr[3] = 0x41;
+            PpcImportAction::Continue
+        },
+    );
+
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: halt_pc,
+            cycles: 2,
+        }
+    );
+    assert_eq!(cpu.pc, halt_pc);
+    assert_eq!(cpu.lr, 0x1111_2222);
+    assert_eq!(cpu.gpr[2], 0x3333_4444);
+    assert_eq!(cpu.gpr[3], 0x42);
+}
+
+#[test]
 fn run_with_imports_fast_paths_cfm_tvector_import_stub() {
     let code_base = 0x1000;
     let toc_base = 0x2000;
@@ -458,6 +496,74 @@ fn run_with_imports_fast_paths_cfm_tvector_import_stub() {
     assert_eq!(cpu.pc, halt_pc);
     assert_eq!(cpu.gpr[2], second_import_rtoc);
     assert_eq!(cpu.gpr[3], 0xDCBA);
+}
+
+#[test]
+fn run_with_imports_fast_stub_can_continue_from_handler_arranged_cpu_state() {
+    let code_base = 0x1000;
+    let toc_base = 0x2000;
+    let stack_base = 0x3000;
+    let tvector = 0x4000;
+    let trap_base = 0x5000;
+    let continuation_pc = 0x6000;
+    let halt_pc = continuation_pc + 4;
+    let trap_entry = trap_base;
+    let toc_slot_disp = 0x10u16;
+    let import_rtoc = 0x7000;
+
+    let mut code = Vec::new();
+    for word in [
+        0x8182_0000 | u32::from(toc_slot_disp),
+        0x9041_0014,
+        0x800C_0000,
+        0x804C_0004,
+        0x7C09_03A6,
+        0x4E80_0420,
+    ] {
+        code.extend_from_slice(&word.to_be_bytes());
+    }
+    let mut mem = PpcSectionMem::new();
+    mem.add_region(code_base, code);
+    mem.add_region(toc_base, vec![0; 0x40]);
+    mem.add_region(stack_base, vec![0; 0x40]);
+    mem.add_region(tvector, vec![0; 8]);
+    mem.add_readonly_region(continuation_pc, d_form(14, 3, 3, 1).to_be_bytes().to_vec());
+    mem.write_u32_be(toc_base + u32::from(toc_slot_disp), tvector)
+        .unwrap();
+    mem.write_u32_be(tvector, trap_entry).unwrap();
+    mem.write_u32_be(tvector + 4, import_rtoc).unwrap();
+
+    let mut cpu = PpcCpu::new();
+    cpu.pc = code_base;
+    cpu.lr = 0x1111_2222;
+    cpu.gpr[1] = stack_base;
+    cpu.gpr[2] = toc_base;
+    let result = cpu.run_with_imports(
+        &mut mem,
+        16,
+        halt_pc,
+        trap_base,
+        1,
+        |_index, cpu, _memory| {
+            cpu.pc = continuation_pc;
+            cpu.lr = 0x3333_4444;
+            cpu.gpr[2] = 0x5555_6666;
+            cpu.gpr[3] = 0x41;
+            PpcImportAction::Continue
+        },
+    );
+
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: halt_pc,
+            cycles: 8,
+        }
+    );
+    assert_eq!(cpu.pc, halt_pc);
+    assert_eq!(cpu.lr, 0x3333_4444);
+    assert_eq!(cpu.gpr[2], 0x5555_6666);
+    assert_eq!(cpu.gpr[3], 0x42);
 }
 
 #[test]

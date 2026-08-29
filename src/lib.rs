@@ -2887,6 +2887,9 @@ pub const PPC_MSR_FP_AVAILABLE_MASK: u32 = 1 << (31 - PPC_MSR_FP_AVAILABLE_BIT);
 ///   `Return(value)`, and also charge `extra` guest cycles.
 /// - `CallNative` — enter a guest routine from an import handler
 ///   while preserving the import caller's final return PC and RTOC.
+/// - `Continue` — continue from the architectural CPU state arranged by the
+///   import handler, without synthesizing a return or storing a private call
+///   frame.
 /// - `Yield(cycles)` — leave the CPU stopped at the import slot and end the
 ///   current execution slice after at most `cycles` more guest cycles. This
 ///   lets a blocking Toolbox routine wait for clocks or host input without
@@ -2910,6 +2913,12 @@ pub enum PpcImportAction {
     /// Synthesize a value return and charge additional guest cycles
     /// for repeated polling work that the host skipped.
     ReturnWithExtraCycles(u32, u64),
+    /// Continue from the PC and register state set by the import handler.
+    ///
+    /// This permits an embedder to retain its own guest-call continuation and
+    /// schedule the next architectural context without duplicating that state
+    /// inside [`PpcCpu`]. The handled import is charged normally.
+    Continue,
     /// End the current execution slice without changing the PC or registers,
     /// consuming at most this many additional guest cycles. Use `u64::MAX`
     /// when the service can advance only after external input.
@@ -3404,6 +3413,8 @@ impl PpcCpu {
     ///   and charge extra guest cycles for host-skipped polling work.
     ///   Fully bypasses the trampoline `blr` — no memory fetch
     ///   for the trap word happens, no instruction is decoded.
+    /// - [`PpcImportAction::Continue`]: execution resumes from the PC and
+    ///   register state arranged by the handler.
     /// - [`PpcImportAction::CallNative`]: execution enters guest
     ///   PowerPC code at `entry` with `gpr2 = rtoc` and `lr =
     ///   return_pc`; when the guest reaches `return_pc`, the saved
@@ -3534,6 +3545,10 @@ impl PpcCpu {
                             self.gpr[3] = value;
                             self.pc = self.lr;
                             cycles = cycles.saturating_add(1).saturating_add(extra_cycles);
+                            continue;
+                        }
+                        PpcImportAction::Continue => {
+                            cycles = cycles.saturating_add(1);
                             continue;
                         }
                         PpcImportAction::Yield(yield_cycles) => {
@@ -3801,6 +3816,10 @@ impl PpcCpu {
                 *cycles = cycles.saturating_add(7).saturating_add(extra_cycles);
                 Some(PpcFastImportStubResult::Continue)
             }
+            PpcImportAction::Continue => {
+                *cycles = cycles.saturating_add(7);
+                Some(PpcFastImportStubResult::Continue)
+            }
             PpcImportAction::Yield(yield_cycles) => {
                 Some(PpcFastImportStubResult::Stop(PpcRunResult::CycleLimit {
                     cycles: cycles
@@ -4037,6 +4056,10 @@ impl PpcCpu {
                             self.gpr[3] = value;
                             self.pc = self.lr;
                             cycles = cycles.saturating_add(1).saturating_add(extra_cycles);
+                            continue;
+                        }
+                        PpcImportAction::Continue => {
+                            cycles = cycles.saturating_add(1);
                             continue;
                         }
                         PpcImportAction::Yield(yield_cycles) => {
