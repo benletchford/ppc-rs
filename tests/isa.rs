@@ -6056,6 +6056,35 @@ fn ppc_section_mem_does_not_cache_instruction_fetches_from_writable_memory() {
 }
 
 #[test]
+fn ppc_section_mem_instruction_tokens_identify_immutable_mapping_versions() {
+    let mut first = PpcSectionMem::new();
+    first.add_readonly_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
+    let mut unchanged_clone = first.clone();
+    assert_eq!(
+        first.instruction_cache_token(0x1000),
+        unchanged_clone.instruction_cache_token(0x1000)
+    );
+
+    let mut separate = PpcSectionMem::new();
+    separate.add_readonly_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
+    assert_ne!(
+        first.instruction_cache_token(0x1000),
+        separate.instruction_cache_token(0x1000)
+    );
+
+    first.add_readonly_region(0x1000, 0x3863_0001u32.to_be_bytes().to_vec());
+    unchanged_clone.add_readonly_region(0x1000, 0x3863_0002u32.to_be_bytes().to_vec());
+    assert_ne!(
+        first.instruction_cache_token(0x1000),
+        unchanged_clone.instruction_cache_token(0x1000)
+    );
+
+    let mut writable = PpcSectionMem::new();
+    writable.add_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
+    assert_eq!(writable.instruction_cache_token(0x1000), None);
+}
+
+#[test]
 fn ppc_section_mem_returns_none_outside_any_region() {
     let mut mem = PpcSectionMem::new();
     mem.add_region(0x1000, vec![0xAA, 0xBB]);
