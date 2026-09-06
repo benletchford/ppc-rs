@@ -23,6 +23,103 @@ fn d_form_compare(opcd: u8, bf: u8, l: bool, ra: u8, imm: u16) -> u32 {
         | u32::from(imm)
 }
 
+fn cfm_import_stub_words(toc_slot_disp: u16) -> [u32; 6] {
+    [
+        0x8182_0000 | u32::from(toc_slot_disp),
+        0x9041_0014,
+        0x800C_0000,
+        0x804C_0004,
+        0x7C09_03A6,
+        0x4E80_0420,
+    ]
+}
+
+const CFM_CODE_BASE: u32 = 0x1000;
+const CFM_TOC_BASE: u32 = 0x2000;
+const CFM_STACK_BASE: u32 = 0x3000;
+const CFM_TVECTOR: u32 = 0x4000;
+const CFM_TRAP_BASE: u32 = 0x5000;
+const CFM_HALT_PC: u32 = 0x6000;
+const CFM_IMPORT_RTOC: u32 = 0x7000;
+const CFM_TOC_SLOT_DISP: u16 = 0x10;
+
+fn cfm_data_memory() -> PpcSectionMem {
+    let mut mem = PpcSectionMem::new();
+    mem.add_region(CFM_TOC_BASE, vec![0; 0x40]);
+    mem.add_region(CFM_STACK_BASE, vec![0; 0x40]);
+    mem.add_region(CFM_TVECTOR, vec![0; 8]);
+    mem.write_u32_be(CFM_TOC_BASE + u32::from(CFM_TOC_SLOT_DISP), CFM_TVECTOR)
+        .unwrap();
+    mem.write_u32_be(CFM_TVECTOR, CFM_TRAP_BASE).unwrap();
+    mem.write_u32_be(CFM_TVECTOR + 4, CFM_IMPORT_RTOC).unwrap();
+    mem
+}
+
+fn cfm_section_memory(words: [u32; 6], readonly: bool) -> PpcSectionMem {
+    let code = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let mut mem = PpcSectionMem::new();
+    if readonly {
+        mem.add_readonly_region(CFM_CODE_BASE, code);
+    } else {
+        mem.add_region(CFM_CODE_BASE, code);
+    }
+    mem.add_region(CFM_TOC_BASE, vec![0; 0x40]);
+    mem.add_region(CFM_STACK_BASE, vec![0; 0x40]);
+    mem.add_region(CFM_TVECTOR, vec![0; 8]);
+    mem.write_u32_be(CFM_TOC_BASE + u32::from(CFM_TOC_SLOT_DISP), CFM_TVECTOR)
+        .unwrap();
+    mem.write_u32_be(CFM_TVECTOR, CFM_TRAP_BASE).unwrap();
+    mem.write_u32_be(CFM_TVECTOR + 4, CFM_IMPORT_RTOC).unwrap();
+    mem
+}
+
+fn cfm_cpu() -> PpcCpu {
+    let mut cpu = PpcCpu::new();
+    cpu.pc = CFM_CODE_BASE;
+    cpu.lr = CFM_HALT_PC;
+    cpu.gpr[1] = CFM_STACK_BASE;
+    cpu.gpr[2] = CFM_TOC_BASE;
+    cpu
+}
+
+fn reset_cfm_cpu_for_unaccelerated_return(cpu: &mut PpcCpu) {
+    cpu.pc = CFM_CODE_BASE;
+    cpu.lr = CFM_HALT_PC;
+    cpu.gpr[0] = CFM_HALT_PC;
+    cpu.gpr[1] = CFM_STACK_BASE;
+    cpu.gpr[2] = CFM_TOC_BASE;
+}
+
+struct SplitInstructionMemory {
+    data: PpcSectionMem,
+    code_base: u32,
+    instructions: [u32; 6],
+    code_data_reads: usize,
+}
+
+impl PpcMemory for SplitInstructionMemory {
+    fn read_u8(&mut self, addr: u32) -> Option<u8> {
+        let code_offset = addr.checked_sub(self.code_base)?;
+        if code_offset < 24 {
+            self.code_data_reads += 1;
+            return Some(0);
+        }
+        self.data.read_u8(addr)
+    }
+
+    fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+        if addr.wrapping_sub(self.code_base) < 24 {
+            return None;
+        }
+        self.data.write_u8(addr, value)
+    }
+
+    fn read_instruction_u32_be(&mut self, addr: u32) -> Option<u32> {
+        let index = usize::try_from(addr.checked_sub(self.code_base)? / 4).ok()?;
+        self.instructions.get(index).copied()
+    }
+}
+
 #[test]
 fn fresh_cpu_state_has_classic_mac_defaults() {
     let cpu = PpcCpu::new();
@@ -496,6 +593,138 @@ fn run_with_imports_fast_paths_cfm_tvector_import_stub() {
     assert_eq!(cpu.pc, halt_pc);
     assert_eq!(cpu.gpr[2], second_import_rtoc);
     assert_eq!(cpu.gpr[3], 0xDCBA);
+}
+
+#[test]
+fn run_with_imports_revalidates_cached_cfm_stub_after_trailing_code_write() {
+    let mut mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), false);
+    let mut cpu = cfm_cpu();
+    let mut calls = 0;
+    let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 7
+        }
+    );
+    assert_eq!(calls, 1);
+
+    // Preserve the cached first word while replacing the trailing branch.
+    // Ordinary execution must now return through LR instead of dispatching
+    // the transition-vector entry as an import.
+    mem.write_u32_be(CFM_CODE_BASE + 20, 0x4E80_0020).unwrap(); // blr
+    reset_cfm_cpu_for_unaccelerated_return(&mut cpu);
+    let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 6
+        }
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(cpu.gpr[2], CFM_IMPORT_RTOC);
+    assert_eq!(cpu.ctr, CFM_TRAP_BASE);
+    assert_eq!(mem.read_u32_be(CFM_STACK_BASE + 20), Some(CFM_TOC_BASE));
+}
+
+#[test]
+fn run_with_imports_rechecks_cfm_stub_after_interior_overlay() {
+    let mut mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut cpu = cfm_cpu();
+    let mut calls = 0;
+    let _ = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(calls, 1);
+
+    // Overlay only the third instruction. The first word and all other
+    // mappings are unchanged.
+    mem.add_readonly_region(CFM_CODE_BASE + 8, 0x6000_0000u32.to_be_bytes().to_vec());
+    reset_cfm_cpu_for_unaccelerated_return(&mut cpu);
+    let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 6
+        }
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(cpu.ctr, CFM_HALT_PC);
+}
+
+#[test]
+fn run_with_imports_uses_instruction_view_when_recognizing_cfm_stub() {
+    let mut mem = SplitInstructionMemory {
+        data: cfm_data_memory(),
+        code_base: CFM_CODE_BASE,
+        instructions: cfm_import_stub_words(CFM_TOC_SLOT_DISP),
+        code_data_reads: 0,
+    };
+
+    let mut cpu = cfm_cpu();
+    let mut calls = 0;
+    let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 7
+        }
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(mem.code_data_reads, 0);
+}
+
+#[test]
+fn run_with_imports_does_not_reuse_cfm_stub_recognition_across_memory_objects() {
+    let mut first = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut second_words = cfm_import_stub_words(CFM_TOC_SLOT_DISP);
+    second_words[2] = 0x6000_0000; // nop
+    let mut second = cfm_section_memory(second_words, true);
+
+    let mut cpu = cfm_cpu();
+    let mut calls = 0;
+    let _ = cpu.run_with_imports(&mut first, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(calls, 1);
+
+    // Both memories have the same mapping count and therefore the same
+    // instance-local mapping generation. Their instruction bytes differ.
+    reset_cfm_cpu_for_unaccelerated_return(&mut cpu);
+    let result = cpu.run_with_imports(&mut second, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 6
+        }
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(cpu.ctr, CFM_HALT_PC);
 }
 
 #[test]

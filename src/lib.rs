@@ -60,9 +60,6 @@ struct FpMulAddControl {
 const PPC_DECODE_CACHE_MAX_ENTRIES: usize = 4096;
 const PPC_DECODE_CACHE_INDEX_MASK: usize = PPC_DECODE_CACHE_MAX_ENTRIES - 1;
 type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
-const PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES: usize = 1024;
-const PPC_CFM_IMPORT_STUB_CACHE_INDEX_MASK: usize = PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES - 1;
-type PpcCfmImportStubCacheEntry = Option<(u32, u32)>;
 const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 1024;
 const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
@@ -410,8 +407,6 @@ pub struct PpcCpu {
     // loader result remain small enough to pass through debug stack frames.
     decode_cache: Box<[PpcDecodeCacheEntry]>,
 
-    cfm_import_stub_cache: Box<[PpcCfmImportStubCacheEntry]>,
-
     basic_block_cache: Box<[Option<PpcBasicBlockCacheEntry>]>,
 }
 
@@ -484,8 +479,6 @@ impl PpcCpu {
             time_base: 0,
             import_call_stack: Vec::new(),
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
-            cfm_import_stub_cache: vec![None; PPC_CFM_IMPORT_STUB_CACHE_MAX_ENTRIES]
-                .into_boxed_slice(),
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
         }
     }
@@ -3708,21 +3701,16 @@ impl PpcCpu {
     where
         F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
     {
-        let cache_index = ((pc >> 2) as usize) & PPC_CFM_IMPORT_STUB_CACHE_INDEX_MASK;
-        match self.cfm_import_stub_cache[cache_index] {
-            Some((cached_pc, cached_first_word))
-                if cached_pc == pc && cached_first_word == first_word => {}
-            _ => {
-                if mem.read_u32_be(pc.wrapping_add(4))? != 0x9041_0014
-                    || mem.read_u32_be(pc.wrapping_add(8))? != 0x800C_0000
-                    || mem.read_u32_be(pc.wrapping_add(12))? != 0x804C_0004
-                    || mem.read_u32_be(pc.wrapping_add(16))? != 0x7C09_03A6
-                    || mem.read_u32_be(pc.wrapping_add(20))? != 0x4E80_0420
-                {
-                    return None;
-                }
-                self.cfm_import_stub_cache[cache_index] = Some((pc, first_word));
-            }
+        // Recheck the complete instruction-view pattern on every entry.
+        // Writable code, newer overlays, and a different memory object can
+        // all preserve the first word while changing any trailing word.
+        if mem.read_instruction_u32_be(pc.wrapping_add(4))? != 0x9041_0014
+            || mem.read_instruction_u32_be(pc.wrapping_add(8))? != 0x800C_0000
+            || mem.read_instruction_u32_be(pc.wrapping_add(12))? != 0x804C_0004
+            || mem.read_instruction_u32_be(pc.wrapping_add(16))? != 0x7C09_03A6
+            || mem.read_instruction_u32_be(pc.wrapping_add(20))? != 0x4E80_0420
+        {
+            return None;
         }
 
         let displacement = first_word as u16 as i16;
