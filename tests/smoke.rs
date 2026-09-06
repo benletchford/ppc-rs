@@ -221,6 +221,81 @@ fn run_executes_addi_blr_to_halt_pc() {
 }
 
 #[test]
+fn immutable_basic_block_cache_does_not_cross_distinct_section_memories() {
+    let base = 0x1000;
+    let halt_pc = 0x2000;
+    let mut first = PpcSectionMem::new();
+    first.add_readonly_region(
+        base,
+        [0x3863_0001u32, 0x4E80_0020]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect(),
+    );
+    let mut second = PpcSectionMem::new();
+    second.add_readonly_region(
+        base,
+        [0x3863_0002u32, 0x4E80_0020]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect(),
+    );
+
+    let mut cpu = PpcCpu::new();
+    cpu.pc = base;
+    cpu.lr = halt_pc;
+    assert_eq!(
+        cpu.run_with_imports(&mut first, 2, halt_pc, 0, 0, |_, _, _| {
+            unreachable!("test program has no imports")
+        }),
+        PpcRunResult::CycleLimit { cycles: 2 }
+    );
+    assert_eq!(cpu.gpr[3], 1);
+
+    cpu.pc = base;
+    cpu.gpr[3] = 0;
+    assert_eq!(
+        cpu.run_with_imports(&mut second, 2, halt_pc, 0, 0, |_, _, _| {
+            unreachable!("test program has no imports")
+        }),
+        PpcRunResult::CycleLimit { cycles: 2 }
+    );
+    assert_eq!(cpu.gpr[3], 2);
+}
+
+#[test]
+fn immutable_basic_block_cache_distinguishes_divergent_clones() {
+    let base = 0x1000;
+    let halt_pc = 0x2000;
+    let initial_code = [0x3863_0001u32, 0x4E80_0020]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let mut first = PpcSectionMem::new();
+    first.add_readonly_region(base, initial_code);
+    let mut second = first.clone();
+    first.add_readonly_region(base, 0x3863_0002u32.to_be_bytes().to_vec());
+    second.add_readonly_region(base, 0x3863_0003u32.to_be_bytes().to_vec());
+
+    let mut cpu = PpcCpu::new();
+    let mut run = |memory: &mut PpcSectionMem, expected| {
+        cpu.pc = base;
+        cpu.lr = halt_pc;
+        cpu.gpr[3] = 0;
+        assert_eq!(
+            cpu.run_with_imports(memory, 2, halt_pc, 0, 0, |_, _, _| {
+                unreachable!("test program has no imports")
+            }),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], expected);
+    };
+    run(&mut first, 2);
+    run(&mut second, 3);
+    run(&mut first, 2);
+}
+
+#[test]
 fn run_with_imports_fast_paths_exact_nop_and_blr_words() {
     let mut mem = PpcSectionMem::new();
     let mut code: Vec<u8> = Vec::new();
@@ -708,8 +783,8 @@ fn run_with_imports_does_not_reuse_cfm_stub_recognition_across_memory_objects() 
     });
     assert_eq!(calls, 1);
 
-    // Both memories have the same mapping count and therefore the same
-    // instance-local mapping generation. Their instruction bytes differ.
+    // The memories have the same mapping shape, but their instruction bytes
+    // differ. Recognition must always follow the current instruction view.
     reset_cfm_cpu_for_unaccelerated_return(&mut cpu);
     let result = cpu.run_with_imports(&mut second, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
         calls += 1;

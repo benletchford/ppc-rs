@@ -8,6 +8,8 @@
 //! addresses; the dispatcher converts that into a `MemoryFault`
 //! step result rather than panicking.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// Memory-bus abstraction for the PowerPC interpreter.
 ///
 /// Provides byte-granular reads and writes plus default
@@ -80,9 +82,12 @@ pub trait PpcMemory {
 
     /// Return a token for an immutable executable mapping containing `addr`.
     ///
-    /// The CPU may reuse instruction words while the token remains unchanged.
-    /// Memory implementations that can contain writable or self-modifying code
-    /// should keep the default `None` result for those addresses.
+    /// Equal tokens authorize the CPU to reuse instruction words, including
+    /// when it is run against a different memory value. Implementations must
+    /// therefore only return the same token while the instruction view is
+    /// identical at every address covered by that token. Memory implementations
+    /// that can contain writable or self-modifying code should keep the default
+    /// `None` result for those addresses.
     #[inline]
     fn instruction_cache_token(&mut self, _addr: u32) -> Option<u64> {
         None
@@ -142,7 +147,7 @@ pub struct PpcSectionMem {
     overlap_span_cache: [Option<(u32, u32, usize)>; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES],
     region_cache: [Option<usize>; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
     instruction_cache: Box<[Option<(u32, u32)>]>,
-    instruction_mapping_generation: u64,
+    instruction_mapping_token: u64,
     has_overlapping_regions: bool,
 }
 
@@ -168,6 +173,15 @@ const PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK: usize =
     PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES - 1;
 const PPC_SECTION_MEM_INSTRUCTION_CACHE_INDEX_MASK: usize =
     PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES - 1;
+static NEXT_INSTRUCTION_MAPPING_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn try_next_instruction_mapping_token(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .ok()
+}
 
 #[derive(Debug, Clone)]
 struct PpcMemRegion {
@@ -185,7 +199,7 @@ impl Default for PpcSectionMem {
             region_cache: [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
             instruction_cache: vec![None; PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES]
                 .into_boxed_slice(),
-            instruction_mapping_generation: 0,
+            instruction_mapping_token: 0,
             has_overlapping_regions: false,
         }
     }
@@ -204,26 +218,33 @@ impl PpcSectionMem {
     /// intentionally wants to overlay an earlier writable mapping.
     /// When ranges overlap, the most recently added region wins.
     pub fn add_region(&mut self, base: u32, bytes: Vec<u8>) {
-        self.has_overlapping_regions |= self.overlaps_existing_region(base, bytes.len());
-        self.regions.push(PpcMemRegion {
-            base,
-            bytes,
-            writable: true,
-        });
-        self.clear_region_cache();
+        self.add_mapped_region(base, bytes, true, &NEXT_INSTRUCTION_MAPPING_TOKEN);
     }
 
     /// Map `bytes` into the guest at `[base, base + bytes.len())`
     /// as read-only storage. Stores hitting this range surface
     /// as a `MemoryFault`.
     pub fn add_readonly_region(&mut self, base: u32, bytes: Vec<u8>) {
+        self.add_mapped_region(base, bytes, false, &NEXT_INSTRUCTION_MAPPING_TOKEN);
+    }
+
+    fn add_mapped_region(
+        &mut self,
+        base: u32,
+        bytes: Vec<u8>,
+        writable: bool,
+        instruction_mapping_tokens: &AtomicU64,
+    ) {
+        let instruction_mapping_token =
+            try_next_instruction_mapping_token(instruction_mapping_tokens)
+                .expect("instruction mapping token space exhausted");
         self.has_overlapping_regions |= self.overlaps_existing_region(base, bytes.len());
         self.regions.push(PpcMemRegion {
             base,
             bytes,
-            writable: false,
+            writable,
         });
-        self.clear_region_cache();
+        self.clear_region_cache(instruction_mapping_token);
     }
 
     /// Number of regions currently mapped.
@@ -525,12 +546,12 @@ impl PpcSectionMem {
     }
 
     #[inline]
-    fn clear_region_cache(&mut self) {
+    fn clear_region_cache(&mut self, instruction_mapping_token: u64) {
         self.page_cache = [None; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES];
         self.overlap_span_cache = [None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES];
         self.region_cache = [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES];
         self.instruction_cache.fill(None);
-        self.instruction_mapping_generation = self.instruction_mapping_generation.wrapping_add(1);
+        self.instruction_mapping_token = instruction_mapping_token;
     }
 
     #[inline]
@@ -703,7 +724,7 @@ impl PpcMemory for PpcSectionMem {
                 return None;
             }
         }
-        Some(self.instruction_mapping_generation)
+        Some(self.instruction_mapping_token)
     }
 
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {
@@ -743,5 +764,39 @@ impl PpcMemory for PpcSectionMem {
             return Some(());
         }
         self.write_bytes(addr, &value.to_be_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn exhausted_instruction_token_allocation_cannot_mutate_a_mapping() {
+        let mut mem = PpcSectionMem::new();
+        let available = AtomicU64::new(42);
+        mem.add_mapped_region(
+            0x1000,
+            0x6000_0000u32.to_be_bytes().to_vec(),
+            false,
+            &available,
+        );
+        let exhausted = AtomicU64::new(u64::MAX);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            mem.add_mapped_region(
+                0x1000,
+                0x4E80_0020u32.to_be_bytes().to_vec(),
+                false,
+                &exhausted,
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(mem.region_count(), 1);
+        assert_eq!(mem.read_instruction_u32_be(0x1000), Some(0x6000_0000));
+        assert_eq!(mem.instruction_cache_token(0x1000), Some(42));
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
     }
 }
