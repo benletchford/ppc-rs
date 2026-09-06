@@ -338,11 +338,72 @@ impl PpcFetchObserver for PpcFetchHistogram {
     }
 }
 
-/// PowerPC architectural state. Registers are stored as `u32` /
-/// `u64` rather than as bitfield structs because every dispatch
-/// site reads them as plain integers — the architectural sub-fields
-/// (e.g. CR's eight 4-bit fields, XER's SO/OV/CA flags) are decoded
-/// at access time.
+/// Register state required to resume PowerPC execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PpcArchitecturalState {
+    /// General-purpose registers GPR0 through GPR31.
+    pub gpr: [u32; 32],
+    /// Floating-point registers FPR0 through FPR31.
+    pub fpr: [u64; 32],
+    /// Condition Register.
+    pub cr: u32,
+    /// Link Register.
+    pub lr: u32,
+    /// Count Register.
+    pub ctr: u32,
+    /// Fixed-point Exception Register.
+    pub xer: u32,
+    /// Floating-point Status and Control Register.
+    pub fpscr: u32,
+    /// Machine State Register.
+    pub msr: u32,
+    /// Program counter for the next instruction.
+    pub pc: u32,
+}
+
+/// Suspendable PowerPC execution state.
+///
+/// This value contains architectural registers and opaque native-import
+/// continuations. Engine policy, time, caches, and reservation state remain
+/// owned by [`PpcCpu`].
+#[derive(Debug, Clone)]
+pub struct PpcExecutionContext {
+    architectural: PpcArchitecturalState,
+    import_call_stack: Vec<PpcImportReturnFrame>,
+}
+
+impl PpcExecutionContext {
+    /// Construct a context with the architectural defaults of [`PpcCpu::new`].
+    pub fn fresh() -> Self {
+        Self {
+            architectural: PpcArchitecturalState {
+                gpr: [0; 32],
+                fpr: [0; 32],
+                cr: 0,
+                lr: 0,
+                ctr: 0,
+                xer: 0,
+                fpscr: 0,
+                msr: PPC_MSR_FP_AVAILABLE_MASK,
+                pc: 0,
+            },
+            import_call_stack: Vec::new(),
+        }
+    }
+
+    /// Borrow the architectural registers.
+    pub fn architectural(&self) -> &PpcArchitecturalState {
+        &self.architectural
+    }
+
+    /// Mutably borrow the architectural registers to prepare an execution entry.
+    pub fn architectural_mut(&mut self) -> &mut PpcArchitecturalState {
+        &mut self.architectural
+    }
+}
+
+/// PowerPC architectural state and live execution engine. Registers are stored
+/// as plain integers; architectural sub-fields are decoded at access time.
 #[derive(Debug, Clone)]
 pub struct PpcCpu {
     /// General-purpose registers (GPR0..GPR31). GPR1 is the stack
@@ -481,6 +542,50 @@ impl PpcCpu {
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
         }
+    }
+
+    /// Capture the state required to resume this execution context.
+    ///
+    /// Capturing does not mutate the CPU. In particular, the live reservation
+    /// remains available until the host commits its own suspension protocol.
+    pub fn capture_execution_context(&self) -> PpcExecutionContext {
+        PpcExecutionContext {
+            architectural: PpcArchitecturalState {
+                gpr: self.gpr,
+                fpr: self.fpr,
+                cr: self.cr,
+                lr: self.lr,
+                ctr: self.ctr,
+                xer: self.xer,
+                fpscr: self.fpscr,
+                msr: self.msr,
+                pc: self.pc,
+            },
+            import_call_stack: self.import_call_stack.clone(),
+        }
+    }
+
+    /// Install suspendable execution state into this engine.
+    ///
+    /// The destination engine retains its alignment policy, time base, and
+    /// caches. Installation invalidates its reservation so a saved context
+    /// cannot recreate a stale load-and-reserve sequence.
+    pub fn install_execution_context(&mut self, context: PpcExecutionContext) {
+        let PpcExecutionContext {
+            architectural,
+            import_call_stack,
+        } = context;
+        self.gpr = architectural.gpr;
+        self.fpr = architectural.fpr;
+        self.cr = architectural.cr;
+        self.lr = architectural.lr;
+        self.ctr = architectural.ctr;
+        self.xer = architectural.xer;
+        self.fpscr = architectural.fpscr;
+        self.msr = architectural.msr;
+        self.pc = architectural.pc;
+        self.import_call_stack = import_call_stack;
+        self.reservation_addr = None;
     }
 
     /// Read CR field N (0–7). Each field is 4 bits; field 0 is the
@@ -6871,14 +6976,20 @@ mod tests {
         base: u32,
         bytes: Vec<u8>,
         instruction_reads: usize,
+        token: u64,
     }
 
     impl CountingImmutableMemory {
         fn new(base: u32, words: &[u32]) -> Self {
+            Self::with_token(base, words, 1)
+        }
+
+        fn with_token(base: u32, words: &[u32], token: u64) -> Self {
             Self {
                 base,
                 bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
                 instruction_reads: 0,
+                token,
             }
         }
     }
@@ -6900,7 +7011,7 @@ mod tests {
 
         fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
             let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
-            (self.bytes.len().saturating_sub(offset) >= 4).then_some(1)
+            (self.bytes.len().saturating_sub(offset) >= 4).then_some(self.token)
         }
     }
 
@@ -6908,6 +7019,359 @@ mod tests {
     fn cpu_keeps_large_host_caches_off_the_stack() {
         let size = std::mem::size_of::<PpcCpu>();
         assert!(size <= 1024, "PpcCpu grew to {size} stack bytes");
+    }
+
+    #[test]
+    fn fresh_execution_context_matches_cpu_architectural_defaults() {
+        let context = PpcExecutionContext::fresh();
+        let cpu = PpcCpu::new();
+
+        assert_eq!(
+            context.architectural(),
+            cpu.capture_execution_context().architectural()
+        );
+        assert!(context.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_round_trips_registers_and_retains_engine_state() {
+        let expected_architectural = PpcArchitecturalState {
+            gpr: std::array::from_fn(|index| 0x1000_0000 | index as u32),
+            fpr: std::array::from_fn(|index| 0x2000_0000_0000_0000 | index as u64),
+            cr: 0x3456_789a,
+            lr: 0x4567_89ab,
+            ctr: 0x5678_9abc,
+            xer: 0x6789_abcd,
+            fpscr: 0x789a_bcde,
+            msr: 0x89ab_cdef,
+            pc: 0x9abc_def0,
+        };
+        let mut source = PpcCpu::new();
+        source.gpr = expected_architectural.gpr;
+        source.fpr = expected_architectural.fpr;
+        source.cr = expected_architectural.cr;
+        source.lr = expected_architectural.lr;
+        source.ctr = expected_architectural.ctr;
+        source.xer = expected_architectural.xer;
+        source.fpscr = expected_architectural.fpscr;
+        source.msr = expected_architectural.msr;
+        source.pc = expected_architectural.pc;
+        let captured = source.capture_execution_context();
+
+        assert_eq!(captured.architectural(), &expected_architectural);
+
+        source.gpr.fill(0);
+        source.fpr.fill(0);
+        source.cr = 0;
+        source.lr = 0;
+        source.ctr = 0;
+        source.xer = 0;
+        source.fpscr = 0;
+        source.msr = 0;
+        source.pc = 0;
+
+        let mut destination = PpcCpu::new();
+        destination.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        assert_eq!(
+            destination.step_instruction(0x6000_0000),
+            PpcStepResult::Stepped
+        );
+        destination.set_time_base(0x1122_3344_5566_7788);
+        let cached_decodes = destination.decode_cache_entry_count();
+        destination.install_execution_context(captured);
+
+        assert_eq!(
+            destination.capture_execution_context().architectural(),
+            &expected_architectural
+        );
+        assert_eq!(
+            destination.alignment_policy,
+            PpcAlignmentPolicy::EmulateData
+        );
+        assert_eq!(destination.time_base(), 0x1122_3344_5566_7788);
+        assert_eq!(destination.decode_cache_entry_count(), cached_decodes);
+    }
+
+    #[test]
+    fn execution_context_resumes_nested_native_import_returns() {
+        const TRAP_BASE: u32 = 0x1000;
+        const OUTER_RETURN: u32 = 0x2000;
+        const INNER_RETURN: u32 = 0x2100;
+        const HALT_PC: u32 = 0x3000;
+
+        let mut cpu = PpcCpu::new();
+        let mut memory = PpcSectionMem::new();
+        cpu.pc = TRAP_BASE;
+        let first = cpu.run_with_imports(&mut memory, 1, HALT_PC, TRAP_BASE, 2, |index, _, _| {
+            assert_eq!(index, 0);
+            PpcImportAction::CallNative {
+                entry: TRAP_BASE + 4,
+                rtoc: 0xaaaa_0001,
+                return_pc: OUTER_RETURN,
+                final_pc: HALT_PC,
+                restore_rtoc: 0x1111_0001,
+                return_gpr3: PpcNativeReturnGpr3::Set(0x3333_0003),
+            }
+        });
+        assert_eq!(first, PpcRunResult::CycleLimit { cycles: 1 });
+        let context = cpu.capture_execution_context();
+        assert_eq!(context.import_call_stack.len(), 1);
+
+        let mut resumed = PpcCpu::new();
+        resumed.install_execution_context(context);
+        let second =
+            resumed.run_with_imports(&mut memory, 10, HALT_PC, TRAP_BASE, 2, |index, _, _| {
+                assert_eq!(index, 1);
+                PpcImportAction::CallNative {
+                    entry: INNER_RETURN,
+                    rtoc: 0xbbbb_0002,
+                    return_pc: INNER_RETURN,
+                    final_pc: OUTER_RETURN,
+                    restore_rtoc: 0xaaaa_0001,
+                    return_gpr3: PpcNativeReturnGpr3::Set(0x2222_0002),
+                }
+            });
+
+        assert_eq!(
+            second,
+            PpcRunResult::Halted {
+                pc: HALT_PC,
+                cycles: 3
+            }
+        );
+        assert_eq!(resumed.pc, HALT_PC);
+        assert_eq!(resumed.lr, HALT_PC);
+        assert_eq!(resumed.gpr[2], 0x1111_0001);
+        assert_eq!(resumed.gpr[3], 0x3333_0003);
+        assert!(resumed.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_install_replaces_pending_import_frames_a_b_a() {
+        fn pending_context(
+            trap_pc: u32,
+            return_pc: u32,
+            final_pc: u32,
+            callback_rtoc: u32,
+            restored_rtoc: u32,
+            result: u32,
+        ) -> PpcExecutionContext {
+            let mut cpu = PpcCpu::new();
+            let mut memory = PpcSectionMem::new();
+            cpu.pc = trap_pc;
+            assert_eq!(
+                cpu.run_with_imports(&mut memory, 1, 0, trap_pc, 1, |index, _, _| {
+                    assert_eq!(index, 0);
+                    PpcImportAction::CallNative {
+                        entry: return_pc,
+                        rtoc: callback_rtoc,
+                        return_pc,
+                        final_pc,
+                        restore_rtoc: restored_rtoc,
+                        return_gpr3: PpcNativeReturnGpr3::Set(result),
+                    }
+                },),
+                PpcRunResult::CycleLimit { cycles: 1 }
+            );
+            cpu.capture_execution_context()
+        }
+
+        const A_RETURN: u32 = 0x2000;
+        const A_FINAL: u32 = 0x3000;
+        const A_RTOC: u32 = 0xaaaa_0001;
+        const A_RESULT: u32 = 0xaaaa_0003;
+        const B_RETURN: u32 = 0x2100;
+        const B_FINAL: u32 = 0x3100;
+        const B_RTOC: u32 = 0xbbbb_0002;
+        const B_RESULT: u32 = 0xbbbb_0003;
+
+        let context_a = pending_context(0x1000, A_RETURN, A_FINAL, 0xaaaa_1000, A_RTOC, A_RESULT);
+        let context_b = pending_context(0x1100, B_RETURN, B_FINAL, 0xbbbb_1000, B_RTOC, B_RESULT);
+        let mut engine = PpcCpu::new();
+        let mut memory = PpcSectionMem::new();
+
+        engine.install_execution_context(context_a.clone());
+        engine.install_execution_context(context_b);
+        assert_eq!(
+            engine.run_with_imports(&mut memory, 2, B_FINAL, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::Halted {
+                pc: B_FINAL,
+                cycles: 1
+            }
+        );
+        assert_eq!(engine.pc, B_FINAL);
+        assert_eq!(engine.lr, B_FINAL);
+        assert_eq!(engine.gpr[2], B_RTOC);
+        assert_eq!(engine.gpr[3], B_RESULT);
+        assert!(engine.import_call_stack.is_empty());
+
+        engine.install_execution_context(context_a);
+        assert_eq!(
+            engine.run_with_imports(&mut memory, 2, A_FINAL, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::Halted {
+                pc: A_FINAL,
+                cycles: 1
+            }
+        );
+        assert_eq!(engine.pc, A_FINAL);
+        assert_eq!(engine.lr, A_FINAL);
+        assert_eq!(engine.gpr[2], A_RTOC);
+        assert_eq!(engine.gpr[3], A_RESULT);
+        assert!(engine.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_runs_across_distinct_section_memories() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+
+        let mut first_memory = PpcSectionMem::new();
+        first_memory.add_readonly_region(
+            BASE,
+            [0x3863_0001, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut equal_token_memory = first_memory.clone();
+        let mut different_token_memory = PpcSectionMem::new();
+        different_token_memory.add_readonly_region(
+            BASE,
+            [0x3863_0005, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+        assert_eq!(
+            cpu.run_with_imports(&mut first_memory, 2, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 1);
+
+        let mut context = cpu.capture_execution_context();
+        context.architectural_mut().gpr[3] = 10;
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(
+                &mut equal_token_memory,
+                2,
+                0,
+                0,
+                0,
+                |_, _, _| unreachable!()
+            ),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 11);
+
+        let mut context = cpu.capture_execution_context();
+        context.architectural_mut().gpr[3] = 20;
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(&mut different_token_memory, 2, 0, 0, 0, |_, _, _| {
+                unreachable!()
+            }),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 25);
+    }
+
+    #[test]
+    fn execution_context_retains_token_validated_basic_block_cache() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+        let words = [0x3863_0001, BRANCH_TO_BASE];
+        let mut first_memory = CountingImmutableMemory::with_token(BASE, &words, 41);
+        let mut equal_token_memory = CountingImmutableMemory::with_token(BASE, &words, 41);
+        let mut different_token_memory =
+            CountingImmutableMemory::with_token(BASE, &[0x3863_0005, BRANCH_TO_BASE], 42);
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut first_memory, 2, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(first_memory.instruction_reads, 2);
+
+        let context = cpu.capture_execution_context();
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(
+                &mut equal_token_memory,
+                2,
+                0,
+                0,
+                0,
+                |_, _, _| unreachable!()
+            ),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(equal_token_memory.instruction_reads, 0);
+        assert_eq!(cpu.gpr[3], 2);
+
+        let context = cpu.capture_execution_context();
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(&mut different_token_memory, 2, 0, 0, 0, |_, _, _| {
+                unreachable!()
+            }),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(different_token_memory.instruction_reads, 2);
+        assert_eq!(cpu.gpr[3], 7);
+    }
+
+    #[test]
+    fn capture_preserves_reservation_but_install_invalidates_it() {
+        const ADDRESS: u32 = 0x1000;
+        const ORIGINAL: u32 = 0x1122_3344;
+        const REPLACEMENT: u32 = 0xaabb_ccdd;
+        const LWARX_R3_R4_R5: u32 = (31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (20 << 1);
+        const STWCX_R6_R4_R5: u32 = (31 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (150 << 1) | 1;
+
+        let mut source_memory = PpcSectionMem::new();
+        source_memory.add_region(ADDRESS, ORIGINAL.to_be_bytes().to_vec());
+        let mut source = PpcCpu::new();
+        source.gpr[4] = ADDRESS;
+        source.gpr[5] = 0;
+        source.gpr[6] = REPLACEMENT;
+        assert_eq!(
+            source.step(&mut source_memory, LWARX_R3_R4_R5),
+            PpcStepResult::Stepped
+        );
+
+        let context = source.capture_execution_context();
+        assert_eq!(source.reservation_address(), Some(ADDRESS));
+        assert_eq!(
+            source.step(&mut source_memory, STWCX_R6_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(source.cr_field(0), 0b0010);
+        assert_eq!(source_memory.read_u32_be(ADDRESS), Some(REPLACEMENT));
+
+        let mut installed_memory = PpcSectionMem::new();
+        installed_memory.add_region(ADDRESS, ORIGINAL.to_be_bytes().to_vec());
+        let mut installed = PpcCpu::new();
+        installed.gpr[4] = ADDRESS;
+        installed.gpr[5] = 0;
+        assert_eq!(
+            installed.step(&mut installed_memory, LWARX_R3_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(installed.reservation_address(), Some(ADDRESS));
+
+        installed.install_execution_context(context);
+        assert_eq!(installed.reservation_address(), None);
+        assert_eq!(
+            installed.step(&mut installed_memory, STWCX_R6_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(installed.cr_field(0), 0);
+        assert_eq!(installed_memory.read_u32_be(ADDRESS), Some(ORIGINAL));
     }
 
     #[test]
