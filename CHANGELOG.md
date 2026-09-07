@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.5.0...ppc-v0.6.0) (2026-09-06)
+
+
+### Features
+
+* separate suspendable PPC execution contexts from engine state ([f76dcc4](https://github.com/benletchford/ppc-rs/commit/f76dcc42f2e0e36e7dffdadf8613f8cb536c098b))
+
+
+### Bug Fixes
+
+* distinguish immutable instruction mappings across memories ([3b1bb99](https://github.com/benletchford/ppc-rs/commit/3b1bb99d6c0d54142cb1972f59f19e41c597fdac))
+* revalidate CFM import stubs through instruction fetches ([765e668](https://github.com/benletchford/ppc-rs/commit/765e6687b4ab532ad3621447a9512344888b23d4))
+
 ## [0.5.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.4.1...ppc-v0.5.0) (2026-08-29)
 
 
