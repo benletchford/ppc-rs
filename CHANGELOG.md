@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.0...ppc-v0.6.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **ppc:** respect CFM import cycle budgets ([cf1d9ae](https://github.com/benletchford/ppc-rs/commit/cf1d9ae10bab1346c7864fb60072fc76eb137156))
+
 ## [0.6.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.5.0...ppc-v0.6.0) (2026-09-06)
 
 
