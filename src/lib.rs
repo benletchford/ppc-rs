@@ -3744,6 +3744,7 @@ impl PpcCpu {
                 }
             };
             if import_count > 0
+                && max_cycles.saturating_sub(cycles) >= 7
                 && (word & 0xFFFF_0000) == 0x8182_0000
                 && let Some(result) = self.try_fast_cfm_import_stub(
                     mem,

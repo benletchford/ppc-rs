@@ -670,6 +670,166 @@ fn run_with_imports_fast_paths_cfm_tvector_import_stub() {
     assert_eq!(cpu.gpr[3], 0xDCBA);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CfmBudgetSnapshot {
+    result: PpcRunResult,
+    imports: Vec<(u64, u32)>,
+    pc: u32,
+    r0: u32,
+    r2: u32,
+    r3: u32,
+    r12: u32,
+    ctr: u32,
+    saved_rtoc: u32,
+}
+
+fn cfm_budget_snapshot(
+    cpu: &PpcCpu,
+    mem: &mut PpcSectionMem,
+    result: PpcRunResult,
+    imports: Vec<(u64, u32)>,
+) -> CfmBudgetSnapshot {
+    CfmBudgetSnapshot {
+        result,
+        imports,
+        pc: cpu.pc,
+        r0: cpu.gpr[0],
+        r2: cpu.gpr[2],
+        r3: cpu.gpr[3],
+        r12: cpu.gpr[12],
+        ctr: cpu.ctr,
+        saved_rtoc: mem.read_u32_be(CFM_STACK_BASE + 20).unwrap(),
+    }
+}
+
+#[test]
+fn run_with_imports_fast_cfm_stub_respects_cycle_budgets() {
+    for budget in 1..=7 {
+        let mut fast_mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+        let mut fast_cpu = cfm_cpu();
+        let mut fast_imports = Vec::new();
+        let fast_result = fast_cpu.run_with_imports_and_cycle_handler(
+            &mut fast_mem,
+            budget,
+            0,
+            CFM_TRAP_BASE,
+            1,
+            |elapsed, index, _, _| {
+                fast_imports.push((elapsed, index));
+                PpcImportAction::Return(0xCAFE_BABE)
+            },
+        );
+        let fast = cfm_budget_snapshot(&fast_cpu, &mut fast_mem, fast_result, fast_imports);
+
+        let mut observed_mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+        let mut observed_cpu = cfm_cpu();
+        let mut observed_imports = Vec::new();
+        let mut fetches = Vec::<PpcFetchedInstruction>::new();
+        let observed_result = observed_cpu.run_with_imports_and_fetch_observer_and_cycle_handler(
+            &mut observed_mem,
+            budget,
+            0,
+            CFM_TRAP_BASE,
+            1,
+            &mut fetches,
+            |elapsed, index, _, _| {
+                observed_imports.push((elapsed, index));
+                PpcImportAction::Return(0xCAFE_BABE)
+            },
+        );
+        let observed = cfm_budget_snapshot(
+            &observed_cpu,
+            &mut observed_mem,
+            observed_result,
+            observed_imports,
+        );
+
+        assert_eq!(
+            fast, observed,
+            "observer changed execution at budget {budget}"
+        );
+        assert_eq!(fetches.len() as u64, budget.min(6));
+        if budget < 7 {
+            assert_eq!(fast.result, PpcRunResult::CycleLimit { cycles: budget });
+            assert!(fast.imports.is_empty());
+        } else {
+            assert_eq!(fast.imports, vec![(6, 0)]);
+        }
+    }
+}
+
+#[test]
+fn run_with_imports_fast_cfm_stub_preserves_import_order_across_slices() {
+    let mut fast_mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut fast_cpu = cfm_cpu();
+    let mut fast_imports = Vec::new();
+    let first_fast = fast_cpu.run_with_imports_and_cycle_handler(
+        &mut fast_mem,
+        3,
+        0,
+        CFM_TRAP_BASE,
+        1,
+        |elapsed, index, _, _| {
+            fast_imports.push((elapsed, index));
+            PpcImportAction::Return(0xCAFE_BABE)
+        },
+    );
+    assert_eq!(first_fast, PpcRunResult::CycleLimit { cycles: 3 });
+    assert!(fast_imports.is_empty());
+    let second_fast = fast_cpu.run_with_imports_and_cycle_handler(
+        &mut fast_mem,
+        4,
+        0,
+        CFM_TRAP_BASE,
+        1,
+        |elapsed, index, _, _| {
+            fast_imports.push((elapsed, index));
+            PpcImportAction::Return(0xCAFE_BABE)
+        },
+    );
+    let fast = cfm_budget_snapshot(&fast_cpu, &mut fast_mem, second_fast, fast_imports);
+
+    let mut observed_mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut observed_cpu = cfm_cpu();
+    let mut observed_imports = Vec::new();
+    let mut fetches = Vec::<PpcFetchedInstruction>::new();
+    let first_observed = observed_cpu.run_with_imports_and_fetch_observer_and_cycle_handler(
+        &mut observed_mem,
+        3,
+        0,
+        CFM_TRAP_BASE,
+        1,
+        &mut fetches,
+        |elapsed, index, _, _| {
+            observed_imports.push((elapsed, index));
+            PpcImportAction::Return(0xCAFE_BABE)
+        },
+    );
+    assert_eq!(first_observed, PpcRunResult::CycleLimit { cycles: 3 });
+    assert!(observed_imports.is_empty());
+    let second_observed = observed_cpu.run_with_imports_and_fetch_observer_and_cycle_handler(
+        &mut observed_mem,
+        4,
+        0,
+        CFM_TRAP_BASE,
+        1,
+        &mut fetches,
+        |elapsed, index, _, _| {
+            observed_imports.push((elapsed, index));
+            PpcImportAction::Return(0xCAFE_BABE)
+        },
+    );
+    let observed = cfm_budget_snapshot(
+        &observed_cpu,
+        &mut observed_mem,
+        second_observed,
+        observed_imports,
+    );
+
+    assert_eq!(fast, observed);
+    assert_eq!(fast.imports, vec![(3, 0)]);
+}
+
 #[test]
 fn run_with_imports_revalidates_cached_cfm_stub_after_trailing_code_write() {
     let mut mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), false);
