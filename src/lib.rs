@@ -60,7 +60,7 @@ struct FpMulAddControl {
 const PPC_DECODE_CACHE_MAX_ENTRIES: usize = 4096;
 const PPC_DECODE_CACHE_INDEX_MASK: usize = PPC_DECODE_CACHE_MAX_ENTRIES - 1;
 type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
-const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 1024;
+const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 32768;
 const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
 
@@ -1016,8 +1016,7 @@ impl PpcCpu {
                 let rt = ((instr_word >> 21) & 0x1f) as usize;
                 let ra = ((instr_word >> 16) & 0x1f) as usize;
                 let si = instr_word as u16 as i16;
-                let (result, ca) =
-                    Self::add_with_carry(!self.gpr[ra], i32::from(si) as u32, true);
+                let (result, ca) = Self::add_with_carry(!self.gpr[ra], i32::from(si) as u32, true);
                 self.gpr[rt] = result;
                 self.set_xer_ca(ca);
                 self.pc = self.pc.wrapping_add(4);
@@ -1057,8 +1056,7 @@ impl PpcCpu {
                 let rt = ((instr_word >> 21) & 0x1f) as usize;
                 let ra = ((instr_word >> 16) & 0x1f) as usize;
                 let si = instr_word as u16 as i16;
-                let (result, ca) =
-                    Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
+                let (result, ca) = Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
                 self.gpr[rt] = result;
                 self.set_xer_ca(ca);
                 self.pc = self.pc.wrapping_add(4);
@@ -1068,8 +1066,7 @@ impl PpcCpu {
                 let rt = ((instr_word >> 21) & 0x1f) as usize;
                 let ra = ((instr_word >> 16) & 0x1f) as usize;
                 let si = instr_word as u16 as i16;
-                let (result, ca) =
-                    Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
+                let (result, ca) = Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
                 self.gpr[rt] = result;
                 self.set_xer_ca(ca);
                 self.update_cr0_from_signed(result);
@@ -1365,8 +1362,7 @@ impl PpcCpu {
                         Some(PpcStepResult::Stepped)
                     }
                     40 | 552 => {
-                        let overflow =
-                            Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
+                        let overflow = Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
                         let result = self.gpr[rb].wrapping_sub(self.gpr[ra]);
                         self.gpr[rs_or_rt] = result;
                         if xo == 552 {
@@ -1379,10 +1375,8 @@ impl PpcCpu {
                         Some(PpcStepResult::Stepped)
                     }
                     8 | 520 => {
-                        let overflow =
-                            Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
-                        let (result, ca) =
-                            Self::add_with_carry(!self.gpr[ra], self.gpr[rb], true);
+                        let overflow = Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
+                        let (result, ca) = Self::add_with_carry(!self.gpr[ra], self.gpr[rb], true);
                         self.gpr[rs_or_rt] = result;
                         self.set_xer_ca(ca);
                         if xo == 520 {
@@ -1395,10 +1389,8 @@ impl PpcCpu {
                         Some(PpcStepResult::Stepped)
                     }
                     10 | 522 => {
-                        let overflow =
-                            Self::signed_add_overflow(self.gpr[ra], self.gpr[rb], false);
-                        let (result, ca) =
-                            Self::add_with_carry(self.gpr[ra], self.gpr[rb], false);
+                        let overflow = Self::signed_add_overflow(self.gpr[ra], self.gpr[rb], false);
+                        let (result, ca) = Self::add_with_carry(self.gpr[ra], self.gpr[rb], false);
                         self.gpr[rs_or_rt] = result;
                         self.set_xer_ca(ca);
                         if xo == 522 {

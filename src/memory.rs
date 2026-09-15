@@ -688,10 +688,18 @@ impl PpcMemory for PpcSectionMem {
         }
         if self.has_overlapping_regions {
             let instruction_last = addr.checked_add(3)?;
-            if !matches!(
-                self.visible_region_span(region_index, addr),
-                Some((_, end, _)) if end > instruction_last
-            ) {
+            let page_key = addr >> PPC_SECTION_MEM_PAGE_SHIFT;
+            let slot = (page_key as usize) & PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK;
+            let span = if let Some(span @ (_, end, _)) = self.overlap_span_cache[slot]
+                && end > instruction_last
+            {
+                Some(span)
+            } else {
+                let computed = self.visible_region_span(region_index, addr);
+                self.overlap_span_cache[slot] = computed;
+                computed
+            };
+            if !matches!(span, Some((_, end, _)) if end > instruction_last) {
                 return None;
             }
         }
