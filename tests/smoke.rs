@@ -364,6 +364,43 @@ fn run_with_imports_fast_path_executes_rlwimi_and_updates_cr0() {
 }
 
 #[test]
+fn run_with_imports_fast_path_executes_extended_ops() {
+    let mut mem = PpcSectionMem::new();
+    // mulli r3, r4, -2 (primary 7, rt=3, ra=4, si=-2 => 0xFFFE)
+    let mulli = (7u32 << 26) | (3u32 << 21) | (4u32 << 16) | 0xFFFE;
+    // andi. r5, r3, 0x00FF (primary 28, rs=3, ra=5, ui=0x00FF)
+    let andi_dot = (28u32 << 26) | (3u32 << 21) | (5u32 << 16) | 0x00FF;
+    // srawi r6, r3, 2 (primary 31, rs=3, ra=6, sh=2, xo=824)
+    let srawi = (31u32 << 26) | (3u32 << 21) | (6u32 << 16) | (2u32 << 11) | (824u32 << 1);
+    // subf r7, r4, r3 (primary 31, rt=7, ra=4, rb=3, xo=40)
+    let subf = (31u32 << 26) | (7u32 << 21) | (4u32 << 16) | (3u32 << 11) | (40u32 << 1);
+    // blr
+    let blr = 0x4E80_0020u32;
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&mulli.to_be_bytes());
+    code.extend_from_slice(&andi_dot.to_be_bytes());
+    code.extend_from_slice(&srawi.to_be_bytes());
+    code.extend_from_slice(&subf.to_be_bytes());
+    code.extend_from_slice(&blr.to_be_bytes());
+    mem.add_readonly_region(0x200, code);
+
+    let mut cpu = PpcCpu::new();
+    cpu.pc = 0x200;
+    cpu.gpr[4] = 10;
+
+    let result = cpu.run_with_imports(&mut mem, 16, 0, 0x4000, 0, |_idx, _cpu, _mem| {
+        PpcImportAction::Halt
+    });
+
+    assert_eq!(result, PpcRunResult::Halted { pc: 0, cycles: 5 });
+    assert_eq!(cpu.gpr[3], (-20i32) as u32);
+    assert_eq!(cpu.gpr[5], (-20i32 as u32) & 0x00FF);
+    assert_eq!(cpu.gpr[6], (-5i32) as u32);
+    assert_eq!(cpu.gpr[7], (-30i32) as u32);
+}
+
+#[test]
 fn run_with_fetch_observer_records_successful_fetches() {
     let addi = d_form(14, 3, 0, 42);
     let blr = 0x4E80_0020u32;
