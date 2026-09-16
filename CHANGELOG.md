@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.1...ppc-v0.6.2) (2026-09-16)
+
+
+### Performance Improvements
+
+* **exec:** accelerate section memory access and expand interpreter fast-path opcodes ([#33](https://github.com/benletchford/ppc-rs/issues/33)) ([8e5af9a](https://github.com/benletchford/ppc-rs/commit/8e5af9a63155de8dc92a7c826245075dc114c5fa))
+
 ## [0.6.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.0...ppc-v0.6.1) (2026-09-08)
 
 
