@@ -143,8 +143,8 @@ impl PpcMemory for NullMemory {
 #[derive(Debug, Clone)]
 pub struct PpcSectionMem {
     regions: Vec<PpcMemRegion>,
-    page_cache: [Option<(u32, usize)>; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES],
-    overlap_span_cache: [Option<(u32, u32, usize)>; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES],
+    page_cache: Box<[Option<(u32, usize)>]>,
+    overlap_span_cache: Box<[Option<(u32, u32, usize)>]>,
     region_cache: [Option<usize>; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
     instruction_cache: Box<[Option<(u32, u32)>]>,
     instruction_mapping_token: u64,
@@ -163,8 +163,8 @@ pub struct PpcSectionMemSpan {
     len: usize,
 }
 
-const PPC_SECTION_MEM_PAGE_CACHE_ENTRIES: usize = 256;
-const PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES: usize = 256;
+const PPC_SECTION_MEM_PAGE_CACHE_ENTRIES: usize = 4_096;
+const PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES: usize = 4_096;
 const PPC_SECTION_MEM_REGION_CACHE_ENTRIES: usize = 4;
 const PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES: usize = 4_096;
 const PPC_SECTION_MEM_PAGE_SHIFT: u32 = 12;
@@ -194,8 +194,9 @@ impl Default for PpcSectionMem {
     fn default() -> Self {
         Self {
             regions: Vec::new(),
-            page_cache: [None; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES],
-            overlap_span_cache: [None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES],
+            page_cache: vec![None; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES].into_boxed_slice(),
+            overlap_span_cache: vec![None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES]
+                .into_boxed_slice(),
             region_cache: [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES],
             instruction_cache: vec![None; PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES]
                 .into_boxed_slice(),
@@ -400,7 +401,9 @@ impl PpcSectionMem {
         }
         // SAFETY: the length check above proves `off..off + 2` is in-bounds.
         let ptr = unsafe { bytes.as_ptr().add(off) };
-        Some(u16::from_be_bytes(unsafe { [*ptr, *ptr.add(1)] }))
+        Some(u16::from_be_bytes(unsafe {
+            ptr.cast::<[u8; 2]>().read_unaligned()
+        }))
     }
 
     #[inline]
@@ -415,11 +418,9 @@ impl PpcSectionMem {
         }
         // SAFETY: the length check above proves `off..off + 4` is in-bounds.
         let ptr = unsafe { bytes.as_ptr().add(off) };
-        let b0 = unsafe { u32::from(*ptr) };
-        let b1 = unsafe { u32::from(*ptr.add(1)) };
-        let b2 = unsafe { u32::from(*ptr.add(2)) };
-        let b3 = unsafe { u32::from(*ptr.add(3)) };
-        Some((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+        Some(u32::from_be_bytes(unsafe {
+            ptr.cast::<[u8; 4]>().read_unaligned()
+        }))
     }
 
     #[inline]
@@ -435,16 +436,7 @@ impl PpcSectionMem {
         // SAFETY: the length check above proves `off..off + 8` is in-bounds.
         let ptr = unsafe { bytes.as_ptr().add(off) };
         Some(u64::from_be_bytes(unsafe {
-            [
-                *ptr,
-                *ptr.add(1),
-                *ptr.add(2),
-                *ptr.add(3),
-                *ptr.add(4),
-                *ptr.add(5),
-                *ptr.add(6),
-                *ptr.add(7),
-            ]
+            ptr.cast::<[u8; 8]>().read_unaligned()
         }))
     }
 
@@ -470,33 +462,19 @@ impl PpcSectionMem {
         // SAFETY: `locate_writable_same_region` proved `off..off + 2` is in-bounds.
         let dst = unsafe { self.regions[i].bytes.as_mut_ptr().add(off) };
         unsafe {
-            *dst = bytes[0];
-            *dst.add(1) = bytes[1];
+            dst.cast::<[u8; 2]>().write_unaligned(bytes);
         }
         Some(())
     }
 
     #[inline]
     fn write_same_region_u32(&mut self, addr: u32, value: u32) -> Option<()> {
-        if self.has_overlapping_regions {
-            return None;
-        }
-        let (i, off) = self.locate_cached(addr)?;
-        let region = &mut self.regions[i];
-        if !region.writable {
-            return None;
-        }
-        if region.bytes.len().saturating_sub(off) < 4 {
-            return None;
-        }
+        let (i, off) = self.locate_writable_same_region(addr, 4)?;
         let bytes = value.to_be_bytes();
-        // SAFETY: the length check above proves `off..off + 4` is in-bounds.
-        let dst = unsafe { region.bytes.as_mut_ptr().add(off) };
+        // SAFETY: `locate_writable_same_region` proved `off..off + 4` is in-bounds.
+        let dst = unsafe { self.regions[i].bytes.as_mut_ptr().add(off) };
         unsafe {
-            *dst = bytes[0];
-            *dst.add(1) = bytes[1];
-            *dst.add(2) = bytes[2];
-            *dst.add(3) = bytes[3];
+            dst.cast::<[u8; 4]>().write_unaligned(bytes);
         }
         Some(())
     }
@@ -508,14 +486,7 @@ impl PpcSectionMem {
         // SAFETY: `locate_writable_same_region` proved `off..off + 8` is in-bounds.
         let dst = unsafe { self.regions[i].bytes.as_mut_ptr().add(off) };
         unsafe {
-            *dst = bytes[0];
-            *dst.add(1) = bytes[1];
-            *dst.add(2) = bytes[2];
-            *dst.add(3) = bytes[3];
-            *dst.add(4) = bytes[4];
-            *dst.add(5) = bytes[5];
-            *dst.add(6) = bytes[6];
-            *dst.add(7) = bytes[7];
+            dst.cast::<[u8; 8]>().write_unaligned(bytes);
         }
         Some(())
     }
@@ -547,8 +518,8 @@ impl PpcSectionMem {
 
     #[inline]
     fn clear_region_cache(&mut self, instruction_mapping_token: u64) {
-        self.page_cache = [None; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES];
-        self.overlap_span_cache = [None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES];
+        self.page_cache.fill(None);
+        self.overlap_span_cache.fill(None);
         self.region_cache = [None; PPC_SECTION_MEM_REGION_CACHE_ENTRIES];
         self.instruction_cache.fill(None);
         self.instruction_mapping_token = instruction_mapping_token;
@@ -717,10 +688,18 @@ impl PpcMemory for PpcSectionMem {
         }
         if self.has_overlapping_regions {
             let instruction_last = addr.checked_add(3)?;
-            if !matches!(
-                self.visible_region_span(region_index, addr),
-                Some((_, end, _)) if end > instruction_last
-            ) {
+            let page_key = addr >> PPC_SECTION_MEM_PAGE_SHIFT;
+            let slot = (page_key as usize) & PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK;
+            let span = if let Some(span @ (_, end, _)) = self.overlap_span_cache[slot]
+                && end > instruction_last
+            {
+                Some(span)
+            } else {
+                let computed = self.visible_region_span(region_index, addr);
+                self.overlap_span_cache[slot] = computed;
+                computed
+            };
+            if !matches!(span, Some((_, end, _)) if end > instruction_last) {
                 return None;
             }
         }

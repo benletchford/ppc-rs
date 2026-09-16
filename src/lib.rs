@@ -60,7 +60,7 @@ struct FpMulAddControl {
 const PPC_DECODE_CACHE_MAX_ENTRIES: usize = 4096;
 const PPC_DECODE_CACHE_INDEX_MASK: usize = PPC_DECODE_CACHE_MAX_ENTRIES - 1;
 type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
-const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 1024;
+const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 32768;
 const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
 
@@ -1003,6 +1003,25 @@ impl PpcCpu {
 
         let primary = (instr_word >> 26) & 0x3f;
         match primary {
+            7 => {
+                let rt = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let si = instr_word as u16 as i16;
+                let lhs = self.gpr[ra] as i32;
+                self.gpr[rt] = lhs.wrapping_mul(i32::from(si)) as u32;
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
+            8 => {
+                let rt = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let si = instr_word as u16 as i16;
+                let (result, ca) = Self::add_with_carry(!self.gpr[ra], i32::from(si) as u32, true);
+                self.gpr[rt] = result;
+                self.set_xer_ca(ca);
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
             10 => {
                 let bf = ((instr_word >> 23) & 0x7) as u8;
                 let l = ((instr_word >> 21) & 0x1) != 0;
@@ -1030,6 +1049,27 @@ impl PpcCpu {
                     ));
                 }
                 self.set_cr_compare(bf, (self.gpr[ra] as i32).cmp(&i32::from(si)));
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
+            12 => {
+                let rt = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let si = instr_word as u16 as i16;
+                let (result, ca) = Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
+                self.gpr[rt] = result;
+                self.set_xer_ca(ca);
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
+            13 => {
+                let rt = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let si = instr_word as u16 as i16;
+                let (result, ca) = Self::add_with_carry(self.gpr[ra], i32::from(si) as u32, false);
+                self.gpr[rt] = result;
+                self.set_xer_ca(ca);
+                self.update_cr0_from_signed(result);
                 self.pc = self.pc.wrapping_add(4);
                 Some(PpcStepResult::Stepped)
             }
@@ -1160,6 +1200,24 @@ impl PpcCpu {
                 self.pc = self.pc.wrapping_add(4);
                 Some(PpcStepResult::Stepped)
             }
+            23 => {
+                let rs = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let rb = ((instr_word >> 11) & 0x1f) as usize;
+                let mb = ((instr_word >> 6) & 0x1f) as u8;
+                let me = ((instr_word >> 1) & 0x1f) as u8;
+                let rc = (instr_word & 0x1) != 0;
+                let n = self.gpr[rb] & 0x1f;
+                let rotated = self.gpr[rs].rotate_left(n);
+                let mask = Self::mask32(mb, me);
+                let result = rotated & mask;
+                self.gpr[ra] = result;
+                if rc {
+                    self.update_cr0_from_signed(result);
+                }
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
             24..=27 => {
                 let rs = ((instr_word >> 21) & 0x1f) as usize;
                 let ra = ((instr_word >> 16) & 0x1f) as usize;
@@ -1174,6 +1232,26 @@ impl PpcCpu {
                 } else {
                     self.gpr[rs] | imm
                 };
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
+            28 => {
+                let rs = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let ui = instr_word as u16;
+                let result = self.gpr[rs] & u32::from(ui);
+                self.gpr[ra] = result;
+                self.update_cr0_from_signed(result);
+                self.pc = self.pc.wrapping_add(4);
+                Some(PpcStepResult::Stepped)
+            }
+            29 => {
+                let rs = ((instr_word >> 21) & 0x1f) as usize;
+                let ra = ((instr_word >> 16) & 0x1f) as usize;
+                let ui = instr_word as u16;
+                let result = self.gpr[rs] & (u32::from(ui) << 16);
+                self.gpr[ra] = result;
+                self.update_cr0_from_signed(result);
                 self.pc = self.pc.wrapping_add(4);
                 Some(PpcStepResult::Stepped)
             }
@@ -1197,16 +1275,157 @@ impl PpcCpu {
                         self.pc = self.pc.wrapping_add(4);
                         Some(PpcStepResult::Stepped)
                     }
-                    28 | 316 | 444 => {
+                    28 | 60 | 124 | 284 | 316 | 412 | 444 | 476 => {
                         let lhs = self.gpr[rs_or_rt];
                         let rhs = self.gpr[rb];
                         let result = match xo {
                             28 => lhs & rhs,
+                            60 => lhs & !rhs,
+                            124 => !(lhs | rhs),
+                            284 => !(lhs ^ rhs),
                             316 => lhs ^ rhs,
+                            412 => lhs | !rhs,
                             444 => lhs | rhs,
+                            476 => !(lhs & rhs),
                             _ => unreachable!(),
                         };
                         self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    24 => {
+                        let n = self.gpr[rb] & 0x3f;
+                        let result = if n >= 32 { 0 } else { self.gpr[rs_or_rt] << n };
+                        self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    26 => {
+                        let result = self.gpr[rs_or_rt].leading_zeros();
+                        self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    536 => {
+                        let n = self.gpr[rb] & 0x3f;
+                        let result = if n >= 32 { 0 } else { self.gpr[rs_or_rt] >> n };
+                        self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    824 => {
+                        let sh = rb as u32;
+                        let signed = self.gpr[rs_or_rt] as i32;
+                        let (result, ca) = if sh == 0 {
+                            (signed as u32, false)
+                        } else {
+                            let bits_lost = self.gpr[rs_or_rt] & ((1u32 << sh) - 1);
+                            let ca = signed < 0 && bits_lost != 0;
+                            ((signed >> sh) as u32, ca)
+                        };
+                        self.gpr[ra] = result;
+                        self.set_xer_ca(ca);
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    922 => {
+                        let result = (self.gpr[rs_or_rt] as i16) as i32 as u32;
+                        self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    954 => {
+                        let result = (self.gpr[rs_or_rt] as i8) as i32 as u32;
+                        self.gpr[ra] = result;
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    40 | 552 => {
+                        let overflow = Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
+                        let result = self.gpr[rb].wrapping_sub(self.gpr[ra]);
+                        self.gpr[rs_or_rt] = result;
+                        if xo == 552 {
+                            self.set_xer_ov_so(overflow);
+                        }
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    8 | 520 => {
+                        let overflow = Self::signed_sub_overflow(self.gpr[rb], self.gpr[ra], false);
+                        let (result, ca) = Self::add_with_carry(!self.gpr[ra], self.gpr[rb], true);
+                        self.gpr[rs_or_rt] = result;
+                        self.set_xer_ca(ca);
+                        if xo == 520 {
+                            self.set_xer_ov_so(overflow);
+                        }
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    10 | 522 => {
+                        let overflow = Self::signed_add_overflow(self.gpr[ra], self.gpr[rb], false);
+                        let (result, ca) = Self::add_with_carry(self.gpr[ra], self.gpr[rb], false);
+                        self.gpr[rs_or_rt] = result;
+                        self.set_xer_ca(ca);
+                        if xo == 522 {
+                            self.set_xer_ov_so(overflow);
+                        }
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    104 | 616 => {
+                        let overflow = self.gpr[ra] == 0x8000_0000;
+                        let result = (!self.gpr[ra]).wrapping_add(1);
+                        self.gpr[rs_or_rt] = result;
+                        if xo == 616 {
+                            self.set_xer_ov_so(overflow);
+                        }
+                        if rc {
+                            self.update_cr0_from_signed(result);
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                        Some(PpcStepResult::Stepped)
+                    }
+                    235 | 747 => {
+                        let lhs = self.gpr[ra] as i32;
+                        let rhs = self.gpr[rb] as i32;
+                        let product = i64::from(lhs) * i64::from(rhs);
+                        let overflow =
+                            product < i64::from(i32::MIN) || product > i64::from(i32::MAX);
+                        let result = product as u32;
+                        self.gpr[rs_or_rt] = result;
+                        if xo == 747 {
+                            self.set_xer_ov_so(overflow);
+                        }
                         if rc {
                             self.update_cr0_from_signed(result);
                         }
