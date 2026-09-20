@@ -3619,6 +3619,61 @@ impl PpcCpu {
     }
 
     #[inline]
+    fn fast_instruction(word: u32) -> bool {
+        match word {
+            0x6000_0000 | 0x4E80_0020 => true,
+            _ => match (word >> 26) & 0x3f {
+                7 | 8 | 10..=16 | 18 | 20 | 21 | 23..=29 | 32..=55 => true,
+                19 => matches!((word >> 1) & 0x03ff, 16 | 528),
+                59 => matches!((word >> 1) & 0x001f, 20 | 21 | 25 | 28..=31),
+                31 => matches!(
+                    (word >> 1) & 0x03ff,
+                    0 | 8
+                        | 10
+                        | 23
+                        | 24
+                        | 26
+                        | 28
+                        | 32
+                        | 40
+                        | 55
+                        | 60
+                        | 87
+                        | 104
+                        | 124
+                        | 151
+                        | 183
+                        | 215
+                        | 235
+                        | 266
+                        | 279
+                        | 284
+                        | 316
+                        | 339
+                        | 407
+                        | 412
+                        | 444
+                        | 467
+                        | 476
+                        | 520
+                        | 522
+                        | 536
+                        | 552
+                        | 616
+                        | 747
+                        | 778
+                        | 792
+                        | 824
+                        | 922
+                        | 954
+                ),
+                63 => matches!((word >> 1) & 0x03ff, 0 | 32 | 72),
+                _ => false,
+            },
+        }
+    }
+
+    #[inline]
     fn is_import_trap(pc: u32, trap_base: u32, import_count: u32) -> bool {
         if import_count == 0 || pc < trap_base {
             return false;
@@ -3655,7 +3710,7 @@ impl PpcCpu {
                     break;
                 }
                 words[len] = word;
-                decoded[len] = Some(decode(word));
+                decoded[len] = (!Self::fast_instruction(word)).then(|| decode(word));
                 len += 1;
                 if Self::instruction_ends_basic_block(word) {
                     break;
@@ -3693,11 +3748,9 @@ impl PpcCpu {
                 break;
             }
             let word = self.basic_block_cache[cache_index].as_ref()?.words[instruction_index];
-            let decoded = self.basic_block_cache[cache_index].as_ref()?.decoded[instruction_index]?;
+            let decoded = self.basic_block_cache[cache_index].as_ref()?.decoded[instruction_index];
             let pc = self.pc;
-            let step_result = if let Some(result) = self.step_fast_unobserved(mem, word) {
-                result
-            } else {
+            let step_result = if let Some(decoded) = decoded {
                 let decoded = match decoded {
                     Ok(decoded) => decoded,
                     Err(error) => {
@@ -3713,6 +3766,9 @@ impl PpcCpu {
                     }
                 };
                 self.step_decoded_with_write_observer(mem, word, decoded, &mut write_observer)
+            } else {
+                self.step_fast_unobserved(mem, word)
+                    .unwrap_or_else(|| self.step(mem, word))
             };
             match step_result {
                 PpcStepResult::Stepped => {
@@ -7679,6 +7735,27 @@ mod tests {
         assert_eq!(cpu.gpr[11], data_base + 4);
         assert_eq!(memory.read_u8(data_base + 4), Some(0xAB));
         assert_eq!(cpu.decode_cache_entry_count(), 0);
+    }
+
+    #[test]
+    fn fast_instruction_classifier_matches_dispatcher() {
+        let mut memory = PpcSectionMem::new();
+        let mut cpu = PpcCpu::new();
+
+        // Exercise every primary/XO combination with the remaining fields
+        // zeroed. This keeps the cached classification conservative: a word
+        // is only omitted from predecoding when the raw dispatcher accepts it.
+        for primary in 0..64u32 {
+            for xo in 0..1024u32 {
+                let word = (primary << 26) | (xo << 1);
+                let dispatched = cpu.step_fast_unobserved(&mut memory, word).is_some();
+                assert_eq!(
+                    PpcCpu::fast_instruction(word),
+                    dispatched,
+                    "primary={primary}, xo={xo}, word={word:#010x}"
+                );
+            }
+        }
     }
 
     #[test]
