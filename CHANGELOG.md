@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.3](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.2...ppc-v0.6.3) (2026-09-20)
+
+
+### Performance Improvements
+
+* cache decoded instructions in immutable blocks ([#36](https://github.com/benletchford/ppc-rs/issues/36)) ([f636963](https://github.com/benletchford/ppc-rs/commit/f6369639bcc3b46a8afcab77984e7e27ebafe477))
+* classify cached fast instructions ([#39](https://github.com/benletchford/ppc-rs/issues/39)) ([19ba796](https://github.com/benletchford/ppc-rs/commit/19ba796274daf1d151f696eaea9731a61c6e7a8a))
+
 ## [0.6.2](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.1...ppc-v0.6.2) (2026-09-16)
 
 
