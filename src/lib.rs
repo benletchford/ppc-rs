@@ -63,12 +63,14 @@ type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
 const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 32768;
 const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
+type PpcDecodedInstruction = Result<PpcInstr, PpcDecodeError>;
 
 #[derive(Debug, Clone)]
 struct PpcBasicBlockCacheEntry {
     start_pc: u32,
     memory_token: u64,
     words: [u32; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
+    decoded: [Option<PpcDecodedInstruction>; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
     len: u8,
 }
 
@@ -3642,6 +3644,7 @@ impl PpcCpu {
 
         if !cache_hit {
             let mut words = [0; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
+            let mut decoded = [None; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
             let mut len = 0usize;
             let mut pc = start_pc;
             while len < words.len() && mem.instruction_cache_token(pc) == Some(memory_token) {
@@ -3652,6 +3655,7 @@ impl PpcCpu {
                     break;
                 }
                 words[len] = word;
+                decoded[len] = Some(decode(word));
                 len += 1;
                 if Self::instruction_ends_basic_block(word) {
                     break;
@@ -3665,12 +3669,14 @@ impl PpcCpu {
                 start_pc,
                 memory_token,
                 words,
+                decoded,
                 len: len as u8,
             });
         }
 
         let block_len = usize::from(self.basic_block_cache[cache_index].as_ref()?.len);
         let mut completed = 0u64;
+        let mut write_observer = PpcNoopMemoryWriteObserver;
         for instruction_index in 0..block_len {
             if completed >= max_cycles {
                 break;
@@ -3687,10 +3693,27 @@ impl PpcCpu {
                 break;
             }
             let word = self.basic_block_cache[cache_index].as_ref()?.words[instruction_index];
+            let decoded = self.basic_block_cache[cache_index].as_ref()?.decoded[instruction_index]?;
             let pc = self.pc;
-            let step_result = self
-                .step_fast_unobserved(mem, word)
-                .unwrap_or_else(|| self.step(mem, word));
+            let step_result = if let Some(result) = self.step_fast_unobserved(mem, word) {
+                result
+            } else {
+                let decoded = match decoded {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        let result = Self::decode_error_illegal_instruction(word, error).map_or(
+                            PpcStepResult::Unimplemented(error),
+                            PpcStepResult::Exception,
+                        );
+                        return Some(PpcBasicBlockRunResult::Stop {
+                            pc,
+                            completed,
+                            result,
+                        });
+                    }
+                };
+                self.step_decoded_with_write_observer(mem, word, decoded, &mut write_observer)
+            };
             match step_result {
                 PpcStepResult::Stepped => {
                     completed += 1;
@@ -4565,6 +4588,19 @@ impl PpcCpu {
                 return PpcStepResult::Unimplemented(e);
             }
         };
+        self.step_decoded_with_write_observer(mem, instr_word, decoded, write_observer)
+    }
+
+    fn step_decoded_with_write_observer<
+        M: PpcMemory + ?Sized,
+        W: PpcMemoryWriteObserver + ?Sized,
+    >(
+        &mut self,
+        mem: &mut M,
+        instr_word: u32,
+        decoded: PpcInstr,
+        write_observer: &mut W,
+    ) -> PpcStepResult {
         if !self.msr_fp_available() && Self::is_floating_point_instruction(decoded) {
             return PpcStepResult::Exception(PpcException::FloatingPointUnavailable);
         }
@@ -7617,6 +7653,32 @@ mod tests {
         assert_eq!(result, PpcRunResult::CycleLimit { cycles: 100 });
         assert_eq!(cpu.gpr[3], 80);
         assert_eq!(memory.instruction_reads, 5);
+    }
+
+    #[test]
+    fn immutable_basic_block_cache_executes_predecoded_fallback_without_decode_cache() {
+        // `stbux` is intentionally outside the raw fast dispatcher.  Its
+        // decoded form must still execute from an immutable code block while
+        // routing the guest store through the normal memory bus.
+        let code_base = 0x1000;
+        let data_base = 0x2000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(code_base, 0x7F2B_61EEu32.to_be_bytes().to_vec());
+        memory.add_region(data_base, vec![0; 0x20]);
+
+        let mut cpu = PpcCpu::new();
+        cpu.pc = code_base;
+        cpu.gpr[25] = 0xAB;
+        cpu.gpr[11] = data_base;
+        cpu.gpr[12] = 4;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 1, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 1 }
+        );
+        assert_eq!(cpu.gpr[11], data_base + 4);
+        assert_eq!(memory.read_u8(data_base + 4), Some(0xAB));
+        assert_eq!(cpu.decode_cache_entry_count(), 0);
     }
 
     #[test]
