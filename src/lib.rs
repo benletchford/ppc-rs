@@ -3147,7 +3147,9 @@ impl PpcCpu {
 
 mod memory;
 use memory::NullMemory;
-pub use memory::{PpcMemory, PpcSectionMem, PpcSectionMemSpan};
+pub use memory::{
+    PpcMemory, PpcSectionMem, PpcSectionMemSpan, try_allocate_instruction_cache_token,
+};
 
 mod decode;
 pub use decode::{PpcDecodeError, PpcInstr, decode};
@@ -3618,6 +3620,47 @@ impl PpcCpu {
             || (primary == 19 && matches!((word >> 1) & 0x03ff, 16 | 528))
     }
 
+    /// Return whether executing `word` can change a later instruction view.
+    ///
+    /// Stores terminate a cached block after they execute. A writable-memory
+    /// adapter may retire its instruction token during the store, so starting
+    /// the following instruction in a new block makes the normal token lookup
+    /// observe that change. This costs nothing while an already-cached block
+    /// executes and preserves long blocks for load/arithmetic-heavy code.
+    fn instruction_may_write_memory(word: u32) -> bool {
+        matches!(
+            decode(word),
+            Ok(PpcInstr::Stb { .. }
+                | PpcInstr::Stbu { .. }
+                | PpcInstr::Stbx { .. }
+                | PpcInstr::Stbux { .. }
+                | PpcInstr::Sth { .. }
+                | PpcInstr::Sthu { .. }
+                | PpcInstr::Sthx { .. }
+                | PpcInstr::Sthux { .. }
+                | PpcInstr::Sthbrx { .. }
+                | PpcInstr::Stw { .. }
+                | PpcInstr::Stwu { .. }
+                | PpcInstr::Stwx { .. }
+                | PpcInstr::Stwux { .. }
+                | PpcInstr::Stwbrx { .. }
+                | PpcInstr::Stwcx { .. }
+                | PpcInstr::Stmw { .. }
+                | PpcInstr::Stswi { .. }
+                | PpcInstr::Stswx { .. }
+                | PpcInstr::Stfs { .. }
+                | PpcInstr::Stfsu { .. }
+                | PpcInstr::Stfsx { .. }
+                | PpcInstr::Stfsux { .. }
+                | PpcInstr::Stfd { .. }
+                | PpcInstr::Stfdu { .. }
+                | PpcInstr::Stfdx { .. }
+                | PpcInstr::Stfdux { .. }
+                | PpcInstr::Stfiwx { .. }
+                | PpcInstr::Dcbz { .. })
+        )
+    }
+
     #[inline]
     fn fast_instruction(word: u32) -> bool {
         match word {
@@ -3712,7 +3755,9 @@ impl PpcCpu {
                 words[len] = word;
                 decoded[len] = (!Self::fast_instruction(word)).then(|| decode(word));
                 len += 1;
-                if Self::instruction_ends_basic_block(word) {
+                if Self::instruction_ends_basic_block(word)
+                    || Self::instruction_may_write_memory(word)
+                {
                     break;
                 }
                 pc = pc.wrapping_add(4);
@@ -7327,6 +7372,44 @@ mod tests {
         }
     }
 
+    struct TokenizedWritableMemory {
+        base: u32,
+        bytes: Vec<u8>,
+        token: u64,
+    }
+
+    impl TokenizedWritableMemory {
+        fn new(base: u32, words: &[u32]) -> Self {
+            Self {
+                base,
+                bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                token: 1,
+            }
+        }
+
+        fn offset(&self, addr: u32) -> Option<usize> {
+            usize::try_from(addr.checked_sub(self.base)?).ok()
+        }
+    }
+
+    impl PpcMemory for TokenizedWritableMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.bytes.get(self.offset(addr)?).copied()
+        }
+
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            let offset = self.offset(addr)?;
+            *self.bytes.get_mut(offset)? = value;
+            self.token = self.token.checked_add(1).expect("test token exhausted");
+            Some(())
+        }
+
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            let offset = self.offset(addr)?;
+            (self.bytes.len().saturating_sub(offset) >= 4).then_some(self.token)
+        }
+    }
+
     #[test]
     fn cpu_keeps_large_host_caches_off_the_stack() {
         let size = std::mem::size_of::<PpcCpu>();
@@ -7709,6 +7792,39 @@ mod tests {
         assert_eq!(result, PpcRunResult::CycleLimit { cycles: 100 });
         assert_eq!(cpu.gpr[3], 80);
         assert_eq!(memory.instruction_reads, 5);
+    }
+
+    fn assert_store_redecodes_the_following_instruction(base: u32) {
+        const STORE_R4_AT_R5_PLUS_4: u32 = 0x9085_0004;
+        const ADD_ONE: u32 = 0x3863_0001;
+        const ADD_TWO: u32 = 0x3863_0002;
+        const BLR: u32 = 0x4e80_0020;
+
+        let mut memory = TokenizedWritableMemory::new(base, &[STORE_R4_AT_R5_PLUS_4, ADD_ONE, BLR]);
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+        cpu.lr = 0;
+        cpu.gpr[4] = ADD_TWO;
+        cpu.gpr[5] = base;
+
+        assert_eq!(
+            cpu.run(&mut memory, 8, 0),
+            PpcRunResult::Halted { pc: 0, cycles: 3 }
+        );
+        assert_eq!(
+            cpu.gpr[3], 2,
+            "the instruction after the store came from a stale cached block"
+        );
+    }
+
+    #[test]
+    fn store_rewriting_the_next_instruction_revalidates_the_cached_block() {
+        assert_store_redecodes_the_following_instruction(0x1000);
+    }
+
+    #[test]
+    fn store_rewriting_the_next_page_revalidates_the_cached_block() {
+        assert_store_redecodes_the_following_instruction(0x1ffc);
     }
 
     #[test]
