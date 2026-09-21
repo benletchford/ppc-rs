@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.3...ppc-v0.6.4) (2026-09-21)
+
+
+### Bug Fixes
+
+* **cache:** revalidate blocks after guest stores ([#42](https://github.com/benletchford/ppc-rs/issues/42)) ([26b584c](https://github.com/benletchford/ppc-rs/commit/26b584c5f91f23b7d3a63dc112a95441c4064f62))
+
 ## [0.6.3](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.2...ppc-v0.6.3) (2026-09-20)
 
 

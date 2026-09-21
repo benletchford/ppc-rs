@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ppc"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "ieee-apsqrt",
  "rustc_apfloat",
