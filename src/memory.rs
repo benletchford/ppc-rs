@@ -183,6 +183,17 @@ fn try_next_instruction_mapping_token(counter: &AtomicU64) -> Option<u64> {
         .ok()
 }
 
+/// Allocate an instruction-cache token from the process-wide non-reusing
+/// namespace used by [`PpcSectionMem`].
+///
+/// Memory adapters that cache writable instruction views can use this to
+/// ensure their tokens never alias immutable mappings or another adapter.
+/// Once the `u64` namespace is exhausted this returns `None`; callers must
+/// then decline instruction caching rather than reuse an older token.
+pub fn try_allocate_instruction_cache_token() -> Option<u64> {
+    try_next_instruction_mapping_token(&NEXT_INSTRUCTION_MAPPING_TOKEN)
+}
+
 #[derive(Debug, Clone)]
 struct PpcMemRegion {
     base: u32,
@@ -750,6 +761,19 @@ impl PpcMemory for PpcSectionMem {
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn public_instruction_tokens_share_one_non_reusing_namespace() {
+        let first = try_allocate_instruction_cache_token().expect("first token");
+        let second = try_allocate_instruction_cache_token().expect("second token");
+        let mut mem = PpcSectionMem::new();
+        mem.add_readonly_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
+        let mapping = mem.instruction_cache_token(0x1000).expect("mapping token");
+
+        assert_ne!(first, second);
+        assert_ne!(first, mapping);
+        assert_ne!(second, mapping);
+    }
 
     #[test]
     fn exhausted_instruction_token_allocation_cannot_mutate_a_mapping() {
