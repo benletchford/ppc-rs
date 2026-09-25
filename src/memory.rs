@@ -285,9 +285,9 @@ impl PpcSectionMem {
     /// Copy a mapped byte range into `dst`.
     ///
     /// Returns `None` when any byte in the requested range is unmapped.
-    /// When the full range falls inside one region this uses a single
-    /// slice copy; otherwise it falls back to byte reads so callers can
-    /// still copy across adjacent mapped regions.
+    /// Copies each visible region span in one slice, including when later
+    /// mappings overlay an earlier region. Reads across adjacent mappings
+    /// keep following the newest visible mapping for each byte.
     pub fn read_bytes_into(&mut self, addr: u32, dst: &mut [u8]) -> Option<()> {
         if dst.is_empty() {
             return Some(());
@@ -305,8 +305,33 @@ impl PpcSectionMem {
             }
         }
 
-        for (offset, byte) in dst.iter_mut().enumerate() {
-            *byte = self.read_u8(addr.wrapping_add(offset as u32))?;
+        let mut copied = 0;
+        while copied < dst.len() {
+            let current = addr.wrapping_add(copied as u32);
+            let (index, offset) = self.locate_cached(current)?;
+            let visible_end = if self.has_overlapping_regions {
+                let page = current >> PPC_SECTION_MEM_PAGE_SHIFT;
+                let slot = (page as usize) & PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK;
+                self.overlap_span_cache[slot].and_then(|(start, end, owner)| {
+                    (owner == index && start <= current && current < end).then_some(end)
+                })
+            } else {
+                let region = &self.regions[index];
+                u32::try_from(region.bytes.len())
+                    .ok()
+                    .and_then(|len| region.base.checked_add(len))
+            };
+            if let Some(end) = visible_end {
+                let len = ((end - current) as usize).min(dst.len() - copied);
+                dst[copied..copied + len]
+                    .copy_from_slice(&self.regions[index].bytes[offset..offset + len]);
+                copied += len;
+            } else {
+                // A span ending at the top of the 32-bit address space cannot
+                // represent its exclusive end as u32. Retain the byte path.
+                dst[copied] = self.read_u8(current)?;
+                copied += 1;
+            }
         }
         Some(())
     }
@@ -761,6 +786,39 @@ impl PpcMemory for PpcSectionMem {
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn bulk_read_follows_visible_regions_across_overlays_and_gaps() {
+        let mut mem = PpcSectionMem::new();
+        mem.add_region(0x1000, vec![0, 1, 2, 3, 4, 5]);
+        mem.add_region(0x1003, vec![30, 31]);
+
+        let mut bytes = [0; 6];
+        assert_eq!(mem.read_bytes_into(0x1000, &mut bytes), Some(()));
+        assert_eq!(bytes, [0, 1, 2, 30, 31, 5]);
+
+        let mut across_gap = [0xff; 4];
+        assert_eq!(mem.read_bytes_into(0x1004, &mut across_gap), None);
+        assert_eq!(across_gap, [31, 5, 0xff, 0xff]);
+
+        mem.add_region(0x1006, vec![6, 7]);
+        let mut adjacent = [0; 8];
+        assert_eq!(mem.read_bytes_into(0x1000, &mut adjacent), Some(()));
+        assert_eq!(adjacent, [0, 1, 2, 30, 31, 5, 6, 7]);
+    }
+
+    #[test]
+    fn bulk_read_preserves_wrapping_at_the_address_space_limit() {
+        let mut mem = PpcSectionMem::new();
+        mem.add_region(0x1000, vec![1, 2]);
+        mem.add_region(0x1001, vec![3]);
+        mem.add_region(u32::MAX, vec![0xaa]);
+        mem.add_region(0, vec![0xbb]);
+
+        let mut bytes = [0; 2];
+        assert_eq!(mem.read_bytes_into(u32::MAX, &mut bytes), Some(()));
+        assert_eq!(bytes, [0xaa, 0xbb]);
+    }
 
     #[test]
     fn public_instruction_tokens_share_one_non_reusing_namespace() {
