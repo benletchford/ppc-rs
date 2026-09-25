@@ -6023,6 +6023,34 @@ fn ppc_section_mem_overlap_span_cache_preserves_newest_region_priority() {
 }
 
 #[test]
+fn ppc_section_mem_word_reads_respect_visible_overlay_spans() {
+    let mut mem = PpcSectionMem::new();
+    mem.add_region(0x1000, (0u8..16).collect());
+    mem.add_region(0x1008, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+
+    assert_eq!(mem.read_u16_be(0x1002), Some(0x0203));
+    assert_eq!(mem.read_u32_be(0x1004), Some(0x0405_0607));
+    assert_eq!(mem.read_u64_be(0x1000), Some(0x0001_0203_0405_0607));
+    assert_eq!(mem.read_u16_be(0x1007), Some(0x07A0));
+    assert_eq!(mem.read_u32_be(0x1006), Some(0x0607_A0A1));
+    assert_eq!(mem.read_u64_be(0x1004), Some(0x0405_0607_A0A1_A2A3));
+    assert_eq!(mem.read_u32_be(0x1008), Some(0xA0A1_A2A3));
+    assert_eq!(mem.read_u32_be(0x100C), Some(0x0C0D_0E0F));
+}
+
+#[test]
+fn ppc_section_mem_word_reads_wrap_at_top_with_overlays() {
+    let mut mem = PpcSectionMem::new();
+    mem.add_region(0xFFFF_FFFE, vec![0x11, 0x22]);
+    mem.add_region(0, vec![0x33, 0x44, 0x55, 0x66]);
+    mem.add_region(0x0000_0002, vec![0xAA]);
+
+    assert_eq!(mem.read_u16_be(0xFFFF_FFFF), Some(0x2233));
+    assert_eq!(mem.read_u32_be(0xFFFF_FFFE), Some(0x1122_3344));
+    assert_eq!(mem.read_u64_be(0xFFFF_FFFE), None);
+}
+
+#[test]
 fn ppc_section_mem_instruction_fetch_cache_is_invalidated_by_new_overlays() {
     let mut mem = PpcSectionMem::new();
     mem.add_readonly_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
