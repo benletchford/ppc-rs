@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.5](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.4...ppc-v0.6.5) (2026-09-25)
+
+
+### Performance Improvements
+
+* copy visible PPC memory spans in bulk ([#45](https://github.com/benletchford/ppc-rs/issues/45)) ([d5e477f](https://github.com/benletchford/ppc-rs/commit/d5e477f99ee76651589f72f638e69be9639b2cb6))
+
 ## [0.6.4](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.3...ppc-v0.6.4) (2026-09-21)
 
 
