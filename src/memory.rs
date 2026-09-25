@@ -427,7 +427,13 @@ impl PpcSectionMem {
 
     #[inline]
     fn read_same_region_u16(&mut self, addr: u32) -> Option<u16> {
-        let (i, off) = self.locate_readable_same_region(addr, 2)?;
+        // Keep the common nonoverlapping read on the direct cached path.
+        // Only overlapping regions need the visible-span proof.
+        let (i, off) = if self.has_overlapping_regions {
+            self.locate_readable_same_region(addr, 2)?
+        } else {
+            self.locate_cached(addr)?
+        };
         let bytes = &self.regions[i].bytes;
         if bytes.len().saturating_sub(off) < 2 {
             return None;
@@ -441,7 +447,11 @@ impl PpcSectionMem {
 
     #[inline]
     fn read_same_region_u32(&mut self, addr: u32) -> Option<u32> {
-        let (i, off) = self.locate_readable_same_region(addr, 4)?;
+        let (i, off) = if self.has_overlapping_regions {
+            self.locate_readable_same_region(addr, 4)?
+        } else {
+            self.locate_cached(addr)?
+        };
         let bytes = &self.regions[i].bytes;
         if bytes.len().saturating_sub(off) < 4 {
             return None;
@@ -455,7 +465,11 @@ impl PpcSectionMem {
 
     #[inline]
     fn read_same_region_u64(&mut self, addr: u32) -> Option<u64> {
-        let (i, off) = self.locate_readable_same_region(addr, 8)?;
+        let (i, off) = if self.has_overlapping_regions {
+            self.locate_readable_same_region(addr, 8)?
+        } else {
+            self.locate_cached(addr)?
+        };
         let bytes = &self.regions[i].bytes;
         if bytes.len().saturating_sub(off) < 8 {
             return None;
@@ -470,17 +484,15 @@ impl PpcSectionMem {
     #[inline]
     fn locate_readable_same_region(&mut self, addr: u32, len: u32) -> Option<(usize, usize)> {
         let (index, offset) = self.locate_cached(addr)?;
-        if self.has_overlapping_regions {
-            let end = addr.checked_add(len)?;
-            let page_key = addr >> PPC_SECTION_MEM_PAGE_SHIFT;
-            let slot = (page_key as usize) & PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK;
-            if !matches!(
-                self.overlap_span_cache[slot],
-                Some((start, visible_end, owner))
-                    if owner == index && start <= addr && visible_end >= end
-            ) {
-                return None;
-            }
+        let end = addr.checked_add(len)?;
+        let page_key = addr >> PPC_SECTION_MEM_PAGE_SHIFT;
+        let slot = (page_key as usize) & PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK;
+        if !matches!(
+            self.overlap_span_cache[slot],
+            Some((start, visible_end, owner))
+                if owner == index && start <= addr && visible_end >= end
+        ) {
+            return None;
         }
         Some((index, offset))
     }
