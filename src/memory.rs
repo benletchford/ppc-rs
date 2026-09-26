@@ -712,6 +712,11 @@ impl PpcMemory for PpcSectionMem {
 
         let (region_index, offset) = self.locate_cached(addr)?;
         let region = &self.regions[region_index];
+        // Writable code always uses coherent reads. Its visible span cannot
+        // make the instruction cacheable, so avoid scanning newer mappings.
+        if region.writable || region.bytes.len().saturating_sub(offset) < 4 {
+            return self.read_u32_be(addr);
+        }
         let crosses_visible_region = self.has_overlapping_regions
             && match addr.checked_add(3) {
                 Some(instruction_last) => !matches!(
@@ -720,10 +725,7 @@ impl PpcMemory for PpcSectionMem {
                 ),
                 None => true,
             };
-        if region.writable
-            || region.bytes.len().saturating_sub(offset) < 4
-            || crosses_visible_region
-        {
+        if crosses_visible_region {
             return self.read_u32_be(addr);
         }
         let word = u32::from_be_bytes([
