@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.6](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.5...ppc-v0.6.6) (2026-09-26)
+
+
+### Performance Improvements
+
+* **memory:** read words within visible overlay spans ([#48](https://github.com/benletchford/ppc-rs/issues/48)) ([cd147ae](https://github.com/benletchford/ppc-rs/commit/cd147aecf75279529448e433b54ec26fa96dcfff))
+* **memory:** restore direct nonoverlap word reads ([#51](https://github.com/benletchford/ppc-rs/issues/51)) ([7227769](https://github.com/benletchford/ppc-rs/commit/7227769e4c5f0a7be23c54aa2587c19dba28b06c))
+* skip unused visibility scans for writable instruction fetches ([1c77db9](https://github.com/benletchford/ppc-rs/commit/1c77db91b4bacfc796a970f3581f39eabebba2b1))
+
 ## [0.6.5](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.4...ppc-v0.6.5) (2026-09-25)
 
 
