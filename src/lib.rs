@@ -3819,9 +3819,8 @@ impl PpcCpu {
             match step_result {
                 PpcStepResult::Stepped => {
                     completed += 1;
-                    if Self::instruction_ends_basic_block(word)
-                        || self.pc != expected_pc.wrapping_add(4)
-                    {
+                    // The cache builder ends the block at its first branch or store.
+                    if self.pc != expected_pc.wrapping_add(4) {
                         break;
                     }
                 }
