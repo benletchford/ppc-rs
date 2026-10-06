@@ -3716,15 +3716,6 @@ impl PpcCpu {
         }
     }
 
-    #[inline]
-    fn is_import_trap(pc: u32, trap_base: u32, import_count: u32) -> bool {
-        if import_count == 0 || pc < trap_base {
-            return false;
-        }
-        let offset = pc.wrapping_sub(trap_base);
-        (offset & 3) == 0 && (offset >> 2) < import_count
-    }
-
     fn run_cached_basic_block<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
@@ -3775,21 +3766,31 @@ impl PpcCpu {
         }
 
         let block_len = usize::from(self.basic_block_cache[cache_index].as_ref()?.len);
+        // The block contains straight-line instructions until its final branch
+        // or store. A halt, import, or native callback return can still lie in
+        // that span, but their PCs do not change while the block runs. Stop
+        // before the first one and let the outer loop handle it as usual.
+        let special_index = |pc: u32| {
+            let offset = pc.wrapping_sub(start_pc);
+            ((offset & 3) == 0)
+                .then_some((offset >> 2) as usize)
+                .filter(|&index| index < block_len)
+        };
+        let mut stop_before = special_index(halt_pc).unwrap_or(block_len);
+        if let Some(return_pc) = self.import_call_stack.last().map(|frame| frame.return_pc) {
+            stop_before = stop_before.min(special_index(return_pc).unwrap_or(block_len));
+        }
+        if import_count > 0 {
+            stop_before = stop_before.min(special_index(trap_base).unwrap_or(block_len));
+        }
         let mut completed = 0u64;
         let mut write_observer = PpcNoopMemoryWriteObserver;
-        for instruction_index in 0..block_len {
+        for instruction_index in 0..stop_before {
             if completed >= max_cycles {
                 break;
             }
             let expected_pc = start_pc.wrapping_add((instruction_index as u32).wrapping_mul(4));
-            if self.pc != expected_pc
-                || self.pc == halt_pc
-                || Self::is_import_trap(self.pc, trap_base, import_count)
-                || self
-                    .import_call_stack
-                    .last()
-                    .is_some_and(|frame| self.pc == frame.return_pc)
-            {
+            if self.pc != expected_pc {
                 break;
             }
             let word = self.basic_block_cache[cache_index].as_ref()?.words[instruction_index];
@@ -7825,6 +7826,90 @@ mod tests {
     #[test]
     fn store_rewriting_the_next_page_revalidates_the_cached_block() {
         assert_store_redecodes_the_following_instruction(0x1ffc);
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_halt_pc() {
+        let base = 0x1000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+
+        assert_eq!(
+            cpu.run(&mut memory, 10, base + 8),
+            PpcRunResult::Halted {
+                pc: base + 8,
+                cycles: 2
+            }
+        );
+        assert_eq!(cpu.gpr[3], 2);
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_import_trap() {
+        let base = 0x1000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+        cpu.lr = 0;
+        let mut calls = 0;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 10, 0, base + 8, 1, |index, _, _| {
+                assert_eq!(index, 0);
+                calls += 1;
+                PpcImportAction::Return(42)
+            }),
+            PpcRunResult::Halted { pc: 0, cycles: 3 }
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(cpu.gpr[3], 42);
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_native_callback_return() {
+        let base = 0x1000;
+        let trap_base = 0x2000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = trap_base;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 10, 0, trap_base, 1, |index, _, _| {
+                assert_eq!(index, 0);
+                PpcImportAction::CallNative {
+                    entry: base,
+                    rtoc: 0,
+                    return_pc: base + 8,
+                    final_pc: 0,
+                    restore_rtoc: 0,
+                    return_gpr3: PpcNativeReturnGpr3::Preserve,
+                }
+            }),
+            PpcRunResult::Halted { pc: 0, cycles: 4 }
+        );
+        assert_eq!(cpu.gpr[3], 2);
     }
 
     #[test]
