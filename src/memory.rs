@@ -93,6 +93,15 @@ pub trait PpcMemory {
         None
     }
 
+    /// Return a token shared by every cacheable instruction in this memory.
+    /// A cached block may use this instead of checking its address again only
+    /// when all cacheable addresses have this token and any change to their
+    /// instruction view changes the token. Other memories should return None.
+    #[inline]
+    fn global_instruction_cache_token(&self) -> Option<u64> {
+        None
+    }
+
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -763,6 +772,11 @@ impl PpcMemory for PpcSectionMem {
             }
         }
         Some(self.instruction_mapping_token)
+    }
+
+    #[inline]
+    fn global_instruction_cache_token(&self) -> Option<u64> {
+        (self.instruction_mapping_token != 0).then_some(self.instruction_mapping_token)
     }
 
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {
