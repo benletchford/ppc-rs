@@ -4007,10 +4007,55 @@ impl PpcCpu {
     where
         F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
     {
-        self.run_with_imports_unobserved(mem, max_cycles, halt_pc, trap_base, import_count, handler)
+        self.run_with_imports_unobserved(
+            mem,
+            max_cycles,
+            halt_pc,
+            trap_base,
+            import_count,
+            handler,
+            |_, _, _, _, _, _| None,
+        )
     }
 
-    fn run_with_imports_unobserved<M: PpcMemory + ?Sized, F>(
+    /// Run with an optional host trace before each cached basic block.
+    ///
+    /// `trace` is offered only after pending native returns, halt/import
+    /// targets, and instruction alignment are handled. It receives the
+    /// remaining cycle budget and the halt/import boundaries. Returning
+    /// `None` must leave CPU and memory unchanged. Returning `Some(cycles)`
+    /// must execute complete instructions, update architectural state and
+    /// time base exactly, stop before any boundary the run loop must handle,
+    /// and charge between one and the remaining number of cycles. Diagnostic
+    /// fetch and write observers use the normal interpreter path instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_imports_and_cycle_handler_and_trace<M: PpcMemory + ?Sized, F, T>(
+        &mut self,
+        mem: &mut M,
+        max_cycles: u64,
+        halt_pc: u32,
+        trap_base: u32,
+        import_count: u32,
+        handler: F,
+        trace: T,
+    ) -> PpcRunResult
+    where
+        F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
+        T: FnMut(&mut PpcCpu, &mut M, u64, u32, u32, u32) -> Option<u64>,
+    {
+        self.run_with_imports_unobserved(
+            mem,
+            max_cycles,
+            halt_pc,
+            trap_base,
+            import_count,
+            handler,
+            trace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_imports_unobserved<M: PpcMemory + ?Sized, F, T>(
         &mut self,
         mem: &mut M,
         max_cycles: u64,
@@ -4018,9 +4063,11 @@ impl PpcCpu {
         trap_base: u32,
         import_count: u32,
         mut handler: F,
+        mut trace: T,
     ) -> PpcRunResult
     where
         F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
+        T: FnMut(&mut PpcCpu, &mut M, u64, u32, u32, u32) -> Option<u64>,
     {
         let mut cycles = 0u64;
         while cycles < max_cycles {
@@ -4140,13 +4187,18 @@ impl PpcCpu {
                     cycles,
                 };
             }
-            if let Some(block_result) = self.run_cached_basic_block(
-                mem,
-                max_cycles.saturating_sub(cycles),
-                halt_pc,
-                trap_base,
-                import_count,
-            ) {
+            let remaining = max_cycles.saturating_sub(cycles);
+            if let Some(completed) = trace(self, mem, remaining, halt_pc, trap_base, import_count) {
+                assert!(
+                    completed > 0 && completed <= remaining,
+                    "PPC trace must charge 1..=remaining cycles"
+                );
+                cycles += completed;
+                continue;
+            }
+            if let Some(block_result) =
+                self.run_cached_basic_block(mem, remaining, halt_pc, trap_base, import_count)
+            {
                 match block_result {
                     PpcBasicBlockRunResult::Advanced(completed) if completed > 0 => {
                         cycles = cycles.saturating_add(completed);
