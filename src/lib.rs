@@ -3750,11 +3750,24 @@ impl PpcCpu {
         import_count: u32,
     ) -> Option<PpcBasicBlockRunResult> {
         let start_pc = self.pc;
-        let memory_token = mem.instruction_cache_token(start_pc)?;
         let cache_index = Self::basic_block_cache_index(start_pc);
-        let cache_hit = self.basic_block_cache[cache_index]
+        let global_token = mem.global_instruction_cache_token();
+        let global_hit = self.basic_block_cache[cache_index]
             .as_ref()
-            .is_some_and(|entry| entry.start_pc == start_pc && entry.memory_token == memory_token);
+            .is_some_and(|entry| {
+                entry.start_pc == start_pc && global_token == Some(entry.memory_token)
+            });
+        let memory_token = if global_hit {
+            global_token?
+        } else {
+            mem.instruction_cache_token(start_pc)?
+        };
+        let cache_hit = global_hit
+            || self.basic_block_cache[cache_index]
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry.start_pc == start_pc && entry.memory_token == memory_token
+                });
 
         if !cache_hit {
             let mut words = [0; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
@@ -7880,6 +7893,34 @@ mod tests {
         assert_eq!(result, PpcRunResult::CycleLimit { cycles: 100 });
         assert_eq!(cpu.gpr[3], 80);
         assert_eq!(memory.instruction_reads, 5);
+    }
+
+    #[test]
+    fn remapping_readonly_code_invalidates_a_cached_block() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            BASE,
+            [0x3863_0001u32, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+        assert_eq!(
+            cpu.run(&mut memory, 20, 0),
+            PpcRunResult::CycleLimit { cycles: 20 }
+        );
+        assert_eq!(cpu.gpr[3], 10);
+
+        memory.add_readonly_region(BASE, 0x3863_0005u32.to_be_bytes().to_vec());
+        assert_eq!(
+            cpu.run(&mut memory, 20, 0),
+            PpcRunResult::CycleLimit { cycles: 20 }
+        );
+        assert_eq!(cpu.gpr[3], 60);
     }
 
     fn assert_store_redecodes_the_following_instruction(base: u32) {
