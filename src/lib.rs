@@ -3811,79 +3811,78 @@ impl PpcCpu {
         if import_count > 0 {
             stop_before = stop_before.min(special_index(trap_base).unwrap_or(block_len));
         }
-        if stop_before >= 2 && max_cycles >= 2 {
-            if let Some(copy) = self.basic_block_cache[cache_index].as_ref()?.word_copy {
-                let load_base = if copy.load_base == 0 {
-                    0
-                } else {
-                    self.gpr[copy.load_base]
-                };
-                let load_addr = load_base.wrapping_add(copy.load_offset);
-                if self.alignment_policy == PpcAlignmentPolicy::Trap && (load_addr & 3) != 0 {
-                    return Some(PpcBasicBlockRunResult::Stop {
-                        pc: start_pc,
-                        completed: 0,
-                        result: PpcStepResult::Exception(PpcException::Alignment {
-                            addr: load_addr,
-                            size: 4,
-                            access: PpcMemoryAccess::Load,
-                        }),
-                    });
-                }
-                let Some(value) = mem.read_u32_be(load_addr) else {
-                    return Some(PpcBasicBlockRunResult::Stop {
-                        pc: start_pc,
-                        completed: 0,
-                        result: PpcStepResult::MemoryFault {
-                            addr: load_addr,
-                            was_write: false,
-                        },
-                    });
-                };
-                self.gpr[copy.register] = value;
-                self.pc = start_pc.wrapping_add(4);
-                self.time_base = self.time_base.wrapping_add(1);
-
-                let store_base = if copy.store_base == 0 {
-                    0
-                } else {
-                    self.gpr[copy.store_base]
-                };
-                let store_addr = store_base.wrapping_add(copy.store_offset);
-                if self.alignment_policy == PpcAlignmentPolicy::Trap && (store_addr & 3) != 0 {
-                    return Some(PpcBasicBlockRunResult::Stop {
-                        pc: self.pc,
-                        completed: 1,
-                        result: PpcStepResult::Exception(PpcException::Alignment {
-                            addr: store_addr,
-                            size: 4,
-                            access: PpcMemoryAccess::Store,
-                        }),
-                    });
-                }
-                if mem.write_u32_be(store_addr, value).is_none() {
-                    return Some(PpcBasicBlockRunResult::Stop {
-                        pc: self.pc,
-                        completed: 1,
-                        result: PpcStepResult::MemoryFault {
-                            addr: store_addr,
-                            was_write: true,
-                        },
-                    });
-                }
-                self.pc = start_pc.wrapping_add(8);
-                self.time_base = self.time_base.wrapping_add(1);
-                return Some(PpcBasicBlockRunResult::Advanced(2));
+        if stop_before >= 2
+            && max_cycles >= 2
+            && let Some(copy) = self.basic_block_cache[cache_index].as_ref()?.word_copy
+        {
+            let load_base = if copy.load_base == 0 {
+                0
+            } else {
+                self.gpr[copy.load_base]
+            };
+            let load_addr = load_base.wrapping_add(copy.load_offset);
+            if self.alignment_policy == PpcAlignmentPolicy::Trap && (load_addr & 3) != 0 {
+                return Some(PpcBasicBlockRunResult::Stop {
+                    pc: start_pc,
+                    completed: 0,
+                    result: PpcStepResult::Exception(PpcException::Alignment {
+                        addr: load_addr,
+                        size: 4,
+                        access: PpcMemoryAccess::Load,
+                    }),
+                });
             }
+            let Some(value) = mem.read_u32_be(load_addr) else {
+                return Some(PpcBasicBlockRunResult::Stop {
+                    pc: start_pc,
+                    completed: 0,
+                    result: PpcStepResult::MemoryFault {
+                        addr: load_addr,
+                        was_write: false,
+                    },
+                });
+            };
+            self.gpr[copy.register] = value;
+            self.pc = start_pc.wrapping_add(4);
+            self.time_base = self.time_base.wrapping_add(1);
+
+            let store_base = if copy.store_base == 0 {
+                0
+            } else {
+                self.gpr[copy.store_base]
+            };
+            let store_addr = store_base.wrapping_add(copy.store_offset);
+            if self.alignment_policy == PpcAlignmentPolicy::Trap && (store_addr & 3) != 0 {
+                return Some(PpcBasicBlockRunResult::Stop {
+                    pc: self.pc,
+                    completed: 1,
+                    result: PpcStepResult::Exception(PpcException::Alignment {
+                        addr: store_addr,
+                        size: 4,
+                        access: PpcMemoryAccess::Store,
+                    }),
+                });
+            }
+            if mem.write_u32_be(store_addr, value).is_none() {
+                return Some(PpcBasicBlockRunResult::Stop {
+                    pc: self.pc,
+                    completed: 1,
+                    result: PpcStepResult::MemoryFault {
+                        addr: store_addr,
+                        was_write: true,
+                    },
+                });
+            }
+            self.pc = start_pc.wrapping_add(8);
+            self.time_base = self.time_base.wrapping_add(1);
+            return Some(PpcBasicBlockRunResult::Advanced(2));
         }
         let mut completed = 0u64;
         let mut write_observer = PpcNoopMemoryWriteObserver;
+        // The builder ends a block at its first branch or store, so execution
+        // cannot leave the block between iterations without returning an error.
         for instruction_index in 0..stop_before {
             if completed >= max_cycles {
-                break;
-            }
-            let expected_pc = start_pc.wrapping_add((instruction_index as u32).wrapping_mul(4));
-            if self.pc != expected_pc {
                 break;
             }
             let word = self.basic_block_cache[cache_index].as_ref()?.words[instruction_index];
@@ -3912,10 +3911,6 @@ impl PpcCpu {
             match step_result {
                 PpcStepResult::Stepped => {
                     completed += 1;
-                    // The cache builder ends the block at its first branch or store.
-                    if self.pc != expected_pc.wrapping_add(4) {
-                        break;
-                    }
                 }
                 result => {
                     return Some(PpcBasicBlockRunResult::Stop {
