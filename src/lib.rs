@@ -3179,6 +3179,9 @@ pub use memory::{
 mod decode;
 pub use decode::{PpcDecodeError, PpcInstr, decode};
 
+#[cfg(feature = "trace-wasm")]
+pub mod trace_wasm;
+
 const XER_SO_MASK: u32 = 1 << 31;
 const XER_OV_MASK: u32 = 1 << 30;
 const XER_CA_MASK: u32 = 1 << 29;
