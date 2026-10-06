@@ -345,6 +345,28 @@ impl PpcSectionMem {
         Some(())
     }
 
+    /// Borrow a contiguous guest range from one visible mapped region.
+    ///
+    /// Returns `None` when the range is unmapped, crosses a region or overlay
+    /// boundary, or extends beyond the 32-bit guest address space. Unlike
+    /// [`Self::read_bytes_into`], this does not assemble bytes from multiple
+    /// mappings. The borrow prevents this memory bus from changing its regions
+    /// or bytes through Rust until the caller releases the slice.
+    pub fn readable_bytes(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let guest_len = u32::try_from(len).ok()?;
+        addr.checked_add(guest_len)?;
+        let (index, offset) = if self.has_overlapping_regions {
+            self.locate_readable_same_region(addr, guest_len)?
+        } else {
+            self.locate_cached(addr)?
+        };
+        let end = offset.checked_add(len)?;
+        self.regions.get(index)?.bytes.get(offset..end)
+    }
+
     /// Copy `src` into a mapped writable byte range.
     ///
     /// Returns `None` when any byte in the requested range is unmapped
@@ -855,6 +877,39 @@ mod tests {
         let mut bytes = [0; 2];
         assert_eq!(mem.read_bytes_into(u32::MAX, &mut bytes), Some(()));
         assert_eq!(bytes, [0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn readable_bytes_admits_only_one_visible_region() {
+        let mut mem = PpcSectionMem::new();
+        mem.add_readonly_region(0x1000, vec![0, 1, 2, 3]);
+        mem.add_region(0x1004, vec![4, 5, 6, 7]);
+
+        assert_eq!(mem.readable_bytes(0x1001, 3), Some(&[1, 2, 3][..]));
+        assert_eq!(mem.readable_bytes(0x1004, 4), Some(&[4, 5, 6, 7][..]));
+        assert_eq!(mem.readable_bytes(0x1003, 2), None);
+        assert_eq!(mem.readable_bytes(0x1008, 1), None);
+        assert_eq!(mem.readable_bytes(0x1000, 0), Some(&[][..]));
+
+        mem.add_region(0x1002, vec![20, 21, 22]);
+        assert_eq!(mem.readable_bytes(0x1000, 2), Some(&[0, 1][..]));
+        assert_eq!(mem.readable_bytes(0x1001, 2), None);
+        assert_eq!(mem.readable_bytes(0x1002, 3), Some(&[20, 21, 22][..]));
+        assert_eq!(mem.readable_bytes(0x1004, 2), None);
+        assert_eq!(mem.readable_bytes(0x1005, 3), Some(&[5, 6, 7][..]));
+    }
+
+    #[test]
+    fn readable_bytes_declines_wrapping_range_and_uses_new_mapping() {
+        let mut mem = PpcSectionMem::new();
+        mem.add_region(0x2000, vec![1, 2, 3, 4]);
+        assert_eq!(mem.readable_bytes(0x2000, 4), Some(&[1, 2, 3, 4][..]));
+        mem.add_readonly_region(0x2000, vec![9, 8, 7, 6]);
+        assert_eq!(mem.readable_bytes(0x2000, 4), Some(&[9, 8, 7, 6][..]));
+
+        mem.add_region(u32::MAX, vec![0xaa]);
+        assert_eq!(mem.read_u8(u32::MAX), Some(0xaa));
+        assert_eq!(mem.readable_bytes(u32::MAX, 1), None);
     }
 
     #[test]
