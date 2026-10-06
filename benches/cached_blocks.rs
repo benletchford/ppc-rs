@@ -13,11 +13,12 @@ fn run_case(words: &[u32], with_data: bool, cycles: u64) -> Duration {
         words.iter().flat_map(|word| word.to_be_bytes()).collect(),
     );
     if with_data {
-        memory.add_region(DATA_BASE, vec![0; 4]);
+        memory.add_region(DATA_BASE, vec![0; 64]);
     }
     let mut cpu = PpcCpu::new();
     cpu.pc = CODE_BASE;
     cpu.gpr[5] = DATA_BASE;
+    cpu.gpr[6] = DATA_BASE + 32;
 
     let start = Instant::now();
     let result = cpu.run_with_imports(&mut memory, cycles, 0, 0, 0, |_, _, _| unreachable!());
@@ -56,12 +57,19 @@ fn main() {
         0x9085_0000, // stw r4,0(r5)
         0x4bff_fff4, // b CODE_BASE
     ];
+    let mut copy_words = Vec::with_capacity(17);
+    for offset in (0..32).step_by(4) {
+        copy_words.push(0x8085_0000 | offset); // lwz r4,offset(r5)
+        copy_words.push(0x9086_0000 | offset); // stw r4,offset(r6)
+    }
+    copy_words.push(0x4bff_ffc0); // b CODE_BASE
 
     println!("case\tcycles\tmedian_ms\tMcycles/s");
     for (name, words, with_data) in [
         ("arithmetic", arithmetic.as_slice(), false),
         ("conditional", conditional.as_slice(), false),
         ("load_store", memory.as_slice(), true),
+        ("copy_words", copy_words.as_slice(), true),
     ] {
         let mut runs = [Duration::ZERO; 3];
         for elapsed in &mut runs {
