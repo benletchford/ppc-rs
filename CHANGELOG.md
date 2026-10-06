@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.6...ppc-v0.7.0) (2026-10-06)
+
+
+### Features
+
+* **memory:** expose guarded contiguous read spans ([#72](https://github.com/benletchford/ppc-rs/issues/72)) ([737d4fc](https://github.com/benletchford/ppc-rs/commit/737d4fc53644ce1422f41e5144747f55e1d8a8eb))
+* **ppc:** allow guarded traces before cached blocks ([#74](https://github.com/benletchford/ppc-rs/issues/74)) ([8404b76](https://github.com/benletchford/ppc-rs/commit/8404b769124210701b12b132dbf6d08085013b81))
+* **ppc:** compile guarded read-only traces to WebAssembly ([#76](https://github.com/benletchford/ppc-rs/issues/76)) ([028cd7b](https://github.com/benletchford/ppc-rs/commit/028cd7bac2837d71215cc7c5d6e3b5e450d774da))
+
+
+### Performance Improvements
+
+* avoid repeated PPC cached-block stop checks ([cae8f50](https://github.com/benletchford/ppc-rs/commit/cae8f5086616848f35328981e5ba779426a1a176))
+* **ppc:** fuse cached word copy pairs ([#61](https://github.com/benletchford/ppc-rs/issues/61)) ([cdfc991](https://github.com/benletchford/ppc-rs/commit/cdfc991b759bd4d6497bb09c9114db3bcc8cb398))
+* **ppc:** remove redundant cached block PC checks ([#62](https://github.com/benletchford/ppc-rs/issues/62)) ([929068d](https://github.com/benletchford/ppc-rs/commit/929068d07261e517ad8d7050c90a97a0baefb8a6))
+* **ppc:** reuse global instruction mapping token on cached block hits ([#69](https://github.com/benletchford/ppc-rs/issues/69)) ([763be03](https://github.com/benletchford/ppc-rs/commit/763be033a418f90d441d8559fba350b415482cfb))
+* skip redundant cached block end checks ([64e9428](https://github.com/benletchford/ppc-rs/commit/64e94283b1499720cfde8d89493d4eca5f7cc990))
+
 ## [0.6.6](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.5...ppc-v0.6.6) (2026-09-26)
 
 
