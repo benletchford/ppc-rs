@@ -65,12 +65,37 @@ const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIE
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
 type PpcDecodedInstruction = Result<PpcInstr, PpcDecodeError>;
 
+#[derive(Debug, Clone, Copy)]
+struct PpcCachedWordCopy {
+    register: usize,
+    load_base: usize,
+    load_offset: u32,
+    store_base: usize,
+    store_offset: u32,
+}
+
+impl PpcCachedWordCopy {
+    fn from_words(load: u32, store: u32) -> Option<Self> {
+        if load >> 26 != 32 || store >> 26 != 36 || (load >> 21) & 31 != (store >> 21) & 31 {
+            return None;
+        }
+        Some(Self {
+            register: ((load >> 21) & 31) as usize,
+            load_base: ((load >> 16) & 31) as usize,
+            load_offset: (load as u16 as i16 as i32) as u32,
+            store_base: ((store >> 16) & 31) as usize,
+            store_offset: (store as u16 as i16 as i32) as u32,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PpcBasicBlockCacheEntry {
     start_pc: u32,
     memory_token: u64,
     words: [u32; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
     decoded: [Option<PpcDecodedInstruction>; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
+    word_copy: Option<PpcCachedWordCopy>,
     len: u8,
 }
 
@@ -3761,6 +3786,9 @@ impl PpcCpu {
                 memory_token,
                 words,
                 decoded,
+                word_copy: (len == 2)
+                    .then(|| PpcCachedWordCopy::from_words(words[0], words[1]))
+                    .flatten(),
                 len: len as u8,
             });
         }
@@ -3782,6 +3810,71 @@ impl PpcCpu {
         }
         if import_count > 0 {
             stop_before = stop_before.min(special_index(trap_base).unwrap_or(block_len));
+        }
+        if stop_before >= 2 && max_cycles >= 2 {
+            if let Some(copy) = self.basic_block_cache[cache_index].as_ref()?.word_copy {
+                let load_base = if copy.load_base == 0 {
+                    0
+                } else {
+                    self.gpr[copy.load_base]
+                };
+                let load_addr = load_base.wrapping_add(copy.load_offset);
+                if self.alignment_policy == PpcAlignmentPolicy::Trap && (load_addr & 3) != 0 {
+                    return Some(PpcBasicBlockRunResult::Stop {
+                        pc: start_pc,
+                        completed: 0,
+                        result: PpcStepResult::Exception(PpcException::Alignment {
+                            addr: load_addr,
+                            size: 4,
+                            access: PpcMemoryAccess::Load,
+                        }),
+                    });
+                }
+                let Some(value) = mem.read_u32_be(load_addr) else {
+                    return Some(PpcBasicBlockRunResult::Stop {
+                        pc: start_pc,
+                        completed: 0,
+                        result: PpcStepResult::MemoryFault {
+                            addr: load_addr,
+                            was_write: false,
+                        },
+                    });
+                };
+                self.gpr[copy.register] = value;
+                self.pc = start_pc.wrapping_add(4);
+                self.time_base = self.time_base.wrapping_add(1);
+
+                let store_base = if copy.store_base == 0 {
+                    0
+                } else {
+                    self.gpr[copy.store_base]
+                };
+                let store_addr = store_base.wrapping_add(copy.store_offset);
+                if self.alignment_policy == PpcAlignmentPolicy::Trap && (store_addr & 3) != 0 {
+                    return Some(PpcBasicBlockRunResult::Stop {
+                        pc: self.pc,
+                        completed: 1,
+                        result: PpcStepResult::Exception(PpcException::Alignment {
+                            addr: store_addr,
+                            size: 4,
+                            access: PpcMemoryAccess::Store,
+                        }),
+                    });
+                }
+                if mem.write_u32_be(store_addr, value).is_none() {
+                    return Some(PpcBasicBlockRunResult::Stop {
+                        pc: self.pc,
+                        completed: 1,
+                        result: PpcStepResult::MemoryFault {
+                            addr: store_addr,
+                            was_write: true,
+                        },
+                    });
+                }
+                self.pc = start_pc.wrapping_add(8);
+                self.time_base = self.time_base.wrapping_add(1);
+                return Some(PpcBasicBlockRunResult::Advanced(2));
+            }
         }
         let mut completed = 0u64;
         let mut write_observer = PpcNoopMemoryWriteObserver;
@@ -7849,6 +7942,72 @@ mod tests {
             }
         );
         assert_eq!(cpu.gpr[3], 2);
+    }
+
+    #[test]
+    fn cached_word_copy_preserves_load_store_boundaries() {
+        const CODE: u32 = 0x1000;
+        const DATA: u32 = 0x2000;
+        // Loading r4 also changes the base used by the following store.
+        let instructions = [0x8085_0000u32, 0x9084_0004];
+        for (source, destination, max_cycles, halt_pc) in [
+            (DATA, DATA + 8, 2, 0),
+            (DATA, DATA + 8, 1, 0),
+            (DATA, DATA + 8, 2, CODE + 4),
+            (DATA + 1, DATA + 8, 2, 0),
+            (DATA, DATA + 1, 2, 0),
+            (DATA + 16, DATA + 8, 2, 0),
+            (DATA, DATA + 16, 2, 0),
+        ] {
+            let mut memory = PpcSectionMem::new();
+            memory.add_readonly_region(
+                CODE,
+                instructions
+                    .into_iter()
+                    .flat_map(u32::to_be_bytes)
+                    .collect(),
+            );
+            let mut data = vec![0u8; 16];
+            data[0..4].copy_from_slice(&(destination - 4).to_be_bytes());
+            memory.add_region(DATA, data);
+
+            let mut cached = PpcCpu::new();
+            cached.pc = CODE;
+            cached.gpr[5] = source;
+            let mut expected = PpcCpu::new();
+            expected.pc = CODE;
+            expected.gpr[5] = source;
+            let mut expected_memory = memory.clone();
+
+            let result = cached.run_with_imports(
+                &mut memory,
+                max_cycles,
+                halt_pc,
+                0,
+                0,
+                |_, _, _| unreachable!(),
+            );
+            let reference = expected.run_with_imports_and_fetch_observer(
+                &mut expected_memory,
+                max_cycles,
+                halt_pc,
+                0,
+                0,
+                &mut Vec::new(),
+                |_, _, _| unreachable!(),
+            );
+            assert_eq!(
+                result, reference,
+                "source={source:#x}, destination={destination:#x}"
+            );
+            assert_eq!(cached.pc, expected.pc);
+            assert_eq!(cached.gpr, expected.gpr);
+            assert_eq!(cached.time_base(), expected.time_base());
+            assert_eq!(
+                memory.read_u32_be(DATA + 8),
+                expected_memory.read_u32_be(DATA + 8)
+            );
+        }
     }
 
     #[test]
