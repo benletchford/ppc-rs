@@ -1,4 +1,4 @@
-use ppc::{PpcCpu, PpcImportAction, PpcRunResult, PpcSectionMem};
+use ppc::{PpcCpu, PpcImportAction, PpcNativeReturnGpr3, PpcRunResult, PpcSectionMem};
 
 const CODE: u32 = 0x1000;
 
@@ -185,4 +185,68 @@ fn trace_reaches_import_handler_with_accumulated_cycles() {
             cycles: 2
         }
     );
+}
+
+#[test]
+fn trace_waits_until_native_callback_return_is_handled() {
+    const CALLBACK: u32 = 0x1000;
+    const IMPORT: u32 = 0x2000;
+    const RESUME: u32 = 0x3000;
+    const HALT: u32 = RESUME + 4;
+    let memory = || {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            CALLBACK,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        memory.add_readonly_region(RESUME, 0x3863_0003u32.to_be_bytes().to_vec());
+        memory
+    };
+    let mut baseline = PpcCpu::new();
+    baseline.pc = IMPORT;
+    let mut traced = baseline.clone();
+    let callback = |_, index, _: &mut PpcCpu, _: &mut PpcSectionMem| {
+        assert_eq!(index, 0);
+        PpcImportAction::CallNative {
+            entry: CALLBACK,
+            rtoc: 0x12,
+            return_pc: CALLBACK + 8,
+            final_pc: RESUME,
+            restore_rtoc: 0x34,
+            return_gpr3: PpcNativeReturnGpr3::Preserve,
+        }
+    };
+    let expected =
+        baseline.run_with_imports_and_cycle_handler(&mut memory(), 10, HALT, IMPORT, 1, callback);
+    let mut trace_calls = 0;
+    let actual = traced.run_with_imports_and_cycle_handler_and_trace(
+        &mut memory(),
+        10,
+        HALT,
+        IMPORT,
+        1,
+        callback,
+        |cpu, _, _, _, _, _| {
+            trace_calls += 1;
+            assert_eq!(cpu.pc, RESUME, "trace ran before native return restoration");
+            assert_eq!(cpu.gpr[2], 0x34);
+            None
+        },
+    );
+    assert_eq!(trace_calls, 1);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual,
+        PpcRunResult::Halted {
+            pc: HALT,
+            cycles: 5
+        }
+    );
+    assert_eq!(traced.pc, baseline.pc);
+    assert_eq!(traced.gpr, baseline.gpr);
+    assert_eq!(traced.lr, baseline.lr);
+    assert_eq!(traced.time_base(), baseline.time_base());
 }
