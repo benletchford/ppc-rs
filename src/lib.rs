@@ -3179,6 +3179,8 @@ pub use memory::{
 mod decode;
 pub use decode::{PpcDecodeError, PpcInstr, decode};
 
+mod frsqrte;
+
 #[cfg(feature = "trace-wasm")]
 pub mod trace_wasm;
 
@@ -5870,13 +5872,7 @@ impl PpcCpu {
             }
             PpcInstr::Frsqrte { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
-                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
-                let one = ApDouble::from_bits(u128::from(1.0f64.to_bits()));
-                let mut result = one.div_r(
-                    ApDouble::from_bits(u128::from(sqrt.value)),
-                    self.fp_rounding_mode(),
-                );
-                result.status |= sqrt.status;
+                let result = frsqrte::evaluate(bits, self.fpscr & 0x3);
                 let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
                 self.finish_ap_double_result(frt, result, invalid, rc);
             }
