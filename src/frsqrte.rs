@@ -29,18 +29,24 @@
 //!    and, by its sign, picks the directed-mode neighbour.  The reference
 //!    division is correctly rounded, so the values agree.
 //!
-//! Anything the proof does not cover returns `None` and takes
-//! [`reference()`]: zeros, negatives, infinities, NaNs, exact square roots,
-//! inputs within the margin, and roots whose significand is a power of two
-//! (the residual bound assumes equal ulps on both sides of `s`, and below a
-//! power of two the midpoint sits at a quarter ulp).  Subnormal inputs with
-//! fewer than about 31 significant bits also fall back, because aligning `x`
-//! with `s * s` would need a shift of more than 74 bits.
+//! An exact square (`r == 0`) is accepted with an exact root: near an exact
+//! root, the reference's Newton step `(e + x/e) / 2` returns the root itself
+//! when rounding to nearest, toward zero or toward -infinity, and the check
+//! `e * e == x` then reports it exact.  Toward +infinity the step stalls one
+//! ulp above the root and the reference reports an inexact, one-ulp-high
+//! root, so exact squares in that mode take the reference.
 //!
-//! For accepted inputs the status is always exactly `INEXACT`: `x` is
-//! positive and finite, so `1 / sqrt(x)` lies in `[2^-512, 2^537]` and can
-//! neither overflow nor underflow, and the square root is inexact by
-//! construction.
+//! Anything else the proof does not cover returns `None` and takes
+//! [`reference()`]: zeros, negatives, infinities, NaNs, inputs within the
+//! margin, and inexact roots whose significand is a power of two (the
+//! residual bound assumes equal ulps on both sides of `s`, and below a power
+//! of two the midpoint sits at a quarter ulp).  Subnormal inputs with fewer
+//! than about 31 significant bits also fall back, because aligning `x` with
+//! `s * s` would need a shift of more than 74 bits.
+//!
+//! For accepted inputs the status is `INEXACT` or `OK` and nothing else: `x`
+//! is positive and finite, so `1 / sqrt(x)` lies in `[2^-512, 2^537]` and can
+//! neither overflow nor underflow.
 
 use rustc_apfloat::{
     Float, Round as ApRound, Status as ApStatus, StatusAnd, ieee::Double as ApDouble,
@@ -59,8 +65,8 @@ const MARGIN: u128 = 1 << 24;
 #[inline]
 pub(crate) fn evaluate(bits: u64, rn: u32) -> StatusAnd<ApDouble> {
     match fast(bits, rn) {
-        Some(value) => StatusAnd {
-            status: ApStatus::INEXACT,
+        Some((value, status)) => StatusAnd {
+            status,
             value: ApDouble::from_bits(u128::from(value)),
         },
         None => reference(bits, rounding_mode(rn)),
@@ -97,10 +103,10 @@ fn decompose(bits: u64) -> (u64, i32) {
     }
 }
 
-/// Returns the `frsqrte` result bits for `bits` when the exact residual checks
-/// prove they match [`reference()`] (whose status is then `INEXACT`).
+/// Returns the `frsqrte` result bits and status for `bits` when the exact
+/// residual checks prove they match [`reference()`].
 #[inline]
-pub(crate) fn fast(bits: u64, rn: u32) -> Option<u64> {
+pub(crate) fn fast(bits: u64, rn: u32) -> Option<(u64, ApStatus)> {
     // Positive, nonzero, finite inputs only.
     if bits.wrapping_sub(1) >= POSITIVE_INFINITY - 1 {
         return None;
@@ -112,11 +118,6 @@ pub(crate) fn fast(bits: u64, rn: u32) -> Option<u64> {
     let (mx, ex) = decompose(bits);
     let s_nearest = f64::from_bits(bits).sqrt().to_bits();
     let (ms, es) = decompose(s_nearest);
-    // A power-of-two root has a narrower ulp below it; leave it to the
-    // reference rather than special-case the asymmetric bounds.
-    if ms == HIDDEN_BIT {
-        return None;
-    }
     // x = mx * 2^ex and s*s = ms^2 * 2^(2*es); align both to 2^(2*es).
     let shift = ex - 2 * es;
     if !(0..=74).contains(&shift) {
@@ -124,17 +125,33 @@ pub(crate) fn fast(bits: u64, rn: u32) -> Option<u64> {
     }
     let square = u128::from(ms) * u128::from(ms);
     let scaled_x = u128::from(mx) << shift;
-    let below = scaled_x < square; // true root is below s
-    let r = scaled_x.abs_diff(square);
-    if r < MARGIN || r > u128::from(ms) - MARGIN {
-        return None;
-    }
-    let s = if below && toward_negative {
-        s_nearest - 1
-    } else if !below && toward_positive {
-        s_nearest + 1
+    let (s, mut status) = if scaled_x == square {
+        // Exact root.  The reference's Newton iteration lands on it exactly
+        // in every mode except toward +infinity, where it stalls one ulp
+        // high and reports INEXACT; leave that mode to the reference.
+        if toward_positive {
+            return None;
+        }
+        (s_nearest, ApStatus::OK)
     } else {
-        s_nearest
+        // A power-of-two root has a narrower ulp below it; leave it to the
+        // reference rather than special-case the asymmetric bounds.
+        if ms == HIDDEN_BIT {
+            return None;
+        }
+        let below = scaled_x < square; // true root is below s
+        let r = scaled_x.abs_diff(square);
+        if r < MARGIN || r > u128::from(ms) - MARGIN {
+            return None;
+        }
+        let s = if below && toward_negative {
+            s_nearest - 1
+        } else if !below && toward_positive {
+            s_nearest + 1
+        } else {
+            s_nearest
+        };
+        (s, ApStatus::INEXACT)
     };
 
     // Step 2: q = round(1 / s).
@@ -160,16 +177,18 @@ pub(crate) fn fast(bits: u64, rn: u32) -> Option<u64> {
     if rho >= limit {
         return None;
     }
-    let q = if rho == 0 {
-        q_nearest
-    } else if above && toward_negative {
+    if rho == 0 {
+        return Some((q_nearest, status));
+    }
+    status |= ApStatus::INEXACT;
+    let q = if above && toward_negative {
         q_nearest - 1
     } else if !above && toward_positive {
         q_nearest + 1
     } else {
         q_nearest
     };
-    Some(q)
+    Some((q, status))
 }
 
 #[cfg(test)]
@@ -383,19 +402,51 @@ mod tests {
         }
     }
 
+    /// The squared length a guest feeds `frsqrte` when normalising a vector:
+    /// a vector of length 0.01..1e4 in double precision, or (for `unit`) an
+    /// already-normalised single-precision vector whose squared length is
+    /// 1.0 or within a few single-precision ulps of it.
+    fn vector_square(rng: &mut Rng, unit_length: bool) -> u64 {
+        let mut unit = || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+        let (a, b, c) = (unit() - 0.5, unit() - 0.5, unit() - 0.5);
+        let length = 10f64.powf(-2.0 + 6.0 * unit());
+        let norm = (a * a + b * b + c * c).sqrt().max(f64::MIN_POSITIVE);
+        if unit_length {
+            let (x, y, z) = ((a / norm) as f32, (b / norm) as f32, (c / norm) as f32);
+            f64::from(x.mul_add(x, y.mul_add(y, z * z))).to_bits()
+        } else {
+            let (x, y, z) = (a / norm * length, b / norm * length, c / norm * length);
+            (x * x + y * y + z * z).to_bits()
+        }
+    }
+
     fn realistic_inputs(seed: u64, count: usize) {
         let mut rng = Rng(seed);
-        let unit = |rng: &mut Rng| (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
         for i in 0..count {
-            // A vector of length 0.01..1e4, squared and summed like a guest
-            // normalisation does.
-            let length = 10f64.powf(-2.0 + 6.0 * unit(&mut rng));
-            let (a, b, c) = (unit(&mut rng), unit(&mut rng), unit(&mut rng));
-            let norm = (a * a + b * b + c * c).sqrt().max(f64::MIN_POSITIVE);
-            let (x, y, z) = (a / norm * length, b / norm * length, c / norm * length);
-            let square = x * x + y * y + z * z;
-            check(square.to_bits(), (i % 4) as u32);
+            check(vector_square(&mut rng, i % 8 < 4), (i % 4) as u32);
         }
+    }
+
+    /// Squares of random doubles with at most 26 significant bits, so the
+    /// square, and therefore the root, is exact.
+    fn exact_squares(seed: u64, count: usize) {
+        let mut rng = Rng(seed);
+        let mut tested = 0;
+        while tested < count {
+            let raw = rng.next();
+            let root = ((raw >> 38) | (1 << 25)) as f64 * 2f64.powi((raw % 1000) as i32 - 500);
+            let square = root * root;
+            if square == 0.0 || !square.is_finite() {
+                continue;
+            }
+            check_all_modes(square.to_bits());
+            tested += 1;
+        }
+    }
+
+    #[test]
+    fn exact_squares_match_reference_in_every_mode() {
+        exact_squares(0x5eed_0004, 1_500);
     }
 
     #[test]
@@ -414,6 +465,7 @@ mod tests {
     fn exhaustive_differential() {
         random_inputs(0x5eed_1000, 8_000_000);
         realistic_inputs(0x5eed_1001, 2_000_000);
+        exact_squares(0x5eed_1003, 200_000);
         let mut rng = Rng(0x5eed_1002);
         for &bits in &hard_cases(&mut rng, 400_000) {
             check_all_modes(bits);
@@ -425,27 +477,27 @@ mod tests {
     #[ignore = "measurement; run with --release -- --ignored --nocapture"]
     fn fallback_rates() {
         let mut rng = Rng(0x5eed_2000);
-        let unit = |rng: &mut Rng| (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
         let total = 10_000_000u64;
         for rn in MODES {
             let mut random_declined = 0u64;
-            let mut realistic_declined = 0u64;
+            let mut lengths_declined = 0u64;
+            let mut units_declined = 0u64;
             for _ in 0..total {
                 let bits = rng.next() & !(1 << 63);
                 if bits < POSITIVE_INFINITY && fast(bits, rn).is_none() {
                     random_declined += 1;
                 }
-                let length = 10f64.powf(-2.0 + 6.0 * unit(&mut rng));
-                let (a, b, c) = (unit(&mut rng), unit(&mut rng), unit(&mut rng));
-                let norm = (a * a + b * b + c * c).sqrt().max(f64::MIN_POSITIVE);
-                let (x, y, z) = (a / norm * length, b / norm * length, c / norm * length);
-                if fast((x * x + y * y + z * z).to_bits(), rn).is_none() {
-                    realistic_declined += 1;
+                if fast(vector_square(&mut rng, false), rn).is_none() {
+                    lengths_declined += 1;
+                }
+                if fast(vector_square(&mut rng, true), rn).is_none() {
+                    units_declined += 1;
                 }
             }
             println!(
-                "rn={rn}: random positive finite declined {random_declined}/{total}, \
-                 realistic declined {realistic_declined}/{total}"
+                "rn={rn}: declined random positive finite {random_declined}/{total}, \
+                 lengths 0.01..1e4 {lengths_declined}/{total}, \
+                 unit single-precision vectors {units_declined}/{total}"
             );
         }
     }
@@ -458,12 +510,9 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
         let mut rng = Rng(0x5eed_3000);
-        let unit = |rng: &mut Rng| (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+        let unit_length = std::env::var_os("FRSQRTE_BENCH_UNIT").is_some();
         let inputs: Vec<u64> = (0..4096)
-            .map(|_| {
-                let length = 10f64.powf(-2.0 + 6.0 * unit(&mut rng));
-                (length * length).to_bits()
-            })
+            .map(|_| vector_square(&mut rng, unit_length))
             .collect();
         let rounds = 50;
         let start = Instant::now();
