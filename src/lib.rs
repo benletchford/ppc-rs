@@ -4023,8 +4023,8 @@ impl PpcCpu {
 
     /// Run with an optional host trace before each cached basic block.
     ///
-    /// `trace` is offered only after pending native returns, halt/import
-    /// targets, and instruction alignment are handled. It receives the
+    /// `trace` is offered only when no native callback return is pending,
+    /// after halt/import targets and instruction alignment are handled. It receives the
     /// remaining cycle budget and the halt/import boundaries. Returning
     /// `None` must leave CPU and memory unchanged. Returning `Some(cycles)`
     /// must execute complete instructions, update architectural state and
@@ -4191,7 +4191,10 @@ impl PpcCpu {
                 };
             }
             let remaining = max_cycles.saturating_sub(cycles);
-            if let Some(completed) = trace(self, mem, remaining, halt_pc, trap_base, import_count) {
+            if self.import_call_stack.is_empty()
+                && let Some(completed) =
+                    trace(self, mem, remaining, halt_pc, trap_base, import_count)
+            {
                 assert!(
                     completed > 0 && completed <= remaining,
                     "PPC trace must charge 1..=remaining cycles"
