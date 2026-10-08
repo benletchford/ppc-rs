@@ -3180,6 +3180,7 @@ mod decode;
 pub use decode::{PpcDecodeError, PpcInstr, decode};
 
 mod frsqrte;
+mod sqrt;
 
 #[cfg(feature = "trace-wasm")]
 pub mod trace_wasm;
@@ -5828,34 +5829,26 @@ impl PpcCpu {
             }
             PpcInstr::Fsqrt { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
-                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
-                let (truncated, _) = ieee_apsqrt::sqrt_accurate(bits, ApRound::TowardZero);
-                let result = StatusAnd {
-                    status: sqrt.status,
-                    value: ApDouble::from_bits(u128::from(sqrt.value)),
-                };
+                let root = sqrt::sqrt(bits, self.fpscr & 0x3);
                 let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
                 self.finish_ap_double_result_rounded(
                     frt,
-                    result,
-                    ApDouble::from_bits(u128::from(truncated.value)),
+                    root.result(),
+                    root.truncated(),
                     invalid,
                     rc,
                 );
             }
             PpcInstr::Fsqrts { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
-                let (sqrt, _) = ieee_apsqrt::sqrt_accurate(bits, self.fp_rounding_mode());
-                let (truncated, _) = ieee_apsqrt::sqrt_accurate(bits, ApRound::TowardZero);
-                let result = StatusAnd {
-                    status: sqrt.status,
-                    value: ApDouble::from_bits(u128::from(sqrt.value)),
-                };
+                // Rounded to odd at double precision, so that the narrowing
+                // to single precision in the finish path rounds only once.
+                let root = sqrt::sqrt_round_to_odd(bits);
                 let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
                 self.finish_ap_single_result_rounded(
                     frt,
-                    result,
-                    ApDouble::from_bits(u128::from(truncated.value)),
+                    root.result(),
+                    root.truncated(),
                     invalid,
                     rc,
                 );
