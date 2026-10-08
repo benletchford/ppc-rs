@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.0...ppc-v0.7.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **fpu:** round fsqrt, fsqrts and frsqrte square roots correctly in every mode ([ce4c218](https://github.com/benletchford/ppc-rs/commit/ce4c2181da48044f1058a261403f43cd25ceba20))
+* **ppc:** defer traces until native callbacks return ([#78](https://github.com/benletchford/ppc-rs/issues/78)) ([ad4b726](https://github.com/benletchford/ppc-rs/commit/ad4b726c66744c82a4416b61862090f9ed44772e))
+
+
+### Performance Improvements
+
+* **fpu:** evaluate frsqrte natively with exact residual proofs ([4859b71](https://github.com/benletchford/ppc-rs/commit/4859b71028139b1a24d6c4b0204cfecc030d7b02))
+
 ## [0.7.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.6.6...ppc-v0.7.0) (2026-10-06)
 
 
