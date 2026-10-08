@@ -514,9 +514,9 @@ mod tests {
             xx: inexact,
             fi: inexact,
             fr: value > truncated.min(max),
-            // The finish path follows rustc_apfloat (and LLVM's APFloat),
-            // which reports OVERFLOW only when the result becomes infinite.
-            ox: value.is_infinite(),
+            // Overflow is decided on the root rounded with an unbounded
+            // exponent, in every mode (MPCFPE32B Rev. 2 §3.3.6.2.1).
+            ox: beyond,
             // Tiny after rounding, and inexact.
             ux: inexact && value < f64::from(f32::MIN_POSITIVE),
         }
