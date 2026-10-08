@@ -2684,13 +2684,66 @@ impl PpcCpu {
         }
     }
 
+    /// Adds `OVERFLOW` to `status` when the exact result overflows the
+    /// format but rustc_apfloat did not report it.
+    ///
+    /// The architecture decides overflow on the result rounded as though the
+    /// exponent range were unbounded, in every rounding mode, and sets
+    /// FPSCR\[OX\] "regardless of the FPSCR\[OE\] value" (MPCFPE32B Rev. 2
+    /// §3.3.6.2.1, p. 3-33). rustc_apfloat (following LLVM's APFloat) reports
+    /// `OVERFLOW` only when it delivers an infinity. When it rounds toward
+    /// zero (toward zero, or toward −∞ for a positive result, toward +∞ for a
+    /// negative one), it delivers the largest finite number with `INEXACT`
+    /// alone. In those modes the unbounded rounded result exceeds the largest
+    /// finite number exactly when the exact magnitude is at least
+    /// 2^(emax+1), which is what apfloat itself tests before choosing the
+    /// largest finite number.
+    ///
+    /// `truncated_exact` returns the exact result rounded toward zero in
+    /// quad precision. Quad's exponent range holds every sum, product,
+    /// quotient and multiply-add of doubles, and 2^(emax+1) is a quad, so the
+    /// truncated value reaches 2^(emax+1) exactly when the exact one does.
+    /// It is evaluated only when apfloat delivered the largest finite
+    /// magnitude with `INEXACT` and without `OVERFLOW`, the only case in
+    /// which it can have hidden an overflow.
+    fn fp_note_overflow(
+        status: &mut ApStatus,
+        single: bool,
+        delivered_largest: bool,
+        truncated_exact: impl FnOnce() -> ApQuad,
+    ) {
+        if !delivered_largest
+            || !status.contains(ApStatus::INEXACT)
+            || status.contains(ApStatus::OVERFLOW)
+        {
+            return;
+        }
+        let value = truncated_exact();
+        let max_exponent = if single { 127 } else { 1023 };
+        if value.is_finite() && !value.is_zero() && value.ilogb() > max_exponent {
+            *status |= ApStatus::OVERFLOW;
+        }
+    }
+
+    /// Whether `value` (a double, or a single widened to double) has the
+    /// largest finite magnitude of its format.
+    fn fp_is_largest(value: ApDouble, single: bool) -> bool {
+        let magnitude = value.to_bits() as u64 & 0x7fff_ffff_ffff_ffff;
+        magnitude
+            == if single {
+                0x47ef_ffff_e000_0000
+            } else {
+                0x7fef_ffff_ffff_ffff
+            }
+    }
+
     fn fp_adjusted_binary_result(
         &self,
         a_bits: u64,
         b_bits: u64,
         operation: FpBinaryOperation,
         single: bool,
-        status: ApStatus,
+        result: &mut StatusAnd<ApDouble>,
     ) -> Option<u64> {
         let to_quad = |bits: u64| {
             let mut ignored = false;
@@ -2700,12 +2753,20 @@ impl PpcCpu {
         };
         let a = to_quad(a_bits);
         let b = to_quad(b_bits);
-        let exact = match operation {
-            FpBinaryOperation::Add => a.add_r(b, ApRound::NearestTiesToEven),
-            FpBinaryOperation::Subtract => a.sub_r(b, ApRound::NearestTiesToEven),
-            FpBinaryOperation::Multiply => a.mul_r(b, ApRound::NearestTiesToEven),
-            FpBinaryOperation::Divide => a.div_r(b, ApRound::NearestTiesToEven),
+        let calculate = |round| match operation {
+            FpBinaryOperation::Add => a.add_r(b, round),
+            FpBinaryOperation::Subtract => a.sub_r(b, round),
+            FpBinaryOperation::Multiply => a.mul_r(b, round),
+            FpBinaryOperation::Divide => a.div_r(b, round),
         };
+        Self::fp_note_overflow(
+            &mut result.status,
+            single,
+            Self::fp_is_largest(result.value, single),
+            || calculate(ApRound::TowardZero).value,
+        );
+        let status = result.status;
+        let exact = calculate(ApRound::NearestTiesToEven);
         let tiny = exact.value.is_finite()
             && !exact.value.is_zero()
             && exact.value.ilogb() < if single { -126 } else { -1022 };
@@ -2716,7 +2777,9 @@ impl PpcCpu {
         } else {
             return None;
         };
-        self.fp_narrow_adjusted_quad(exact.value.scalbn(adjustment), single)
+        let intermediate =
+            self.fp_adjusted_intermediate(exact.value, || calculate(self.fp_rounding_mode()).value);
+        self.fp_narrow_adjusted_quad(intermediate.scalbn(adjustment), single)
     }
 
     fn fp_adjusted_mul_add_result(
@@ -2725,7 +2788,7 @@ impl PpcCpu {
         c_bits: u64,
         b_bits: u64,
         control: FpMulAddControl,
-        status: ApStatus,
+        result: &mut StatusAnd<ApDouble>,
     ) -> Option<u64> {
         let to_quad = |bits: u64| {
             let mut ignored = false;
@@ -2737,10 +2800,20 @@ impl PpcCpu {
         if control.subtract_b {
             b = -b;
         }
-        let mut exact = to_quad(a_bits).mul_add_r(to_quad(c_bits), b, ApRound::NearestTiesToEven);
-        if control.negate_result && !exact.value.is_nan() {
-            exact.value = -exact.value;
-        }
+        let a = to_quad(a_bits);
+        let c = to_quad(c_bits);
+        // `fnmadd` and `fnmsub` round frA × frC ± frB and then negate it, so
+        // everything here works on the result before negation; negation
+        // changes neither the magnitude nor the direction of rounding.
+        let unnegated = |round| a.mul_add_r(c, b, round);
+        Self::fp_note_overflow(
+            &mut result.status,
+            control.single,
+            Self::fp_is_largest(result.value, control.single),
+            || unnegated(ApRound::TowardZero).value,
+        );
+        let status = result.status;
+        let exact = unnegated(ApRound::NearestTiesToEven);
         let tiny = exact.value.is_finite()
             && !exact.value.is_zero()
             && exact.value.ilogb() < if control.single { -126 } else { -1022 };
@@ -2751,7 +2824,35 @@ impl PpcCpu {
         } else {
             return None;
         };
-        self.fp_narrow_adjusted_quad(exact.value.scalbn(adjustment), control.single)
+        let intermediate =
+            self.fp_adjusted_intermediate(exact.value, || unnegated(self.fp_rounding_mode()).value);
+        let bits = self.fp_narrow_adjusted_quad(intermediate.scalbn(adjustment), control.single)?;
+        Some(if control.negate_result {
+            bits ^ (1 << 63)
+        } else {
+            bits
+        })
+    }
+
+    /// The quad intermediate that `fp_narrow_adjusted_quad` rounds again.
+    ///
+    /// Sums, quotients and multiply-adds need not be exact in quad
+    /// precision, so the adjusted value is rounded twice. Two roundings in
+    /// the same direction (toward zero, +∞ or −∞) give the same result as
+    /// one, but nearest-then-directed does not: an exact result just below
+    /// a double can round up onto it in quad and then stay there. So in a
+    /// directed mode the quad intermediate is rounded in that mode. Round to
+    /// nearest keeps `nearest`, the existing intermediate.
+    fn fp_adjusted_intermediate(
+        &self,
+        nearest: ApQuad,
+        in_mode: impl FnOnce() -> ApQuad,
+    ) -> ApQuad {
+        if self.fpscr & 0x3 == 0 {
+            nearest
+        } else {
+            in_mode()
+        }
     }
 
     fn fp_narrow_adjusted_quad(&self, value: ApQuad, single: bool) -> Option<u64> {
@@ -2770,10 +2871,17 @@ impl PpcCpu {
         }
     }
 
-    fn fp_adjusted_single_conversion(&self, bits: u64, status: ApStatus) -> Option<u64> {
+    fn fp_adjusted_single_conversion(
+        &self,
+        bits: u64,
+        status: &mut ApStatus,
+        delivered_largest: bool,
+    ) -> Option<u64> {
         let mut ignored = false;
         let source: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
             .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+        Self::fp_note_overflow(status, true, delivered_largest, || source.value);
+        let status = *status;
         let tiny =
             source.value.is_finite() && !source.value.is_zero() && source.value.ilogb() < -126;
         let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
@@ -3103,6 +3211,15 @@ impl PpcCpu {
         if loses_info {
             status |= ApStatus::INEXACT;
         }
+        // Narrowing a double of magnitude 2^128 or more overflows single
+        // precision in every rounding mode (`fres`, `fsqrts`).
+        let delivered_largest = (narrowed.value.to_bits() as u32 & 0x7fff_ffff) == 0x7f7f_ffff;
+        Self::fp_note_overflow(&mut status, true, delivered_largest, || {
+            let mut ignored = false;
+            let widened: StatusAnd<ApQuad> =
+                result.value.convert_r(ApRound::TowardZero, &mut ignored);
+            widened.value
+        });
         let mut ignored = false;
         let widened: StatusAnd<ApDouble> = narrowed
             .value
@@ -5614,7 +5731,7 @@ impl PpcCpu {
             PpcInstr::Fadd { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let result = ApDouble::from_bits(u128::from(a_bits)).add_r(
+                let mut result = ApDouble::from_bits(u128::from(a_bits)).add_r(
                     ApDouble::from_bits(u128::from(b_bits)),
                     self.fp_rounding_mode(),
                 );
@@ -5627,7 +5744,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Add,
                     false,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5636,7 +5753,7 @@ impl PpcCpu {
             PpcInstr::Fsub { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let result = ApDouble::from_bits(u128::from(a_bits)).sub_r(
+                let mut result = ApDouble::from_bits(u128::from(a_bits)).sub_r(
                     ApDouble::from_bits(u128::from(b_bits)),
                     self.fp_rounding_mode(),
                 );
@@ -5649,7 +5766,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Subtract,
                     false,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5658,7 +5775,7 @@ impl PpcCpu {
             PpcInstr::Fmul { frt, fra, frc, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let c_bits = self.fpr[frc as usize];
-                let result = ApDouble::from_bits(u128::from(a_bits)).mul_r(
+                let mut result = ApDouble::from_bits(u128::from(a_bits)).mul_r(
                     ApDouble::from_bits(u128::from(c_bits)),
                     self.fp_rounding_mode(),
                 );
@@ -5671,7 +5788,7 @@ impl PpcCpu {
                     c_bits,
                     FpBinaryOperation::Multiply,
                     false,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5680,7 +5797,7 @@ impl PpcCpu {
             PpcInstr::Fdiv { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let result = ApDouble::from_bits(u128::from(a_bits)).div_r(
+                let mut result = ApDouble::from_bits(u128::from(a_bits)).div_r(
                     ApDouble::from_bits(u128::from(b_bits)),
                     self.fp_rounding_mode(),
                 );
@@ -5700,7 +5817,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Divide,
                     false,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5872,7 +5989,7 @@ impl PpcCpu {
             PpcInstr::Fadds { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let (result, truncated) =
+                let (mut result, truncated) =
                     self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Add);
                 let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
                 let adjusted = self.fp_adjusted_binary_result(
@@ -5880,7 +5997,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Add,
                     true,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5889,7 +6006,7 @@ impl PpcCpu {
             PpcInstr::Fsubs { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let (result, truncated) =
+                let (mut result, truncated) =
                     self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Subtract);
                 let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
                 let adjusted = self.fp_adjusted_binary_result(
@@ -5897,7 +6014,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Subtract,
                     true,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5906,7 +6023,7 @@ impl PpcCpu {
             PpcInstr::Fmuls { frt, fra, frc, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let c_bits = self.fpr[frc as usize];
-                let (result, truncated) =
+                let (mut result, truncated) =
                     self.fp_binary_single(a_bits, c_bits, FpBinaryOperation::Multiply);
                 let invalid = Self::fp_invalid_flags(a_bits, Some(c_bits), FPSCR_VXIMZ);
                 let adjusted = self.fp_adjusted_binary_result(
@@ -5914,7 +6031,7 @@ impl PpcCpu {
                     c_bits,
                     FpBinaryOperation::Multiply,
                     true,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5923,7 +6040,7 @@ impl PpcCpu {
             PpcInstr::Fdivs { frt, fra, frb, rc } => {
                 let a_bits = self.fpr[fra as usize];
                 let b_bits = self.fpr[frb as usize];
-                let (result, truncated) =
+                let (mut result, truncated) =
                     self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Divide);
                 let default = if Self::fp_is_zero(a_bits) && Self::fp_is_zero(b_bits) {
                     FPSCR_VXZDZ
@@ -5938,7 +6055,7 @@ impl PpcCpu {
                     b_bits,
                     FpBinaryOperation::Divide,
                     true,
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5951,7 +6068,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add(
+                let (mut result, truncated, invalid) = self.fp_mul_add(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -5967,7 +6084,7 @@ impl PpcCpu {
                         negate_result: false,
                         single: false,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -5980,7 +6097,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add(
+                let (mut result, truncated, invalid) = self.fp_mul_add(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -5996,7 +6113,7 @@ impl PpcCpu {
                         negate_result: false,
                         single: false,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6009,7 +6126,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add(
+                let (mut result, truncated, invalid) = self.fp_mul_add(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6025,7 +6142,7 @@ impl PpcCpu {
                         negate_result: true,
                         single: false,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6038,7 +6155,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add(
+                let (mut result, truncated, invalid) = self.fp_mul_add(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6054,7 +6171,7 @@ impl PpcCpu {
                         negate_result: true,
                         single: false,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_double_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6067,7 +6184,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add_single(
+                let (mut result, truncated, invalid) = self.fp_mul_add_single(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6083,7 +6200,7 @@ impl PpcCpu {
                         negate_result: false,
                         single: true,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6096,7 +6213,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add_single(
+                let (mut result, truncated, invalid) = self.fp_mul_add_single(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6112,7 +6229,7 @@ impl PpcCpu {
                         negate_result: false,
                         single: true,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6125,7 +6242,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add_single(
+                let (mut result, truncated, invalid) = self.fp_mul_add_single(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6141,7 +6258,7 @@ impl PpcCpu {
                         negate_result: true,
                         single: true,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6154,7 +6271,7 @@ impl PpcCpu {
                 frb,
                 rc,
             } => {
-                let (result, truncated, invalid) = self.fp_mul_add_single(
+                let (mut result, truncated, invalid) = self.fp_mul_add_single(
                     self.fpr[fra as usize],
                     self.fpr[frc as usize],
                     self.fpr[frb as usize],
@@ -6170,7 +6287,7 @@ impl PpcCpu {
                         negate_result: true,
                         single: true,
                     },
-                    result.status,
+                    &mut result,
                 );
                 self.finish_ap_single_result_adjusted(
                     frt, result, truncated, adjusted, invalid, rc,
@@ -6182,17 +6299,20 @@ impl PpcCpu {
                 let mut loses_info = false;
                 let narrowed: StatusAnd<ApSingle> =
                     source.convert_r(self.fp_rounding_mode(), &mut loses_info);
-                let status = narrowed.status
+                let mut status = narrowed.status
                     | if Self::is_signaling_nan(bits) {
                         ApStatus::INVALID_OP
                     } else {
                         ApStatus::OK
                     };
+                let delivered_largest =
+                    (narrowed.value.to_bits() as u32 & 0x7fff_ffff) == 0x7f7f_ffff;
+                let adjusted =
+                    self.fp_adjusted_single_conversion(bits, &mut status, delivered_largest);
                 let result = StatusAnd {
                     status,
                     value: source,
                 };
-                let adjusted = self.fp_adjusted_single_conversion(bits, status);
                 self.finish_ap_single_result_adjusted(
                     frt,
                     result,
