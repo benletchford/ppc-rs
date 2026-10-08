@@ -168,13 +168,10 @@ pub(crate) fn fast(bits: u64, rn: u32) -> Option<(u64, ApStatus)> {
     let above = product > one; // q is above the true quotient
     let rho = product.abs_diff(one);
     // Prove q is the round-to-nearest quotient: |1/s - q| < ulp(q)/2, i.e.
-    // 2|rho| < ms, or 4|rho| < ms below a power-of-two q.
-    let limit = if above && mq == HIDDEN_BIT {
-        u128::from(ms) / 4
-    } else {
-        u128::from(ms) / 2
-    };
-    if rho >= limit {
+    // 2|rho| < ms, or 4|rho| < ms below a power-of-two q.  (Compared
+    // exactly: `rho < ms / 2` would wrongly decline `rho = (ms - 1) / 2`.)
+    let scale = if above && mq == HIDDEN_BIT { 4 } else { 2 };
+    if rho * scale >= u128::from(ms) {
         return None;
     }
     if rho == 0 {
@@ -390,6 +387,35 @@ mod tests {
         }
         // The generator must exercise both sides of the margin.
         assert!(accepted > 0 && accepted < cases.len() * MODES.len());
+    }
+
+    /// Quotients exactly at the floor of the round-to-nearest bound.  For
+    /// `s = 0x1ffffff8000001 * 2^-52` (`ms` divides `2^106 + 1`), `q =
+    /// round(1 / s)` has residual `rho = (ms - 1) / 2`: inside the bound
+    /// `2 * rho < ms`, but not below the floor of `ms / 2`.  The inputs are
+    /// squares near `s * s` (scaled by even powers of two) whose rounded root
+    /// is `s` in the listed modes; the fast path must accept them.
+    #[test]
+    fn quotients_at_the_half_ulp_floor_take_the_fast_path() {
+        let ms = 0x1f_ffff_f800_0001u64;
+        let s = f64::from_bits((1023 << 52) | (ms & FRACTION_MASK));
+        let (mq, eq) = decompose((1.0 / s).to_bits());
+        let product = u128::from(mq) * u128::from(ms);
+        let rho = product.abs_diff(1 << -(eq - 52));
+        assert_eq!(2 * rho, u128::from(ms) - 1);
+        let cases: [(u64, &[u32]); 3] = [
+            (0x400f_ffff_f000_0003, &[0, 2]),
+            (0x400f_ffff_f000_0004, &[0, 1, 3]),
+            (0x400f_ffff_f000_0005, &[1, 3]),
+        ];
+        for (base, modes) in cases {
+            for binades in [-800i64, -200, -2, 0, 2, 200, 800] {
+                let bits = base.wrapping_add_signed(binades << 52);
+                for &rn in modes {
+                    assert!(check(bits, rn), "frsqrte({bits:#018x}) rn={rn} declined");
+                }
+            }
+        }
     }
 
     fn random_inputs(seed: u64, count: usize) {
