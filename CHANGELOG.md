@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.1...ppc-v0.7.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **fpu:** report overflow when rounding toward zero delivers the largest number ([670e1fe](https://github.com/benletchford/ppc-rs/commit/670e1feef3a725107511b72988ec7861d6ab638b))
+
 ## [0.7.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.0...ppc-v0.7.1) (2026-10-08)
 
 
