@@ -65,7 +65,7 @@ dependencies = [
  "ieee-apsqrt",
  "rustc_apfloat",
  "wasm-encoder",
- "wasmparser 0.261.0",
+ "wasmparser",
 ]
 
 [[package]]
@@ -156,23 +156,12 @@ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "wasm-encoder"
-version = "0.244.0"
+version = "0.261.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
+checksum = "2608e8bb6d67fd68f5a8d0eb1363d6e7bcbc1f8ded5a0bd3a1e382462b876b22"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.244.0",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
-dependencies = [
- "bitflags",
- "indexmap",
- "semver",
+ "wasmparser",
 ]
 
 [[package]]
