@@ -129,20 +129,24 @@ fn single_store_forms_agree_in_stepped_and_cached_execution() {
             0x7ff0_0000_0000_0001,
         ] {
             for mode in 0..4 {
-                for cached in [false, true] {
+                for execution in ["step", "run", "cached"] {
                     cpu.pc = CODE;
                     cpu.gpr[4] = DATA - 4;
                     cpu.gpr[6] = 4;
                     cpu.fpr[1] = bits;
                     let fpscr = 0xa502_40f8 | mode;
                     cpu.fpscr = fpscr;
-                    if cached {
-                        assert_eq!(
+                    match execution {
+                        "cached" => assert_eq!(
+                            cpu.run_with_imports(&mut memory, 1, 0, 0, 0, |_, _, _| unreachable!()),
+                            PpcRunResult::CycleLimit { cycles: 1 }
+                        ),
+                        "run" => assert_eq!(
                             cpu.run(&mut memory, 1, 0),
                             PpcRunResult::CycleLimit { cycles: 1 }
-                        );
-                    } else {
-                        assert_eq!(cpu.step(&mut memory, word), PpcStepResult::Stepped);
+                        ),
+                        "step" => assert_eq!(cpu.step(&mut memory, word), PpcStepResult::Stepped),
+                        _ => unreachable!(),
                     }
                     assert_eq!(memory.read_u32_be(DATA), Some(reference(bits, mode)));
                     assert_eq!(cpu.gpr[4], if updates { DATA } else { DATA - 4 });
