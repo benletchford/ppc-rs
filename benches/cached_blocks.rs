@@ -6,7 +6,7 @@ const CODE_BASE: u32 = 0x1000;
 const DATA_BASE: u32 = 0x2000;
 const DEFAULT_CYCLES: u64 = 20_000_000;
 
-fn run_case(words: &[u32], with_data: bool, cycles: u64) -> Duration {
+fn run_case(words: &[u32], with_data: bool, single_store_value: f64, cycles: u64) -> Duration {
     let mut memory = PpcSectionMem::new();
     memory.add_readonly_region(
         CODE_BASE,
@@ -19,6 +19,7 @@ fn run_case(words: &[u32], with_data: bool, cycles: u64) -> Duration {
     cpu.pc = CODE_BASE;
     cpu.gpr[5] = DATA_BASE;
     cpu.gpr[6] = DATA_BASE + 32;
+    cpu.fpr[1] = single_store_value.to_bits();
 
     let start = Instant::now();
     let result = cpu.run_with_imports(&mut memory, cycles, 0, 0, 0, |_, _, _| unreachable!());
@@ -64,16 +65,26 @@ fn main() {
     }
     copy_words.push(0x4bff_ffc0); // b CODE_BASE
 
+    let single_stores = [
+        0xd025_0000, // stfs f1,0(r5)
+        0xd025_0004, // stfs f1,4(r5)
+        0xd025_0008, // stfs f1,8(r5)
+        0xd025_000c, // stfs f1,12(r5)
+        0x4bff_fff0, // b CODE_BASE
+    ];
+
     println!("case\tcycles\tmedian_ms\tMcycles/s");
-    for (name, words, with_data) in [
-        ("arithmetic", arithmetic.as_slice(), false),
-        ("conditional", conditional.as_slice(), false),
-        ("load_store", memory.as_slice(), true),
-        ("copy_words", copy_words.as_slice(), true),
+    for (name, words, with_data, single_store_value) in [
+        ("arithmetic", arithmetic.as_slice(), false, 0.0),
+        ("conditional", conditional.as_slice(), false, 0.0),
+        ("load_store", memory.as_slice(), true, 0.0),
+        ("copy_words", copy_words.as_slice(), true, 0.0),
+        ("single_store_exact", single_stores.as_slice(), true, 2.5),
+        ("single_store_rounding", single_stores.as_slice(), true, 0.1),
     ] {
         let mut runs = [Duration::ZERO; 3];
         for elapsed in &mut runs {
-            *elapsed = run_case(words, with_data, cycles);
+            *elapsed = run_case(words, with_data, single_store_value, cycles);
         }
         runs.sort_unstable();
         let seconds = runs[1].as_secs_f64();
