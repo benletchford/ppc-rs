@@ -5,8 +5,13 @@
 //! the division is rounded again, both in the FPSCR rounding mode.
 //! [`reference()`] computes the division with arbitrary-precision arithmetic.
 //!
-//! [`fast()`] reproduces the same value with native `f64` division and proves
-//! it with an exact integer residual before accepting it: `q = 1 / s` in
+//! [`fast()`] first uses the architectural SSE2 guarantee on x86-64 when both
+//! guest and host use nearest-even, with masked exceptions and FTZ/DAZ disabled.
+//! It computes SQRTSD followed by DIVSD; the combined status is exact only for
+//! powers of four. The host control register is checked without modifying it.
+//!
+//! Other cases use native `f64` division and prove the result with an exact
+//! integer residual before accepting it: `q = 1 / s` in
 //! round-to-nearest, and the residual `1 - q * s`, an exact integer once both
 //! sides are scaled to the last bit of `q * s`, verifies that `q` is the
 //! round-to-nearest quotient (including the narrower ulp below a
@@ -25,8 +30,12 @@ use rustc_apfloat::{
 
 use crate::sqrt::{self, decompose, is_positive_finite};
 
+#[cfg(target_arch = "x86_64")]
+mod x86;
+
 /// Evaluates `frsqrte` for `bits` under FPSCR rounding control `rn` (the low
 /// two FPSCR bits), returning the same value and status as [`reference()`].
+#[cfg(test)]
 #[inline]
 pub(crate) fn evaluate(bits: u64, rn: u32) -> StatusAnd<ApDouble> {
     match fast(bits, rn) {
@@ -59,13 +68,19 @@ pub(crate) fn rounding_mode(rn: u32) -> ApRound {
     }
 }
 
-/// Returns the `frsqrte` result bits and status for `bits` when the exact
-/// residual check proves they match [`reference()`].
+/// Returns the `frsqrte` result bits and status for `bits` when the architectural
+/// SSE2 guarantee or an exact residual check proves they match [`reference()`].
 #[inline]
 pub(crate) fn fast(bits: u64, rn: u32) -> Option<(u64, ApStatus)> {
     // Positive, nonzero, finite inputs only.
     if !is_positive_finite(bits) {
         return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if rn & 3 == 0
+        && let Some(result) = x86::nearest(bits)
+    {
+        return Some(result);
     }
     let toward_positive = rn & 0x3 == 2;
     let toward_negative = rn & 0x3 == 1 || rn & 0x3 == 3;
