@@ -3021,6 +3021,18 @@ impl PpcCpu {
     }
 
     fn fp_single_bits(&self, bits: u64) -> u32 {
+        let sign = ((bits >> 32) as u32) & 0x8000_0000;
+        let exponent = (bits >> 52) & 0x7ff;
+        // A normal binary32 value widened to binary64 has 29 zero low
+        // significand bits. Repack it exactly: no rounding is necessary in
+        // any FPSCR mode, and no host floating-point operation is involved.
+        if (897..=1150).contains(&exponent) && bits & 0x1fff_ffff == 0 {
+            return sign | (((exponent - 896) as u32) << 23) | ((bits >> 29) as u32 & 0x7f_ffff);
+        }
+        if bits & 0x7fff_ffff_ffff_ffff == 0 {
+            return sign;
+        }
+        // Keep the existing rounding, subnormal and NaN behavior otherwise.
         let mut loses_info = false;
         let value: StatusAnd<ApSingle> = ApDouble::from_bits(u128::from(bits))
             .convert_r(self.fp_rounding_mode(), &mut loses_info);
