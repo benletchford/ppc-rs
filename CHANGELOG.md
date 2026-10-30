@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.3](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.2...ppc-v0.7.3) (2026-10-30)
+
+
+### Performance Improvements
+
+* **cpu:** reduce scalar rounding overhead in vector loops ([8769349](https://github.com/benletchford/ppc-rs/commit/8769349de242dbdb2bd602ac9a96bbe3ed67504d))
+* **fpu:** repack exact single stores without software rounding ([5119236](https://github.com/benletchford/ppc-rs/commit/5119236bb109930ac341e5bac2c513b5b8110bec))
+
 ## [0.7.2](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.1...ppc-v0.7.2) (2026-10-08)
 
 
