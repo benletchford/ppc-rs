@@ -98,7 +98,7 @@ struct Emitter<'a, 'f> {
     next_pc: Option<Value>,
     /// Instructions completed by earlier blocks of the region.
     done: Value,
-    may_write: bool,
+    may_change_code: bool,
     fault: Block,
     normal_exit: Block,
     /// `(exit block, pending cycles, instruction index, prior completed count)`.
@@ -133,7 +133,7 @@ pub(super) fn build(
 /// block; at the end of each block it continues directly into a successor
 /// whose start matches the new `pc` (while the cycle budget in
 /// [`JitCtx::budget`](super::JitCtx) allows and, after a block that may have
-/// written memory, the code epoch is unchanged) and otherwise returns the
+/// changed code mappings, the code epoch is unchanged) and otherwise returns the
 /// instructions completed so far. Faults return the same count plus
 /// [`STOPPED`](super::STOPPED), exactly like a single block.
 pub(super) fn build_region(
@@ -207,7 +207,7 @@ pub(super) fn build_region(
         pc_in_sync: true,
         next_pc: None,
         done: zero,
-        may_write: false,
+        may_change_code: false,
         fault,
         normal_exit,
         fault_exits: Vec::new(),
@@ -222,7 +222,7 @@ pub(super) fn build_region(
         e.pending_cycles = 0;
         e.pc_in_sync = true;
         e.next_pc = None;
-        e.may_write = false;
+        e.may_change_code = false;
         for (offset, &word) in block.words.iter().enumerate() {
             let pc = block.pc.wrapping_add(offset as u32 * 4);
             e.b.set_srcloc(SourceLoc::new(line));
@@ -387,7 +387,7 @@ impl Emitter<'_, '_> {
             )
         });
         let exit = self.b.create_block();
-        if self.may_write {
+        if self.may_change_code {
             // A callback may have changed code later blocks were built from.
             let same = self.b.create_block();
             let callee = self
@@ -461,7 +461,7 @@ impl Emitter<'_, '_> {
         self.invalidate();
         self.pc_in_sync = true;
         self.next_pc = None;
-        self.may_write = true;
+        self.may_change_code = true;
     }
 
     // ---- flags ----------------------------------------------------------
@@ -569,6 +569,7 @@ impl Emitter<'_, '_> {
     fn load(&mut self, kind: Load, index: u32, pc: u32, rt: u8, ea: Value) {
         let pc_value = self.c32(pc);
         let result = self.call(kind.helper(), false, &[ea, pc_value]);
+        self.may_change_code = true;
         self.check_fault(result, index);
         let value = self.b.ins().ireduce(types::I32, result);
         self.set(rt, value);
@@ -578,7 +579,7 @@ impl Emitter<'_, '_> {
         let pc_value = self.c32(pc);
         let result = self.call(helper, true, &[ea, value, pc_value]);
         self.check_fault(result, index);
-        self.may_write = true;
+        self.may_change_code = true;
     }
 
     fn fp_access(&mut self, helper: usize, index: u32, pc: u32, fr: u8, ea: Value) {
@@ -586,7 +587,7 @@ impl Emitter<'_, '_> {
         let pc_value = self.c32(pc);
         let result = self.call(helper, true, &[ea, fr_value, pc_value]);
         self.check_fault(result, index);
-        self.may_write |= helper != helper!(lfs) && helper != helper!(lfd);
+        self.may_change_code = true;
     }
 
     #[allow(clippy::too_many_arguments)]

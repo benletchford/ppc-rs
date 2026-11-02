@@ -719,3 +719,82 @@ fn memory_remapping_during_a_native_block_matches_interpreter() {
     assert_eq!(run(false), (1, 7));
     assert_eq!(run(true), run(false));
 }
+
+#[test]
+fn load_remapping_code_exits_a_hot_region() {
+    use ppc::PpcMemory;
+
+    struct BankSwitchingBus {
+        memory: PpcSectionMem,
+        switch_on_read: bool,
+    }
+    impl PpcMemory for BankSwitchingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            if (DATA..DATA + 8).contains(&addr) {
+                if std::mem::take(&mut self.switch_on_read) {
+                    self.memory
+                        .add_readonly_region(CODE + 8, d_form(14, 3, 3, 7).to_be_bytes().to_vec());
+                }
+                Some(0)
+            } else {
+                self.memory.read_u8(addr)
+            }
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            self.memory.write_u8(addr, value)
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.memory.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.memory.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.memory.code_epoch()
+        }
+    }
+
+    // Two blocks: load and branch; increment and branch back.
+    let run = |jit, load_opcode| {
+        let words = [
+            d_form(load_opcode, 4, 5, 0),
+            0x4800_0004,
+            d_form(14, 3, 3, 1),
+            0x4bff_fff4,
+        ];
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, words.into_iter().flat_map(u32::to_be_bytes).collect());
+        let mut bus = BankSwitchingBus {
+            memory,
+            switch_on_read: false,
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.pc = CODE;
+        cpu.gpr[5] = DATA;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                hot_threshold: 2,
+                background: false,
+                verify: true,
+                jitdump: false,
+            })
+            .unwrap();
+        }
+        cpu.run_with_imports(&mut bus, 400, 0, 0, 0, |_, _, _| unreachable!());
+        assert_eq!(cpu.pc, CODE);
+        if jit {
+            assert!(cpu.jit_stats().regions_compiled > 0);
+        }
+        let before = cpu.gpr[3];
+        bus.switch_on_read = true;
+        cpu.run_with_imports(&mut bus, 4, 0, 0, 0, |_, _, _| unreachable!());
+        (cpu.gpr[3] - before, cpu.pc, cpu.time_base())
+    };
+    for load_opcode in [34, 48, 50] {
+        // lbz, lfs, lfd
+        let interpreted = run(false, load_opcode);
+        assert_eq!(interpreted.0, 7);
+        assert_eq!(run(true, load_opcode), interpreted);
+    }
+}

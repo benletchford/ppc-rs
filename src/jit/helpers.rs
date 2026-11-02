@@ -171,7 +171,7 @@ pub(super) extern "C" fn step(ctx: *mut JitCtx, word: u32, pc: u32) -> u64 {
 }
 
 /// Whether the code epoch moved since the region was entered: generated
-/// region code calls this after a block that may have written memory.
+/// region code calls this after a block that may have changed code mappings.
 pub(super) extern "C" fn code_changed(ctx: *mut JitCtx) -> u64 {
     // SAFETY: see `step`.
     let ctx = unsafe { &*ctx };
