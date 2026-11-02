@@ -89,7 +89,7 @@ impl PpcCachedWordCopy {
     }
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use jit::runtime::{PpcJitEntry, PpcJitLimits};
 
 #[derive(Debug, Clone)]
@@ -500,21 +500,21 @@ pub struct PpcCpu {
 
     basic_block_cache: Box<[Option<PpcBasicBlockCacheEntry>]>,
 
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit: Option<std::sync::Arc<jit::JitShared>>,
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_stats: PpcJitStats,
     /// Allocated while the JIT is enabled.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_table: Box<[PpcJitEntry]>,
     /// JIT table indices whose region is compiling in the background.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_pending_regions: Vec<usize>,
     /// [`jit::JitShared::finished`] when `jit_pending_regions` was last polled.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_finished_seen: usize,
     /// Links made under another generation are ignored.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_link_gen: u32,
 }
 
@@ -588,17 +588,17 @@ impl PpcCpu {
             import_call_stack: Vec::new(),
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit: None,
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_stats: PpcJitStats::default(),
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_table: Box::default(),
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_pending_regions: Vec::new(),
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_finished_seen: 0,
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_link_gen: 0,
         }
     }
@@ -3128,84 +3128,6 @@ impl PpcCpu {
         true
     }
 
-    /// `fadds`/`fsubs`/`fmuls`/`fdivs`: a native fast path, falling back to
-    /// the software reference for every case it does not prove exact.
-    fn execute_single_binary(
-        &mut self,
-        frt: u8,
-        a_bits: u64,
-        b_bits: u64,
-        operation: FpBinaryOperation,
-        rc: bool,
-    ) {
-        if !self.try_fast_single_binary(frt, a_bits, b_bits, operation, rc) {
-            self.single_binary_reference(frt, a_bits, b_bits, operation, rc);
-        }
-    }
-
-    /// Whether `bits` is a normal binary32 value widened to binary64.
-    fn is_exact_normal_single(bits: u64) -> bool {
-        (897..=1150).contains(&((bits >> 52) & 0x7ff)) && bits & 0x1fff_ffff == 0
-    }
-
-    /// Native evaluation for operands that are normal singles.
-    ///
-    /// The single-precision operation is computed in binary64 and then
-    /// rounded once more by [`Self::fast_single_round`] in the FPSCR mode.
-    /// That is exact in every case accepted here:
-    ///
-    /// * Products of two 24-bit significands have at most 48 bits, and sums
-    ///   whose exponents differ by at most 28 have at most 53, so the
-    ///   binary64 result *is* the exact result.
-    /// * A quotient of 24-bit significands that is not itself a 24- or
-    ///   25-bit number lies at least 2^-48 (relative) away from every 24-bit
-    ///   value and every midpoint between two of them, further than the
-    ///   2^-53 binary64 rounding error. So the binary64 quotient truncates
-    ///   to the same 24 bits as the exact one, has a nonzero sticky part
-    ///   exactly when the quotient is inexact, and lies on the same side of
-    ///   every midpoint: rounding it again gives the correctly rounded
-    ///   single, the right INEXACT, and the right FR in every mode.
-    ///
-    /// Results are required to be normal, nonzero, below the largest finite
-    /// single and above the smallest normal binade, which excludes every
-    /// overflow, underflow and tininess case (and with them the FPSCR\[OE\]
-    /// and FPSCR\[UE\] result adjustments) as well as zero signs.
-    fn try_fast_single_binary(
-        &mut self,
-        frt: u8,
-        a_bits: u64,
-        b_bits: u64,
-        operation: FpBinaryOperation,
-        rc: bool,
-    ) -> bool {
-        if !Self::is_exact_normal_single(a_bits) || !Self::is_exact_normal_single(b_bits) {
-            return false;
-        }
-        let (a, b) = (f64::from_bits(a_bits), f64::from_bits(b_bits));
-        let exponent_gap = || ((a_bits >> 52) & 0x7ff).abs_diff((b_bits >> 52) & 0x7ff);
-        let exact = match operation {
-            FpBinaryOperation::Add if exponent_gap() <= 28 => a + b,
-            FpBinaryOperation::Subtract if exponent_gap() <= 28 => a - b,
-            FpBinaryOperation::Multiply => a * b,
-            FpBinaryOperation::Divide => a / b,
-            _ => return false,
-        };
-        let bits = exact.to_bits();
-        if !(898..=1150).contains(&((bits >> 52) & 0x7ff)) {
-            return false;
-        }
-        let Some((rounded, status, incremented)) = Self::fast_single_round(bits, self.fpscr & 3)
-        else {
-            return false;
-        };
-        if rounded & 0x7fff_ffff_ffff_ffff == 0x47ef_ffff_e000_0000 {
-            return false;
-        }
-        self.apply_fp_status(status, 0, incremented, true);
-        self.finish_fp_result(frt, rounded, rc);
-        true
-    }
-
     /// The software (rustc_apfloat) implementation of the single-precision
     /// binary operations.
     fn single_binary_reference(
@@ -3233,24 +3155,6 @@ impl PpcCpu {
         let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
         let adjusted = self.fp_adjusted_binary_result(a_bits, b_bits, operation, true, &mut result);
         self.finish_ap_single_result_adjusted(frt, result, truncated, adjusted, invalid, rc);
-    }
-
-    /// `fctiwz` for finite values whose truncation fits in an `i32`: the
-    /// result can only be exact or INEXACT, and rounding toward zero never
-    /// increments the fraction.
-    fn fast_convert_to_i32_toward_zero(&mut self, bits: u64) -> Option<u32> {
-        let value = f64::from_bits(bits);
-        if !(value > -2_147_483_649.0 && value < 2_147_483_648.0) {
-            return None;
-        }
-        let truncated = value.trunc();
-        let status = if truncated == value {
-            ApStatus::OK
-        } else {
-            ApStatus::INEXACT
-        };
-        self.apply_fp_status(status, 1u32 << FPSCR_VXCVI, false, true);
-        Some(truncated as i32 as u32)
     }
 
     fn fp_single_bits(&self, bits: u64) -> u32 {
@@ -4126,7 +4030,7 @@ impl PpcCpu {
         };
         let old_token = entry.memory_token;
         entry.memory_token = memory_token;
-        #[cfg(feature = "jit")]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
             let (start_pc, len) = (entry.start_pc, u32::from(entry.len));
             if let Some(slot) = self.jit_table.get_mut(Self::jit_table_index(start_pc))
@@ -4137,7 +4041,7 @@ impl PpcCpu {
                 slot.memory_token = memory_token;
             }
         }
-        #[cfg(not(feature = "jit"))]
+        #[cfg(not(all(feature = "jit", not(target_family = "wasm"))))]
         let _ = old_token;
     }
 
@@ -4148,7 +4052,11 @@ impl PpcCpu {
         halt_pc: u32,
         trap_base: u32,
         import_count: u32,
-        #[cfg_attr(not(feature = "jit"), allow(unused_variables))] chain: bool,
+        #[cfg_attr(
+            not(all(feature = "jit", not(target_family = "wasm"))),
+            allow(unused_variables)
+        )]
+        chain: bool,
     ) -> Option<PpcBasicBlockRunResult> {
         let start_pc = self.pc;
         let cache_index = Self::basic_block_cache_index(start_pc);
@@ -4205,7 +4113,7 @@ impl PpcCpu {
                         && entry.words[..len] == words[..len]
                 });
             if unchanged {
-                #[cfg(feature = "jit")]
+                #[cfg(all(feature = "jit", not(target_family = "wasm")))]
                 jit::diag::count(jit::diag::Event::TokenAdopted);
                 self.adopt_basic_block_token(cache_index, memory_token);
             } else {
@@ -4306,7 +4214,7 @@ impl PpcCpu {
             self.time_base = self.time_base.wrapping_add(1);
             return Some(PpcBasicBlockRunResult::Advanced(2));
         }
-        #[cfg(feature = "jit")]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         if stop_before == block_len
             && max_cycles >= block_len as u64
             && let Some(result) = self.run_jit_block(
@@ -6302,19 +6210,19 @@ impl PpcCpu {
             }
             PpcInstr::Fadds { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.execute_single_binary(frt, a, b, FpBinaryOperation::Add, rc);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Add, rc);
             }
             PpcInstr::Fsubs { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.execute_single_binary(frt, a, b, FpBinaryOperation::Subtract, rc);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Subtract, rc);
             }
             PpcInstr::Fmuls { frt, fra, frc, rc } => {
                 let (a, c) = (self.fpr[fra as usize], self.fpr[frc as usize]);
-                self.execute_single_binary(frt, a, c, FpBinaryOperation::Multiply, rc);
+                self.single_binary_reference(frt, a, c, FpBinaryOperation::Multiply, rc);
             }
             PpcInstr::Fdivs { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.execute_single_binary(frt, a, b, FpBinaryOperation::Divide, rc);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Divide, rc);
             }
             PpcInstr::Fmadd {
                 frt,
@@ -6594,10 +6502,7 @@ impl PpcCpu {
                 // fctiwz uses round-toward-zero regardless of
                 // FPSCR.RN.
                 let bits = self.fpr[frb as usize];
-                if let Some(value) = self
-                    .fast_convert_to_i32_toward_zero(bits)
-                    .or_else(|| self.fp_convert_to_i32(bits, ApRound::TowardZero))
-                {
+                if let Some(value) = self.fp_convert_to_i32(bits, ApRound::TowardZero) {
                     self.fpr[frt as usize] = u64::from(value);
                 }
                 self.finish_fp_record(rc);
@@ -7854,13 +7759,1119 @@ impl PpcCpu {
 }
 
 #[cfg(test)]
-#[path = "tests/core.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    struct CountingImmutableMemory {
+        base: u32,
+        bytes: Vec<u8>,
+        instruction_reads: usize,
+        token: u64,
+    }
+
+    impl CountingImmutableMemory {
+        fn new(base: u32, words: &[u32]) -> Self {
+            Self::with_token(base, words, 1)
+        }
+
+        fn with_token(base: u32, words: &[u32], token: u64) -> Self {
+            Self {
+                base,
+                bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                instruction_reads: 0,
+                token,
+            }
+        }
+    }
+
+    impl PpcMemory for CountingImmutableMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            self.bytes.get(offset).copied()
+        }
+
+        fn write_u8(&mut self, _addr: u32, _value: u8) -> Option<()> {
+            None
+        }
+
+        fn read_instruction_u32_be(&mut self, addr: u32) -> Option<u32> {
+            self.instruction_reads += 1;
+            self.read_u32_be(addr)
+        }
+
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            (self.bytes.len().saturating_sub(offset) >= 4).then_some(self.token)
+        }
+    }
+
+    struct TokenizedWritableMemory {
+        base: u32,
+        bytes: Vec<u8>,
+        token: u64,
+    }
+
+    impl TokenizedWritableMemory {
+        fn new(base: u32, words: &[u32]) -> Self {
+            Self {
+                base,
+                bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                token: 1,
+            }
+        }
+
+        fn offset(&self, addr: u32) -> Option<usize> {
+            usize::try_from(addr.checked_sub(self.base)?).ok()
+        }
+    }
+
+    impl PpcMemory for TokenizedWritableMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.bytes.get(self.offset(addr)?).copied()
+        }
+
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            let offset = self.offset(addr)?;
+            *self.bytes.get_mut(offset)? = value;
+            self.token = self.token.checked_add(1).expect("test token exhausted");
+            Some(())
+        }
+
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            let offset = self.offset(addr)?;
+            (self.bytes.len().saturating_sub(offset) >= 4).then_some(self.token)
+        }
+    }
+
+    #[test]
+    fn cpu_keeps_large_host_caches_off_the_stack() {
+        let size = std::mem::size_of::<PpcCpu>();
+        assert!(size <= 1024, "PpcCpu grew to {size} stack bytes");
+    }
+
+    #[test]
+    fn fresh_execution_context_matches_cpu_architectural_defaults() {
+        let context = PpcExecutionContext::fresh();
+        let cpu = PpcCpu::new();
+
+        assert_eq!(
+            context.architectural(),
+            cpu.capture_execution_context().architectural()
+        );
+        assert!(context.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_round_trips_registers_and_retains_engine_state() {
+        let expected_architectural = PpcArchitecturalState {
+            gpr: std::array::from_fn(|index| 0x1000_0000 | index as u32),
+            fpr: std::array::from_fn(|index| 0x2000_0000_0000_0000 | index as u64),
+            cr: 0x3456_789a,
+            lr: 0x4567_89ab,
+            ctr: 0x5678_9abc,
+            xer: 0x6789_abcd,
+            fpscr: 0x789a_bcde,
+            msr: 0x89ab_cdef,
+            pc: 0x9abc_def0,
+        };
+        let mut source = PpcCpu::new();
+        source.gpr = expected_architectural.gpr;
+        source.fpr = expected_architectural.fpr;
+        source.cr = expected_architectural.cr;
+        source.lr = expected_architectural.lr;
+        source.ctr = expected_architectural.ctr;
+        source.xer = expected_architectural.xer;
+        source.fpscr = expected_architectural.fpscr;
+        source.msr = expected_architectural.msr;
+        source.pc = expected_architectural.pc;
+        let captured = source.capture_execution_context();
+
+        assert_eq!(captured.architectural(), &expected_architectural);
+
+        source.gpr.fill(0);
+        source.fpr.fill(0);
+        source.cr = 0;
+        source.lr = 0;
+        source.ctr = 0;
+        source.xer = 0;
+        source.fpscr = 0;
+        source.msr = 0;
+        source.pc = 0;
+
+        let mut destination = PpcCpu::new();
+        destination.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        assert_eq!(
+            destination.step_instruction(0x6000_0000),
+            PpcStepResult::Stepped
+        );
+        destination.set_time_base(0x1122_3344_5566_7788);
+        let cached_decodes = destination.decode_cache_entry_count();
+        destination.install_execution_context(captured);
+
+        assert_eq!(
+            destination.capture_execution_context().architectural(),
+            &expected_architectural
+        );
+        assert_eq!(
+            destination.alignment_policy,
+            PpcAlignmentPolicy::EmulateData
+        );
+        assert_eq!(destination.time_base(), 0x1122_3344_5566_7788);
+        assert_eq!(destination.decode_cache_entry_count(), cached_decodes);
+    }
+
+    #[test]
+    fn execution_context_resumes_nested_native_import_returns() {
+        const TRAP_BASE: u32 = 0x1000;
+        const OUTER_RETURN: u32 = 0x2000;
+        const INNER_RETURN: u32 = 0x2100;
+        const HALT_PC: u32 = 0x3000;
+
+        let mut cpu = PpcCpu::new();
+        let mut memory = PpcSectionMem::new();
+        cpu.pc = TRAP_BASE;
+        let first = cpu.run_with_imports(&mut memory, 1, HALT_PC, TRAP_BASE, 2, |index, _, _| {
+            assert_eq!(index, 0);
+            PpcImportAction::CallNative {
+                entry: TRAP_BASE + 4,
+                rtoc: 0xaaaa_0001,
+                return_pc: OUTER_RETURN,
+                final_pc: HALT_PC,
+                restore_rtoc: 0x1111_0001,
+                return_gpr3: PpcNativeReturnGpr3::Set(0x3333_0003),
+            }
+        });
+        assert_eq!(first, PpcRunResult::CycleLimit { cycles: 1 });
+        let context = cpu.capture_execution_context();
+        assert_eq!(context.import_call_stack.len(), 1);
+
+        let mut resumed = PpcCpu::new();
+        resumed.install_execution_context(context);
+        let second =
+            resumed.run_with_imports(&mut memory, 10, HALT_PC, TRAP_BASE, 2, |index, _, _| {
+                assert_eq!(index, 1);
+                PpcImportAction::CallNative {
+                    entry: INNER_RETURN,
+                    rtoc: 0xbbbb_0002,
+                    return_pc: INNER_RETURN,
+                    final_pc: OUTER_RETURN,
+                    restore_rtoc: 0xaaaa_0001,
+                    return_gpr3: PpcNativeReturnGpr3::Set(0x2222_0002),
+                }
+            });
+
+        assert_eq!(
+            second,
+            PpcRunResult::Halted {
+                pc: HALT_PC,
+                cycles: 3
+            }
+        );
+        assert_eq!(resumed.pc, HALT_PC);
+        assert_eq!(resumed.lr, HALT_PC);
+        assert_eq!(resumed.gpr[2], 0x1111_0001);
+        assert_eq!(resumed.gpr[3], 0x3333_0003);
+        assert!(resumed.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_install_replaces_pending_import_frames_a_b_a() {
+        fn pending_context(
+            trap_pc: u32,
+            return_pc: u32,
+            final_pc: u32,
+            callback_rtoc: u32,
+            restored_rtoc: u32,
+            result: u32,
+        ) -> PpcExecutionContext {
+            let mut cpu = PpcCpu::new();
+            let mut memory = PpcSectionMem::new();
+            cpu.pc = trap_pc;
+            assert_eq!(
+                cpu.run_with_imports(&mut memory, 1, 0, trap_pc, 1, |index, _, _| {
+                    assert_eq!(index, 0);
+                    PpcImportAction::CallNative {
+                        entry: return_pc,
+                        rtoc: callback_rtoc,
+                        return_pc,
+                        final_pc,
+                        restore_rtoc: restored_rtoc,
+                        return_gpr3: PpcNativeReturnGpr3::Set(result),
+                    }
+                },),
+                PpcRunResult::CycleLimit { cycles: 1 }
+            );
+            cpu.capture_execution_context()
+        }
+
+        const A_RETURN: u32 = 0x2000;
+        const A_FINAL: u32 = 0x3000;
+        const A_RTOC: u32 = 0xaaaa_0001;
+        const A_RESULT: u32 = 0xaaaa_0003;
+        const B_RETURN: u32 = 0x2100;
+        const B_FINAL: u32 = 0x3100;
+        const B_RTOC: u32 = 0xbbbb_0002;
+        const B_RESULT: u32 = 0xbbbb_0003;
+
+        let context_a = pending_context(0x1000, A_RETURN, A_FINAL, 0xaaaa_1000, A_RTOC, A_RESULT);
+        let context_b = pending_context(0x1100, B_RETURN, B_FINAL, 0xbbbb_1000, B_RTOC, B_RESULT);
+        let mut engine = PpcCpu::new();
+        let mut memory = PpcSectionMem::new();
+
+        engine.install_execution_context(context_a.clone());
+        engine.install_execution_context(context_b);
+        assert_eq!(
+            engine.run_with_imports(&mut memory, 2, B_FINAL, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::Halted {
+                pc: B_FINAL,
+                cycles: 1
+            }
+        );
+        assert_eq!(engine.pc, B_FINAL);
+        assert_eq!(engine.lr, B_FINAL);
+        assert_eq!(engine.gpr[2], B_RTOC);
+        assert_eq!(engine.gpr[3], B_RESULT);
+        assert!(engine.import_call_stack.is_empty());
+
+        engine.install_execution_context(context_a);
+        assert_eq!(
+            engine.run_with_imports(&mut memory, 2, A_FINAL, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::Halted {
+                pc: A_FINAL,
+                cycles: 1
+            }
+        );
+        assert_eq!(engine.pc, A_FINAL);
+        assert_eq!(engine.lr, A_FINAL);
+        assert_eq!(engine.gpr[2], A_RTOC);
+        assert_eq!(engine.gpr[3], A_RESULT);
+        assert!(engine.import_call_stack.is_empty());
+    }
+
+    #[test]
+    fn execution_context_runs_across_distinct_section_memories() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+
+        let mut first_memory = PpcSectionMem::new();
+        first_memory.add_readonly_region(
+            BASE,
+            [0x3863_0001, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut equal_token_memory = first_memory.clone();
+        let mut different_token_memory = PpcSectionMem::new();
+        different_token_memory.add_readonly_region(
+            BASE,
+            [0x3863_0005, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+        assert_eq!(
+            cpu.run_with_imports(&mut first_memory, 2, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 1);
+
+        let mut context = cpu.capture_execution_context();
+        context.architectural_mut().gpr[3] = 10;
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(
+                &mut equal_token_memory,
+                2,
+                0,
+                0,
+                0,
+                |_, _, _| unreachable!()
+            ),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 11);
+
+        let mut context = cpu.capture_execution_context();
+        context.architectural_mut().gpr[3] = 20;
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(&mut different_token_memory, 2, 0, 0, 0, |_, _, _| {
+                unreachable!()
+            }),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(cpu.gpr[3], 25);
+    }
+
+    #[test]
+    fn execution_context_retains_token_validated_basic_block_cache() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+        let words = [0x3863_0001, BRANCH_TO_BASE];
+        let mut first_memory = CountingImmutableMemory::with_token(BASE, &words, 41);
+        let mut equal_token_memory = CountingImmutableMemory::with_token(BASE, &words, 41);
+        let mut different_token_memory =
+            CountingImmutableMemory::with_token(BASE, &[0x3863_0005, BRANCH_TO_BASE], 42);
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut first_memory, 2, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(first_memory.instruction_reads, 2);
+
+        let context = cpu.capture_execution_context();
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(
+                &mut equal_token_memory,
+                2,
+                0,
+                0,
+                0,
+                |_, _, _| unreachable!()
+            ),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(equal_token_memory.instruction_reads, 0);
+        assert_eq!(cpu.gpr[3], 2);
+
+        let context = cpu.capture_execution_context();
+        cpu.install_execution_context(context);
+        assert_eq!(
+            cpu.run_with_imports(&mut different_token_memory, 2, 0, 0, 0, |_, _, _| {
+                unreachable!()
+            }),
+            PpcRunResult::CycleLimit { cycles: 2 }
+        );
+        assert_eq!(different_token_memory.instruction_reads, 2);
+        assert_eq!(cpu.gpr[3], 7);
+    }
+
+    #[test]
+    fn capture_preserves_reservation_but_install_invalidates_it() {
+        const ADDRESS: u32 = 0x1000;
+        const ORIGINAL: u32 = 0x1122_3344;
+        const REPLACEMENT: u32 = 0xaabb_ccdd;
+        const LWARX_R3_R4_R5: u32 = (31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (20 << 1);
+        const STWCX_R6_R4_R5: u32 = (31 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (150 << 1) | 1;
+
+        let mut source_memory = PpcSectionMem::new();
+        source_memory.add_region(ADDRESS, ORIGINAL.to_be_bytes().to_vec());
+        let mut source = PpcCpu::new();
+        source.gpr[4] = ADDRESS;
+        source.gpr[5] = 0;
+        source.gpr[6] = REPLACEMENT;
+        assert_eq!(
+            source.step(&mut source_memory, LWARX_R3_R4_R5),
+            PpcStepResult::Stepped
+        );
+
+        let context = source.capture_execution_context();
+        assert_eq!(source.reservation_address(), Some(ADDRESS));
+        assert_eq!(
+            source.step(&mut source_memory, STWCX_R6_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(source.cr_field(0), 0b0010);
+        assert_eq!(source_memory.read_u32_be(ADDRESS), Some(REPLACEMENT));
+
+        let mut installed_memory = PpcSectionMem::new();
+        installed_memory.add_region(ADDRESS, ORIGINAL.to_be_bytes().to_vec());
+        let mut installed = PpcCpu::new();
+        installed.gpr[4] = ADDRESS;
+        installed.gpr[5] = 0;
+        assert_eq!(
+            installed.step(&mut installed_memory, LWARX_R3_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(installed.reservation_address(), Some(ADDRESS));
+
+        installed.install_execution_context(context);
+        assert_eq!(installed.reservation_address(), None);
+        assert_eq!(
+            installed.step(&mut installed_memory, STWCX_R6_R4_R5),
+            PpcStepResult::Stepped
+        );
+        assert_eq!(installed.cr_field(0), 0);
+        assert_eq!(installed_memory.read_u32_be(ADDRESS), Some(ORIGINAL));
+    }
+
+    #[test]
+    fn immutable_basic_block_cache_avoids_repeated_instruction_fetches() {
+        let base = 0x1000;
+        let mut memory = CountingImmutableMemory::new(
+            base,
+            &[
+                0x3863_0001,
+                0x3863_0001,
+                0x3863_0001,
+                0x3863_0001,
+                0x4bff_fff0,
+            ],
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+
+        let result = cpu.run_with_imports(&mut memory, 100, 0, 0, 0, |_, _, _| {
+            unreachable!("test program has no imports")
+        });
+
+        assert_eq!(result, PpcRunResult::CycleLimit { cycles: 100 });
+        assert_eq!(cpu.gpr[3], 80);
+        assert_eq!(memory.instruction_reads, 5);
+    }
+
+    #[test]
+    fn remapping_readonly_code_invalidates_a_cached_block() {
+        const BASE: u32 = 0x1000;
+        const BRANCH_TO_BASE: u32 = 0x4bff_fffc;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            BASE,
+            [0x3863_0001u32, BRANCH_TO_BASE]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = BASE;
+        assert_eq!(
+            cpu.run(&mut memory, 20, 0),
+            PpcRunResult::CycleLimit { cycles: 20 }
+        );
+        assert_eq!(cpu.gpr[3], 10);
+
+        memory.add_readonly_region(BASE, 0x3863_0005u32.to_be_bytes().to_vec());
+        assert_eq!(
+            cpu.run(&mut memory, 20, 0),
+            PpcRunResult::CycleLimit { cycles: 20 }
+        );
+        assert_eq!(cpu.gpr[3], 60);
+    }
+
+    fn assert_store_redecodes_the_following_instruction(base: u32) {
+        const STORE_R4_AT_R5_PLUS_4: u32 = 0x9085_0004;
+        const ADD_ONE: u32 = 0x3863_0001;
+        const ADD_TWO: u32 = 0x3863_0002;
+        const BLR: u32 = 0x4e80_0020;
+
+        let mut memory = TokenizedWritableMemory::new(base, &[STORE_R4_AT_R5_PLUS_4, ADD_ONE, BLR]);
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+        cpu.lr = 0;
+        cpu.gpr[4] = ADD_TWO;
+        cpu.gpr[5] = base;
+
+        assert_eq!(
+            cpu.run(&mut memory, 8, 0),
+            PpcRunResult::Halted { pc: 0, cycles: 3 }
+        );
+        assert_eq!(
+            cpu.gpr[3], 2,
+            "the instruction after the store came from a stale cached block"
+        );
+    }
+
+    #[test]
+    fn store_rewriting_the_next_instruction_revalidates_the_cached_block() {
+        assert_store_redecodes_the_following_instruction(0x1000);
+    }
+
+    #[test]
+    fn store_rewriting_the_next_page_revalidates_the_cached_block() {
+        assert_store_redecodes_the_following_instruction(0x1ffc);
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_halt_pc() {
+        let base = 0x1000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+
+        assert_eq!(
+            cpu.run(&mut memory, 10, base + 8),
+            PpcRunResult::Halted {
+                pc: base + 8,
+                cycles: 2
+            }
+        );
+        assert_eq!(cpu.gpr[3], 2);
+    }
+
+    #[test]
+    fn cached_word_copy_preserves_load_store_boundaries() {
+        const CODE: u32 = 0x1000;
+        const DATA: u32 = 0x2000;
+        // Loading r4 also changes the base used by the following store.
+        let instructions = [0x8085_0000u32, 0x9084_0004];
+        for (source, destination, max_cycles, halt_pc) in [
+            (DATA, DATA + 8, 2, 0),
+            (DATA, DATA + 8, 1, 0),
+            (DATA, DATA + 8, 2, CODE + 4),
+            (DATA + 1, DATA + 8, 2, 0),
+            (DATA, DATA + 1, 2, 0),
+            (DATA + 16, DATA + 8, 2, 0),
+            (DATA, DATA + 16, 2, 0),
+        ] {
+            let mut memory = PpcSectionMem::new();
+            memory.add_readonly_region(
+                CODE,
+                instructions
+                    .into_iter()
+                    .flat_map(u32::to_be_bytes)
+                    .collect(),
+            );
+            let mut data = vec![0u8; 16];
+            data[0..4].copy_from_slice(&(destination - 4).to_be_bytes());
+            memory.add_region(DATA, data);
+
+            let mut cached = PpcCpu::new();
+            cached.pc = CODE;
+            cached.gpr[5] = source;
+            let mut expected = PpcCpu::new();
+            expected.pc = CODE;
+            expected.gpr[5] = source;
+            let mut expected_memory = memory.clone();
+
+            let result = cached.run_with_imports(
+                &mut memory,
+                max_cycles,
+                halt_pc,
+                0,
+                0,
+                |_, _, _| unreachable!(),
+            );
+            let reference = expected.run_with_imports_and_fetch_observer(
+                &mut expected_memory,
+                max_cycles,
+                halt_pc,
+                0,
+                0,
+                &mut Vec::new(),
+                |_, _, _| unreachable!(),
+            );
+            assert_eq!(
+                result, reference,
+                "source={source:#x}, destination={destination:#x}"
+            );
+            assert_eq!(cached.pc, expected.pc);
+            assert_eq!(cached.gpr, expected.gpr);
+            assert_eq!(cached.time_base(), expected.time_base());
+            assert_eq!(
+                memory.read_u32_be(DATA + 8),
+                expected_memory.read_u32_be(DATA + 8)
+            );
+        }
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_import_trap() {
+        let base = 0x1000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = base;
+        cpu.lr = 0;
+        let mut calls = 0;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 10, 0, base + 8, 1, |index, _, _| {
+                assert_eq!(index, 0);
+                calls += 1;
+                PpcImportAction::Return(42)
+            }),
+            PpcRunResult::Halted { pc: 0, cycles: 3 }
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(cpu.gpr[3], 42);
+    }
+
+    #[test]
+    fn cached_block_stops_before_interior_native_callback_return() {
+        let base = 0x1000;
+        let trap_base = 0x2000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(
+            base,
+            [0x3863_0001u32, 0x3863_0001, 0x3863_0001, 0x4bff_fff4]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        );
+        let mut cpu = PpcCpu::new();
+        cpu.pc = trap_base;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 10, 0, trap_base, 1, |index, _, _| {
+                assert_eq!(index, 0);
+                PpcImportAction::CallNative {
+                    entry: base,
+                    rtoc: 0,
+                    return_pc: base + 8,
+                    final_pc: 0,
+                    restore_rtoc: 0,
+                    return_gpr3: PpcNativeReturnGpr3::Preserve,
+                }
+            }),
+            PpcRunResult::Halted { pc: 0, cycles: 4 }
+        );
+        assert_eq!(cpu.gpr[3], 2);
+    }
+
+    #[test]
+    fn immutable_basic_block_cache_executes_predecoded_fallback_without_decode_cache() {
+        // `stbux` is intentionally outside the raw fast dispatcher.  Its
+        // decoded form must still execute from an immutable code block while
+        // routing the guest store through the normal memory bus.
+        let code_base = 0x1000;
+        let data_base = 0x2000;
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(code_base, 0x7F2B_61EEu32.to_be_bytes().to_vec());
+        memory.add_region(data_base, vec![0; 0x20]);
+
+        let mut cpu = PpcCpu::new();
+        cpu.pc = code_base;
+        cpu.gpr[25] = 0xAB;
+        cpu.gpr[11] = data_base;
+        cpu.gpr[12] = 4;
+
+        assert_eq!(
+            cpu.run_with_imports(&mut memory, 1, 0, 0, 0, |_, _, _| unreachable!()),
+            PpcRunResult::CycleLimit { cycles: 1 }
+        );
+        assert_eq!(cpu.gpr[11], data_base + 4);
+        assert_eq!(memory.read_u8(data_base + 4), Some(0xAB));
+        assert_eq!(cpu.decode_cache_entry_count(), 0);
+    }
+
+    #[test]
+    fn fast_instruction_classifier_matches_dispatcher() {
+        let mut memory = PpcSectionMem::new();
+        let mut cpu = PpcCpu::new();
+
+        // Exercise every primary/XO combination with the remaining fields
+        // zeroed. This keeps the cached classification conservative: a word
+        // is only omitted from predecoding when the raw dispatcher accepts it.
+        for primary in 0..64u32 {
+            for xo in 0..1024u32 {
+                let word = (primary << 26) | (xo << 1);
+                let dispatched = cpu.step_fast_unobserved(&mut memory, word).is_some();
+                assert_eq!(
+                    PpcCpu::fast_instruction(word),
+                    dispatched,
+                    "primary={primary}, xo={xo}, word={word:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_cache_reuses_repeated_successful_instruction_words() {
+        let mut cpu = PpcCpu::new();
+
+        assert_eq!(cpu.step_instruction(0x6000_0000), PpcStepResult::Stepped);
+        assert_eq!(cpu.pc, 4);
+        assert_eq!(cpu.decode_cache_entry_count(), 1);
+        assert_eq!(cpu.step_instruction(0x6000_0000), PpcStepResult::Stepped);
+        assert_eq!(cpu.pc, 8);
+        assert_eq!(cpu.decode_cache_entry_count(), 1);
+    }
+
+    #[test]
+    fn decode_cache_reuses_repeated_decode_errors() {
+        let mut cpu = PpcCpu::new();
+        let unsupported_vector_instruction = 0x1000_0000;
+
+        assert_eq!(
+            cpu.step_instruction(unsupported_vector_instruction),
+            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(4))
+        );
+        assert_eq!(cpu.decode_cache_entry_count(), 1);
+        assert_eq!(
+            cpu.step_instruction(unsupported_vector_instruction),
+            PpcStepResult::Unimplemented(PpcDecodeError::UnsupportedPrimaryOpcode(4))
+        );
+        assert_eq!(cpu.decode_cache_entry_count(), 1);
+    }
+
+    #[test]
+    fn stbux_decodes_and_updates_the_base_register() {
+        let word = 0x7F2B_61EE;
+        assert_eq!(
+            crate::decode::decode(word),
+            Ok(PpcInstr::Stbux {
+                rs: 25,
+                ra: 11,
+                rb: 12,
+            })
+        );
+
+        let mut cpu = PpcCpu::new();
+        let mut mem = PpcSectionMem::new();
+        mem.add_region(0x1000, vec![0; 0x100]);
+        cpu.gpr[25] = 0x1234_56AB;
+        cpu.gpr[11] = 0x1000;
+        cpu.gpr[12] = 0x20;
+
+        assert_eq!(cpu.step(&mut mem, word), PpcStepResult::Stepped);
+        assert_eq!(mem.read_u8(0x1020), Some(0xAB));
+        assert_eq!(cpu.gpr[11], 0x1020);
+        assert_eq!(cpu.pc, 4);
+    }
+
+    #[test]
+    fn stbux_rejects_ra_zero() {
+        let word = 0x7F20_61EE;
+        let mut cpu = PpcCpu::new();
+        let mut mem = PpcSectionMem::new();
+
+        assert_eq!(
+            cpu.step(&mut mem, word),
+            PpcStepResult::Exception(PpcException::IllegalInstruction {
+                word,
+                reason: PpcIllegalInstructionReason::InvalidForm,
+            })
+        );
+        assert_eq!(cpu.pc, 0);
+    }
+
+    #[test]
+    fn bcctr_null_target_branches_to_zero() {
+        let mut cpu = PpcCpu::new();
+        cpu.ctr = 0;
+
+        assert_eq!(cpu.step_instruction(0x4E80_0420), PpcStepResult::Stepped);
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.lr, 0);
+        assert_eq!(cpu.gpr[3], 0);
+    }
+}
 
 #[cfg(test)]
-#[path = "tests/fast_frsp.rs"]
-mod fast_frsp_tests;
+mod fast_frsp_tests {
+    use super::*;
+
+    #[test]
+    fn unary_fp_reserved_fra_matches_decoded_exceptions_in_all_paths() {
+        for xo in [12u32, 26] {
+            for fra in 0..32 {
+                for rc in [0, 1] {
+                    let word = (63 << 26) | (3 << 21) | (fra << 16) | (2 << 11) | (xo << 1) | rc;
+                    assert_eq!(PpcCpu::fast_instruction(word), fra == 0);
+                    for fp_available in [false, true] {
+                        if fra == 0 && fp_available {
+                            continue; // Valid arithmetic is covered below.
+                        }
+                        let exception = if fra == 0 {
+                            PpcException::FloatingPointUnavailable
+                        } else {
+                            PpcException::IllegalInstruction {
+                                word,
+                                reason: PpcIllegalInstructionReason::InvalidForm,
+                            }
+                        };
+                        for cached in [false, true] {
+                            let mut memory = PpcSectionMem::new();
+                            let code = word.to_be_bytes().to_vec();
+                            if cached {
+                                memory.add_readonly_region(0x1000, code);
+                            } else {
+                                memory.add_region(0x1000, code);
+                            }
+                            let mut cpu = PpcCpu::new();
+                            cpu.pc = 0x1000;
+                            cpu.fpr.fill(2.0f64.to_bits());
+                            cpu.fpscr = 0x1234_5678;
+                            cpu.cr = 0x8765_4321;
+                            cpu.set_time_base(123);
+                            cpu.set_msr_fp_available(fp_available);
+                            assert_eq!(
+                                cpu.step(&mut memory, word),
+                                PpcStepResult::Exception(exception)
+                            );
+                            // Repeat to cover a cache hit as well as its fill.
+                            for _ in 0..2 {
+                                assert_eq!(
+                                    cpu.run_with_imports(
+                                        &mut memory,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
+                                        |_, _, _| unreachable!()
+                                    ),
+                                    PpcRunResult::Exception {
+                                        pc: 0x1000,
+                                        exception,
+                                        cycles: 0
+                                    },
+                                    "xo={xo} fra={fra} rc={rc} fp={fp_available} cached={cached}"
+                                );
+                                assert_eq!(cpu.pc, 0x1000);
+                                assert_eq!(cpu.time_base(), 123);
+                                assert_eq!(cpu.fpr, [2.0f64.to_bits(); 32]);
+                                assert_eq!(cpu.fpscr, 0x1234_5678);
+                                assert_eq!(cpu.cr, 0x8765_4321);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reference(cpu: &mut PpcCpu, bits: u64, rc: bool) {
+        let source = ApDouble::from_bits(u128::from(bits));
+        let narrowed: StatusAnd<ApSingle> = source.convert_r(cpu.fp_rounding_mode(), &mut false);
+        let mut status = narrowed.status
+            | if PpcCpu::is_signaling_nan(bits) {
+                ApStatus::INVALID_OP
+            } else {
+                ApStatus::OK
+            };
+        let largest = (narrowed.value.to_bits() as u32 & 0x7fff_ffff) == 0x7f7f_ffff;
+        let adjusted = cpu.fp_adjusted_single_conversion(bits, &mut status, largest);
+        cpu.finish_ap_single_result_adjusted(
+            3,
+            StatusAnd {
+                status,
+                value: source,
+            },
+            source,
+            adjusted,
+            1u32 << FPSCR_VXSNAN,
+            rc,
+        );
+        cpu.set_time_base(cpu.time_base().wrapping_add(1));
+    }
+    #[test]
+    fn normal_single_rounding_matches_software_in_all_modes_and_execution_paths() {
+        let mut inputs = vec![
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            u64::MAX,
+            0x7ff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0x7ff8_0000_1234_5678,
+        ];
+        for exponent in 896u64..=1151 {
+            for fraction in [
+                0,
+                1,
+                0x0fff_ffff,
+                0x1000_0000,
+                0x1000_0001,
+                0x1fff_ffff,
+                0x2000_0000,
+                0x3000_0000,
+                0x000f_ffff_ffff_ffff,
+            ] {
+                for sign in [0, 0x8000_0000_0000_0000] {
+                    inputs.push(sign | exponent << 52 | fraction);
+                }
+            }
+        }
+        let mut seed = 0x5a8c_1234_0066_17a3u64;
+        for _ in 0..8192 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            inputs.push(seed);
+        }
+        let mut memory = PpcSectionMem::new();
+        for rc in [0u32, 1] {
+            memory.add_readonly_region(
+                0x1000 + 4 * rc,
+                ((63u32 << 26) | (3 << 21) | (2 << 11) | (12 << 1) | rc)
+                    .to_be_bytes()
+                    .to_vec(),
+            );
+        }
+        let mut expected = PpcCpu::new();
+        let mut stepped = PpcCpu::new();
+        let mut cached = PpcCpu::new();
+        let mut accepted = 0;
+        for bits in inputs {
+            for mode in 0..4 {
+                if PpcCpu::fast_single_round(bits, mode).is_some() {
+                    accepted += 1;
+                }
+                for prior in [0u32, 0xa502_40f8] {
+                    for rc in [false, true] {
+                        for cpu in [&mut expected, &mut stepped, &mut cached] {
+                            cpu.pc = 0x1000 + 4 * u32::from(rc);
+                            cpu.fpscr = prior | mode;
+                            cpu.cr = 0x1234_5678;
+                            cpu.fpr.fill(0x4020_0000_0000_0000);
+                            cpu.fpr[2] = bits;
+                            cpu.set_time_base(u64::MAX);
+                        }
+                        reference(&mut expected, bits, rc);
+                        let word =
+                            (63u32 << 26) | (3 << 21) | (2 << 11) | (12 << 1) | u32::from(rc);
+                        assert_eq!(stepped.step(&mut memory, word), PpcStepResult::Stepped);
+                        assert_eq!(
+                            cached.run_with_imports(
+                                &mut memory,
+                                1,
+                                0,
+                                0,
+                                0,
+                                |_, _, _| unreachable!()
+                            ),
+                            PpcRunResult::CycleLimit { cycles: 1 }
+                        );
+                        for actual in [&stepped, &cached] {
+                            assert_eq!(
+                                (
+                                    &actual.fpr,
+                                    actual.fpscr,
+                                    actual.cr,
+                                    actual.pc,
+                                    actual.time_base()
+                                ),
+                                (
+                                    &expected.fpr,
+                                    expected.fpscr,
+                                    expected.cr,
+                                    expected.pc,
+                                    expected.time_base()
+                                ),
+                                "bits={bits:016x} mode={mode} rc={rc}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted > 16000,
+            "insufficient fast-path coverage: {accepted}"
+        );
+    }
+}
 
 #[cfg(test)]
-#[path = "tests/fast_frsqrte_dispatch.rs"]
-mod fast_frsqrte_dispatch_tests;
+mod fast_frsqrte_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn direct_frsqrte_result_matches_software_in_both_execution_paths() {
+        let mut inputs = vec![
+            0,
+            1,
+            2,
+            3,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0x7ff8_0000_1234_5678,
+        ];
+        for exponent in 0u64..2047 {
+            for fraction in [0, 1, 0x000f_ffff_ffff_ffff] {
+                inputs.push((exponent << 52) | fraction);
+            }
+        }
+        let mut seed = 0x890c_1337_5184_eeeeu64;
+        for _ in 0..4096 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            inputs.push(seed);
+        }
+        let mut memory = PpcSectionMem::new();
+        for rc in [0u32, 1] {
+            memory.add_readonly_region(
+                0x1000 + 4 * rc,
+                ((63u32 << 26) | (3 << 21) | (3 << 11) | (26 << 1) | rc)
+                    .to_be_bytes()
+                    .to_vec(),
+            );
+        }
+        let mut expected = PpcCpu::new();
+        let mut stepped = PpcCpu::new();
+        let mut cached = PpcCpu::new();
+        let mut accepted = 0;
+        for bits in inputs {
+            for mode in 0..4 {
+                accepted += usize::from(frsqrte::fast(bits, mode).is_some());
+                for prior in [0u32, 0xa502_40f8] {
+                    for rc in [false, true] {
+                        for cpu in [&mut expected, &mut stepped, &mut cached] {
+                            cpu.pc = 0x1000 + 4 * u32::from(rc);
+                            cpu.fpscr = prior | mode;
+                            cpu.cr = 0x1234_5678;
+                            cpu.fpr.fill(0x4020_0000_0000_0000);
+                            cpu.fpr[3] = bits;
+                            cpu.set_time_base(u64::MAX);
+                        }
+                        let result = frsqrte::reference(bits, mode);
+                        let invalid = PpcCpu::fp_invalid_flags(bits, None, FPSCR_VXSQRT);
+                        expected.finish_ap_double_result(3, result, invalid, rc);
+                        expected.set_time_base(0);
+                        let word =
+                            (63u32 << 26) | (3 << 21) | (3 << 11) | (26 << 1) | u32::from(rc);
+                        assert_eq!(stepped.step(&mut memory, word), PpcStepResult::Stepped);
+                        assert_eq!(
+                            cached.run_with_imports(
+                                &mut memory,
+                                1,
+                                0,
+                                0,
+                                0,
+                                |_, _, _| unreachable!()
+                            ),
+                            PpcRunResult::CycleLimit { cycles: 1 }
+                        );
+                        for actual in [&stepped, &cached] {
+                            assert_eq!(
+                                (
+                                    &actual.fpr,
+                                    actual.fpscr,
+                                    actual.cr,
+                                    actual.pc,
+                                    actual.time_base()
+                                ),
+                                (
+                                    &expected.fpr,
+                                    expected.fpscr,
+                                    expected.cr,
+                                    expected.pc,
+                                    expected.time_base()
+                                ),
+                                "bits={bits:016x} mode={mode} rc={rc} prior={prior:08x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted > 24000,
+            "insufficient direct path coverage: {accepted}"
+        );
+    }
+}

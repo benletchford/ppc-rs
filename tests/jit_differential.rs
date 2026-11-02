@@ -1,6 +1,6 @@
 //! Differential test: random programs must behave identically in the
 //! interpreter and the Cranelift JIT.
-#![cfg(feature = "jit")]
+#![cfg(all(feature = "jit", not(target_family = "wasm")))]
 
 use ppc::{PpcAlignmentPolicy, PpcCpu, PpcJitConfig, PpcRunResult, PpcSectionMem};
 

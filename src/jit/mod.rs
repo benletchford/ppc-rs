@@ -5,15 +5,28 @@
 //! Other instructions fall back to the interpreter.
 #![allow(unsafe_code)]
 
+#[cfg(not(target_family = "wasm"))]
 mod compiler;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod diag;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod runtime;
+#[cfg(not(target_family = "wasm"))]
 mod session;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use compiler::{
     JIT_DECLINED, JitRequest, JitShared, JitTicket, RegionSpec, poll_ticket,
 };
-pub use compiler::{PpcJitConfig, PpcJitStats};
+mod config;
+pub use config::{PpcJitConfig, PpcJitStats};
+
+#[cfg(target_family = "wasm")]
+mod unsupported;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use session::{JitCtx, STOPPED, with_session};
+#[cfg(not(target_family = "wasm"))]
 mod emit;
+#[cfg(not(target_family = "wasm"))]
 mod helpers;
+#[cfg(not(target_family = "wasm"))]
 mod jitdump;

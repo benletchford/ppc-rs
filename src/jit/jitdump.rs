@@ -32,6 +32,8 @@ pub(super) fn block_name(pc: u32) -> String {
 /// Name of a hot region entered at `pc` spanning `blocks` blocks.
 pub(super) fn region_name(pc: u32, blocks: usize) -> String {
     let index = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
+    // Samply recognizes Firefox's IonIC prefix as a separate JIT category.
+    // Reuse it to distinguish hot regions from baseline blocks in profiles.
     format!("IonIC: ppc_hot_{pc:08x}_{blocks}b_{index}")
 }
 
