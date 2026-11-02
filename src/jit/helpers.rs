@@ -4,6 +4,8 @@
 //! there is one) and bit 32 ([`FAULT`]) is set when the instruction stopped the
 //! run. A stopping helper records the result in [`JitCtx`] and leaves
 //! `cpu.pc` at the faulting instruction, exactly like the interpreter.
+//! Panics are caught before crossing the C ABI, carried through a normal
+//! native return, and resumed by the session. Guest instructions are not retried.
 
 use super::JitCtx;
 use crate::{
@@ -13,6 +15,29 @@ use crate::{
 
 pub(super) const FAULT_BIT: u32 = 32;
 const FAULT: u64 = 1 << FAULT_BIT;
+
+/// Catch inside the Rust helper, never across a generated frame. Mutable CPU
+/// and host memory may be partially updated, so this only transports the panic;
+/// the session resumes unwinding immediately instead of continuing execution.
+fn guard(ctx: *mut JitCtx, pc: Option<u32>, body: impl FnOnce(&mut JitCtx) -> u64) -> u64 {
+    // SAFETY: generated code passes its live session context, exclusively for
+    // this helper call; no reference from the helper survives its return.
+    let ctx = unsafe { &mut *ctx };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(ctx))) {
+        Ok(result) => result,
+        Err(payload) => {
+            ctx.panic = Some(payload);
+            if let Some(pc) = pc {
+                // SAFETY: the CPU is live and exclusively owned by the session.
+                unsafe { (*ctx.cpu).pc = pc };
+                FAULT
+            } else {
+                // The epoch helper returns a boolean: force a region exit.
+                1
+            }
+        }
+    }
+}
 
 // Compact argument shared by floating-point helpers and the emitter.
 const FP_REGISTER_MASK: u32 = 31;
@@ -32,98 +57,107 @@ pub(super) fn fp_fields(dest: u8, a: u8, b: u8, operation: u32, record: bool) ->
 
 /// Execute a decoded double-precision operation or ordered comparison.
 pub(super) extern "C" fn double_op(ctx: *mut JitCtx, fields: u32, pc: u32) -> u64 {
-    let ctx = unsafe { &mut *ctx };
-    let cpu = unsafe { &mut *ctx.cpu };
-    if !cpu.msr_fp_available() {
-        return stop(
-            ctx,
-            pc,
-            PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
-        );
-    }
-    let dest = (fields & FP_REGISTER_MASK) as u8;
-    let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
-    let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
-    let rc = fields & FP_RECORD_BIT != 0;
-    match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
-        0 => {
-            if let Some(value) = cpu.fp_convert_to_i32(b, ApRound::TowardZero) {
-                cpu.fpr[dest as usize] = u64::from(value);
+    guard(ctx, Some(pc), |ctx| {
+        let cpu = unsafe { &mut *ctx.cpu };
+        if !cpu.msr_fp_available() {
+            return stop(
+                ctx,
+                pc,
+                PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
+            );
+        }
+        let dest = (fields & FP_REGISTER_MASK) as u8;
+        let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
+        let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
+        let rc = fields & FP_RECORD_BIT != 0;
+        match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
+            0 => {
+                if let Some(value) = cpu.fp_convert_to_i32(b, ApRound::TowardZero) {
+                    cpu.fpr[dest as usize] = u64::from(value);
+                }
+                cpu.finish_fp_record(rc);
             }
-            cpu.finish_fp_record(rc);
+            1 => {
+                let mut result = ApDouble::from_bits(u128::from(a))
+                    .div_r(ApDouble::from_bits(u128::from(b)), cpu.fp_rounding_mode());
+                let truncated = ApDouble::from_bits(u128::from(a))
+                    .div_r(ApDouble::from_bits(u128::from(b)), ApRound::TowardZero)
+                    .value;
+                let default = if PpcCpu::fp_is_zero(a) && PpcCpu::fp_is_zero(b) {
+                    FPSCR_VXZDZ
+                } else if PpcCpu::fp_is_infinite(a) && PpcCpu::fp_is_infinite(b) {
+                    FPSCR_VXIDI
+                } else {
+                    FPSCR_VXSOFT
+                };
+                let invalid = PpcCpu::fp_invalid_flags(a, Some(b), default);
+                let adjusted = cpu.fp_adjusted_binary_result(
+                    a,
+                    b,
+                    FpBinaryOperation::Divide,
+                    false,
+                    &mut result,
+                );
+                cpu.finish_ap_double_result_adjusted(
+                    dest, result, truncated, adjusted, invalid, rc,
+                );
+            }
+            _ => {
+                // The block runner uses its unobserved comparison path.
+                let (a, b) = (f64::from_bits(a), f64::from_bits(b));
+                let nibble = if a.is_nan() || b.is_nan() {
+                    1
+                } else if a < b {
+                    8
+                } else if a > b {
+                    4
+                } else {
+                    2
+                };
+                cpu.set_cr_field(dest, nibble);
+                cpu.set_fpscr_compare_result(nibble);
+            }
         }
-        1 => {
-            let mut result = ApDouble::from_bits(u128::from(a))
-                .div_r(ApDouble::from_bits(u128::from(b)), cpu.fp_rounding_mode());
-            let truncated = ApDouble::from_bits(u128::from(a))
-                .div_r(ApDouble::from_bits(u128::from(b)), ApRound::TowardZero)
-                .value;
-            let default = if PpcCpu::fp_is_zero(a) && PpcCpu::fp_is_zero(b) {
-                FPSCR_VXZDZ
-            } else if PpcCpu::fp_is_infinite(a) && PpcCpu::fp_is_infinite(b) {
-                FPSCR_VXIDI
-            } else {
-                FPSCR_VXSOFT
-            };
-            let invalid = PpcCpu::fp_invalid_flags(a, Some(b), default);
-            let adjusted =
-                cpu.fp_adjusted_binary_result(a, b, FpBinaryOperation::Divide, false, &mut result);
-            cpu.finish_ap_double_result_adjusted(dest, result, truncated, adjusted, invalid, rc);
-        }
-        _ => {
-            // The block runner uses its unobserved comparison path.
-            let (a, b) = (f64::from_bits(a), f64::from_bits(b));
-            let nibble = if a.is_nan() || b.is_nan() {
-                1
-            } else if a < b {
-                8
-            } else if a > b {
-                4
-            } else {
-                2
-            };
-            cpu.set_cr_field(dest, nibble);
-            cpu.set_fpscr_compare_result(nibble);
-        }
-    }
-    0
+        0
+    })
 }
 
 /// Execute a decoded single-precision operation using the shared FPSCR logic.
 pub(super) extern "C" fn single_binary(ctx: *mut JitCtx, fields: u32, pc: u32) -> u64 {
-    let ctx = unsafe { &mut *ctx };
-    let cpu = unsafe { &mut *ctx.cpu };
-    if !cpu.msr_fp_available() {
-        return stop(
-            ctx,
-            pc,
-            PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
-        );
-    }
-    let frt = (fields & FP_REGISTER_MASK) as u8;
-    let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
-    let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
-    let operation = match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
-        0 => FpBinaryOperation::Add,
-        1 => FpBinaryOperation::Subtract,
-        2 => FpBinaryOperation::Multiply,
-        _ => FpBinaryOperation::Divide,
-    };
-    let rc = fields & FP_RECORD_BIT != 0;
-    if matches!(operation, FpBinaryOperation::Divide) {
-        cpu.single_binary_reference(frt, a, b, operation, rc);
-    } else {
-        // Match the unobserved execution path used by the block runner.
-        let (a, b) = (f64::from_bits(a), f64::from_bits(b));
-        let result = match operation {
-            FpBinaryOperation::Add => a + b,
-            FpBinaryOperation::Subtract => a - b,
-            FpBinaryOperation::Multiply => a * b,
-            _ => unreachable!(),
-        } as f32;
-        cpu.finish_fp_result(frt, f64::from(result).to_bits(), rc);
-    }
-    0
+    guard(ctx, Some(pc), |ctx| {
+        let cpu = unsafe { &mut *ctx.cpu };
+        if !cpu.msr_fp_available() {
+            return stop(
+                ctx,
+                pc,
+                PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
+            );
+        }
+        let frt = (fields & FP_REGISTER_MASK) as u8;
+        let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
+        let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
+        let operation = match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
+            0 => FpBinaryOperation::Add,
+            1 => FpBinaryOperation::Subtract,
+            2 => FpBinaryOperation::Multiply,
+            _ => FpBinaryOperation::Divide,
+        };
+        let rc = fields & FP_RECORD_BIT != 0;
+        if matches!(operation, FpBinaryOperation::Divide) {
+            cpu.single_binary_reference(frt, a, b, operation, rc);
+        } else {
+            // Match the unobserved execution path used by the block runner.
+            let (a, b) = (f64::from_bits(a), f64::from_bits(b));
+            let result = match operation {
+                FpBinaryOperation::Add => a + b,
+                FpBinaryOperation::Subtract => a - b,
+                FpBinaryOperation::Multiply => a * b,
+                _ => unreachable!(),
+            } as f32;
+            cpu.finish_fp_result(frt, f64::from(result).to_bits(), rc);
+        }
+        0
+    })
 }
 
 #[cold]
@@ -154,48 +188,51 @@ fn alignment(ctx: &mut JitCtx, pc: u32, ea: u32, size: u8, access: PpcMemoryAcce
 
 /// Interpret one instruction with `cpu.pc` set to its address.
 pub(super) extern "C" fn step(ctx: *mut JitCtx, word: u32, pc: u32) -> u64 {
-    // SAFETY: generated code passes the context it was invoked with.
-    let ctx = unsafe { &mut *ctx };
-    let (cpu, mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
-    cpu.pc = pc;
-    let result = cpu
-        .step_fast_unobserved(mem, word)
-        .unwrap_or_else(|| cpu.step(mem, word));
-    match result {
-        PpcStepResult::Stepped => 0,
-        other => stop(ctx, pc, other),
-    }
+    guard(ctx, Some(pc), |ctx| {
+        // SAFETY: generated code passes the context it was invoked with.
+        let (cpu, mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
+        cpu.pc = pc;
+        let result = cpu
+            .step_fast_unobserved(mem, word)
+            .unwrap_or_else(|| cpu.step(mem, word));
+        match result {
+            PpcStepResult::Stepped => 0,
+            other => stop(ctx, pc, other),
+        }
+    })
 }
 
 /// Whether the code epoch moved since the region was entered: generated
 /// region code calls this after a block that may have changed code mappings.
 pub(super) extern "C" fn code_changed(ctx: *mut JitCtx) -> u64 {
-    // SAFETY: see `step`.
-    let ctx = unsafe { &*ctx };
-    let mem = unsafe { &*ctx.mem };
-    u64::from(mem.code_epoch().unwrap_or(0) != ctx.epoch)
+    guard(ctx, None, |ctx| {
+        // SAFETY: see `step`.
+        let mem = unsafe { &*ctx.mem };
+        u64::from(mem.code_epoch().unwrap_or(0) != ctx.epoch)
+    })
 }
 
 macro_rules! load_helper {
     ($name:ident, $size:expr, |$mem:ident, $ea:ident| $read:expr) => {
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, pc: u32) -> u64 {
-            // SAFETY: see `step`.
-            let ctx = unsafe { &mut *ctx };
-            let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
-            if $size > 1 && misaligned(cpu, $ea, $size) {
-                return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Load);
-            }
-            match $read {
-                Some(value) => u64::from(value),
-                None => stop(
-                    ctx,
-                    pc,
-                    PpcStepResult::MemoryFault {
-                        addr: $ea,
-                        was_write: false,
-                    },
-                ),
-            }
+            guard(ctx, Some(pc), |ctx| {
+                // SAFETY: see `step`.
+                let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
+                if $size > 1 && misaligned(cpu, $ea, $size) {
+                    return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Load);
+                }
+                match $read {
+                    Some(value) => u64::from(value),
+                    None => stop(
+                        ctx,
+                        pc,
+                        PpcStepResult::MemoryFault {
+                            addr: $ea,
+                            was_write: false,
+                        },
+                    ),
+                }
+            })
         }
     };
 }
@@ -210,23 +247,24 @@ load_helper!(lwz, 4, |mem, ea| mem.read_u32_be(ea));
 macro_rules! store_helper {
     ($name:ident, $size:expr, |$mem:ident, $ea:ident, $value:ident| $write:expr) => {
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, $value: u32, pc: u32) -> u64 {
-            // SAFETY: see `step`.
-            let ctx = unsafe { &mut *ctx };
-            let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
-            if $size > 1 && misaligned(cpu, $ea, $size) {
-                return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Store);
-            }
-            match $write {
-                Some(()) => 0,
-                None => stop(
-                    ctx,
-                    pc,
-                    PpcStepResult::MemoryFault {
-                        addr: $ea,
-                        was_write: true,
-                    },
-                ),
-            }
+            guard(ctx, Some(pc), |ctx| {
+                // SAFETY: see `step`.
+                let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
+                if $size > 1 && misaligned(cpu, $ea, $size) {
+                    return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Store);
+                }
+                match $write {
+                    Some(()) => 0,
+                    None => stop(
+                        ctx,
+                        pc,
+                        PpcStepResult::MemoryFault {
+                            addr: $ea,
+                            was_write: true,
+                        },
+                    ),
+                }
+            })
         }
     };
 }
@@ -239,24 +277,25 @@ macro_rules! fp_helper {
     ($name:ident, $size:expr, $access:ident, |$cpu:ident, $mem:ident, $ea:ident, $fr:ident| $body:expr) => {
         /// Floating-point load/store; the FPR is read or written in place.
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, $fr: u32, pc: u32) -> u64 {
-            // SAFETY: see `step`.
-            let ctx = unsafe { &mut *ctx };
-            let ($cpu, $mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
-            if misaligned($cpu, $ea, $size) {
-                return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::$access);
-            }
-            let $fr = $fr as usize;
-            match $body {
-                Some(()) => 0,
-                None => stop(
-                    ctx,
-                    pc,
-                    PpcStepResult::MemoryFault {
-                        addr: $ea,
-                        was_write: matches!(PpcMemoryAccess::$access, PpcMemoryAccess::Store),
-                    },
-                ),
-            }
+            guard(ctx, Some(pc), |ctx| {
+                // SAFETY: see `step`.
+                let ($cpu, $mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
+                if misaligned($cpu, $ea, $size) {
+                    return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::$access);
+                }
+                let $fr = $fr as usize;
+                match $body {
+                    Some(()) => 0,
+                    None => stop(
+                        ctx,
+                        pc,
+                        PpcStepResult::MemoryFault {
+                            addr: $ea,
+                            was_write: matches!(PpcMemoryAccess::$access, PpcMemoryAccess::Store),
+                        },
+                    ),
+                }
+            })
         }
     };
 }

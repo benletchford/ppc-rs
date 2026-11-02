@@ -60,6 +60,11 @@ fields override those defaults:
 | `PPC_JIT_JITDUMP` | unset | Set to `1` to write baseline/hot jitdump files and guest `.ppc` listings to the temporary directory for samply/perf |
 | `PPC_JIT_STATS` | unset | Set to `1` before first enabling JIT to print periodic process-wide diagnostics; independent of config fields |
 
+With unwinding enabled, panics in host memory callbacks propagate to the caller:
+the JIT catches them inside its Rust helpers, exits generated code normally, and
+resumes the original panic. It does not retry the instruction or roll back CPU or
+memory side effects. `panic = "abort"` retains its usual process-abort behavior.
+
 Hot-region symbols use the `IonIC:` prefix as a samply categorization workaround,
 so hot regions and baseline blocks appear in different profiler categories.
 

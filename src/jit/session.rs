@@ -6,6 +6,7 @@ pub(crate) struct JitCtx {
     pub(crate) cpu: *mut PpcCpu,
     pub(crate) mem: *mut dyn PpcMemory,
     pub(crate) stop: Option<PpcStepResult>,
+    pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
     pub(crate) stop_pc: u32,
     /// Instructions a region may retire in this call (a block's own length
     /// is checked by the caller before entering it).
@@ -100,6 +101,11 @@ impl Session<'_> {
         let function: extern "C" fn(*mut PpcCpu, *mut JitCtx) -> u32 =
             unsafe { std::mem::transmute(code) };
         let returned = function(self.cpu, &mut self.ctx);
+        // Helpers return normally through generated code before we resume the
+        // original panic. Check even normal exits: the epoch helper uses one.
+        if let Some(payload) = self.ctx.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         if returned & STOPPED == 0 {
             return Ok(u64::from(returned));
         }
@@ -129,6 +135,7 @@ pub(crate) fn with_session<M: PpcMemory + ?Sized, R>(
             cpu: cpu_ptr,
             mem,
             stop: None,
+            panic: None,
             stop_pc: 0,
             budget: 0,
             epoch: 0,

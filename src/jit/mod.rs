@@ -30,3 +30,6 @@ mod emit;
 mod helpers;
 #[cfg(not(target_family = "wasm"))]
 mod jitdump;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod panic_tests;
