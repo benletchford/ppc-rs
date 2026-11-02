@@ -20,6 +20,10 @@ fn run_case(words: &[u32], with_data: bool, floating_value: f64, cycles: u64) ->
     cpu.gpr[5] = DATA_BASE;
     cpu.gpr[6] = DATA_BASE + 32;
     cpu.fpr[1] = floating_value.to_bits();
+    #[cfg(feature = "jit")]
+    if std::env::var("PPC_BENCH_JIT").as_deref() == Ok("1") {
+        cpu.enable_jit(ppc::PpcJitConfig::default()).unwrap();
+    }
 
     let start = Instant::now();
     let result = cpu.run_with_imports(&mut memory, cycles, 0, 0, 0, |_, _, _| unreachable!());

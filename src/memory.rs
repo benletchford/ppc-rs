@@ -102,6 +102,52 @@ pub trait PpcMemory {
         None
     }
 
+    /// A value that stays the same only while every result of
+    /// [`Self::instruction_cache_token`] and
+    /// [`Self::global_instruction_cache_token`] stays the same.
+    ///
+    /// The JIT remembers which compiled blocks it validated under an epoch
+    /// and skips their token checks while the epoch is unchanged, so the
+    /// value must change whenever any token could, and must differ between
+    /// independent memories whose tokens could differ. `None` (the default)
+    /// means every dispatch checks tokens.
+    #[inline]
+    fn code_epoch(&self) -> Option<u64> {
+        None
+    }
+
+    /// Where [`Self::code_epoch`] is stored, if it is a plain `u64` (`0`
+    /// meaning `None`) that stays at this address, and is updated in place,
+    /// for as long as the memory is borrowed. Generated code then reads it
+    /// directly instead of calling [`Self::code_epoch`].
+    #[inline]
+    fn code_epoch_ptr(&self) -> Option<std::ptr::NonNull<u64>> {
+        None
+    }
+
+    /// Identity of the host pointers returned by [`Self::page_window`].
+    ///
+    /// Every pointer handed out stays valid, and keeps showing exactly the
+    /// bytes `read_u8` returns for its page, until this value changes. The
+    /// value must change whenever the mapping changes, and must differ
+    /// between independent memories (including clones), because the JIT
+    /// keeps windows across runs and discards them only when it sees a new
+    /// value. `None` (the default) disables page windows.
+    #[inline]
+    fn page_window_epoch(&self) -> Option<u64> {
+        None
+    }
+
+    /// Host address of the first byte of the 4 KiB page holding `addr`, when
+    /// every byte of that page is ordinary readable memory stored
+    /// contiguously at that address in guest (big-endian) byte order, and a
+    /// plain read of it is equivalent to [`Self::read_u8`]. See
+    /// [`Self::page_window_epoch`] for how long the pointer stays valid.
+    #[inline]
+    fn page_window(&mut self, _addr: u32) -> Option<std::ptr::NonNull<u8>> {
+        None
+    }
+
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -149,7 +195,7 @@ impl PpcMemory for NullMemory {
 /// the host via [`Self::add_readonly_region`]; writes to read-only
 /// regions return `None` and surface as a `MemoryFault` rather
 /// than silently mutating the shared backing store.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PpcSectionMem {
     regions: Vec<PpcMemRegion>,
     page_cache: Box<[Option<(u32, usize)>]>,
@@ -158,6 +204,25 @@ pub struct PpcSectionMem {
     instruction_cache: Box<[Option<(u32, u32)>]>,
     instruction_mapping_token: u64,
     has_overlapping_regions: bool,
+    /// [`PpcMemory::page_window_epoch`]: renewed by every mapping change and
+    /// by every clone, whose regions are new allocations. `0` disables
+    /// windows (token space exhausted).
+    window_epoch: u64,
+}
+
+impl Clone for PpcSectionMem {
+    fn clone(&self) -> Self {
+        Self {
+            regions: self.regions.clone(),
+            page_cache: self.page_cache.clone(),
+            overlap_span_cache: self.overlap_span_cache.clone(),
+            region_cache: self.region_cache,
+            instruction_cache: self.instruction_cache.clone(),
+            instruction_mapping_token: self.instruction_mapping_token,
+            has_overlapping_regions: self.has_overlapping_regions,
+            window_epoch: try_allocate_instruction_cache_token().unwrap_or(0),
+        }
+    }
 }
 
 /// Cached span inside a single mapped [`PpcSectionMem`] region.
@@ -222,6 +287,7 @@ impl Default for PpcSectionMem {
                 .into_boxed_slice(),
             instruction_mapping_token: 0,
             has_overlapping_regions: false,
+            window_epoch: 0,
         }
     }
 }
@@ -266,6 +332,7 @@ impl PpcSectionMem {
             writable,
         });
         self.clear_region_cache(instruction_mapping_token);
+        self.window_epoch = try_allocate_instruction_cache_token().unwrap_or(0);
     }
 
     /// Number of regions currently mapped.
@@ -799,6 +866,35 @@ impl PpcMemory for PpcSectionMem {
     #[inline]
     fn global_instruction_cache_token(&self) -> Option<u64> {
         (self.instruction_mapping_token != 0).then_some(self.instruction_mapping_token)
+    }
+
+    #[inline]
+    fn code_epoch(&self) -> Option<u64> {
+        // Every token this memory hands out is the mapping token, which
+        // changes with every mapping change.
+        self.global_instruction_cache_token()
+    }
+
+    #[inline]
+    fn page_window_epoch(&self) -> Option<u64> {
+        (self.window_epoch != 0).then_some(self.window_epoch)
+    }
+
+    fn page_window(&mut self, addr: u32) -> Option<std::ptr::NonNull<u8>> {
+        let page = addr & !((1 << PPC_SECTION_MEM_PAGE_SHIFT) - 1);
+        let page_end = u64::from(page) + (1 << PPC_SECTION_MEM_PAGE_SHIFT);
+        let (index, offset) = self.locate_cached(page)?;
+        if self.has_overlapping_regions {
+            let (_, end, _) = self.visible_region_span(index, page)?;
+            if u64::from(end) < page_end {
+                return None;
+            }
+        }
+        let region = &mut self.regions[index];
+        if region.bytes.len() - offset < 1 << PPC_SECTION_MEM_PAGE_SHIFT {
+            return None;
+        }
+        std::ptr::NonNull::new(region.bytes[offset..].as_mut_ptr())
     }
 
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {
