@@ -10,6 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::decode;
 
+// jitdump file and record layout, in bytes.
+const JITDUMP_MAGIC: u32 = 0x4a69_5444;
+const JITDUMP_VERSION: u32 = 1;
+const HEADER_SIZE: u32 = 40;
+const CODE_LOAD: u32 = 0;
+const CODE_DEBUG_INFO: u32 = 2;
+const DEBUG_INFO_HEADER_SIZE: usize = 32;
+const DEBUG_ENTRY_SIZE: usize = 16;
+const CODE_LOAD_HEADER_SIZE: usize = 56;
+const ELF_MACHINE_AARCH64: u32 = 183;
+const ELF_MACHINE_X86_64: u32 = 62;
+
 static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn block_name(pc: u32) -> String {
@@ -106,9 +118,9 @@ impl Writer {
 
     fn create(tier: &str) -> io::Result<Self> {
         let arch = if cfg!(target_arch = "aarch64") {
-            183
+            ELF_MACHINE_AARCH64
         } else if cfg!(target_arch = "x86_64") {
-            62
+            ELF_MACHINE_X86_64
         } else {
             return Err(io::Error::other("unsupported host architecture"));
         };
@@ -124,8 +136,8 @@ impl Writer {
             .write(true)
             .create_new(true)
             .open(&source_path)?;
-        let mut header = Vec::with_capacity(40);
-        for value in [0x4a69_5444, 1, 40, arch, 0, pid] {
+        let mut header = Vec::with_capacity(HEADER_SIZE as usize);
+        for value in [JITDUMP_MAGIC, JITDUMP_VERSION, HEADER_SIZE, arch, 0, pid] {
             push_u32(&mut header, value);
         }
         push_u64(&mut header, timestamp);
@@ -178,9 +190,10 @@ impl Writer {
         }
         self.source.write_all(listing.as_bytes())?;
 
-        let debug_size = 32 + locations.len() * (17 + self.source_path.len());
+        let debug_size = DEBUG_INFO_HEADER_SIZE
+            + locations.len() * (DEBUG_ENTRY_SIZE + self.source_path.len() + 1);
         let mut debug = Vec::with_capacity(debug_size);
-        push_u32(&mut debug, 2);
+        push_u32(&mut debug, CODE_DEBUG_INFO);
         push_u32(&mut debug, debug_size as u32);
         push_u64(&mut debug, timestamp);
         push_u64(&mut debug, address);
@@ -194,9 +207,9 @@ impl Writer {
         }
         self.file.write_all(&debug)?;
 
-        let total = 56 + name.len() + 1 + code.len();
+        let total = CODE_LOAD_HEADER_SIZE + name.len() + 1 + code.len();
         let mut record = Vec::with_capacity(total);
-        push_u32(&mut record, 0);
+        push_u32(&mut record, CODE_LOAD);
         push_u32(&mut record, total as u32);
         push_u64(&mut record, timestamp);
         push_u32(&mut record, self.pid);

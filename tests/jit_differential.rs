@@ -650,3 +650,72 @@ fn routines_sharing_an_interpreter_cache_slot_keep_their_regions() {
         "regions formed again: {long:?}"
     );
 }
+
+#[test]
+fn memory_remapping_during_a_native_block_matches_interpreter() {
+    use ppc::PpcMemory;
+
+    struct RemappingBus {
+        code: PpcSectionMem,
+        data: Box<[u8; 4096]>,
+    }
+    impl PpcMemory for RemappingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            if (DATA..DATA + 4096).contains(&addr) {
+                Some(self.data[(addr - DATA) as usize])
+            } else {
+                self.code.read_u8(addr)
+            }
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            if addr != DATA {
+                return None;
+            }
+            self.data = Box::new([value; 4096]);
+            Some(())
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.code.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.code.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.code.code_epoch()
+        }
+    }
+    let words = [
+        d_form(34, 3, 5, 0),
+        d_form(38, 4, 5, 0),
+        d_form(34, 6, 5, 0),
+        0x48000000,
+    ];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let run = |jit| {
+        let mut code_mem = PpcSectionMem::new();
+        code_mem.add_readonly_region(CODE, code.clone());
+        let mut mem = RemappingBus {
+            code: code_mem,
+            data: Box::new([1; 4096]),
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.pc = CODE;
+        cpu.gpr[4] = 7;
+        cpu.gpr[5] = DATA;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                background: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        cpu.run_with_imports(&mut mem, 3, 0, 0, 0, |_, _, _| unreachable!());
+        if jit {
+            assert!(cpu.jit_stats().block_runs > 0);
+        }
+        (cpu.gpr[3], cpu.gpr[6])
+    };
+    assert_eq!(run(false), (1, 7));
+    assert_eq!(run(true), run(false));
+}

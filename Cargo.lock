@@ -339,7 +339,6 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
- "cranelift-native",
  "ieee-apsqrt",
  "rustc_apfloat",
  "wasm-encoder",

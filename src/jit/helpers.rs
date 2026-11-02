@@ -5,7 +5,7 @@
 //! run. A stopping helper records the result in [`JitCtx`] and leaves
 //! `cpu.pc` at the faulting instruction, exactly like the interpreter.
 
-use super::{JitCtx, JitWindow, PAGE_SHIFT, WINDOW_ENTRIES, WINDOW_NONE, WINDOW_READ};
+use super::JitCtx;
 use crate::{
     ApDouble, ApRound, FPSCR_VXIDI, FPSCR_VXSOFT, FPSCR_VXZDZ, Float, FpBinaryOperation,
     PpcAlignmentPolicy, PpcCpu, PpcException, PpcMemoryAccess, PpcStepResult,
@@ -13,6 +13,22 @@ use crate::{
 
 pub(super) const FAULT_BIT: u32 = 32;
 const FAULT: u64 = 1 << FAULT_BIT;
+
+// Compact argument shared by floating-point helpers and the emitter.
+const FP_REGISTER_MASK: u32 = 31;
+const FP_A_SHIFT: u32 = 5;
+const FP_B_SHIFT: u32 = 10;
+const FP_OPERATION_SHIFT: u32 = 15;
+const FP_OPERATION_MASK: u32 = 3;
+const FP_RECORD_BIT: u32 = 1 << 17;
+
+pub(super) fn fp_fields(dest: u8, a: u8, b: u8, operation: u32, record: bool) -> u32 {
+    u32::from(dest)
+        | (u32::from(a) << FP_A_SHIFT)
+        | (u32::from(b) << FP_B_SHIFT)
+        | (operation << FP_OPERATION_SHIFT)
+        | if record { FP_RECORD_BIT } else { 0 }
+}
 
 /// Execute a decoded double-precision operation or ordered comparison.
 pub(super) extern "C" fn double_op(ctx: *mut JitCtx, fields: u32, pc: u32) -> u64 {
@@ -25,11 +41,11 @@ pub(super) extern "C" fn double_op(ctx: *mut JitCtx, fields: u32, pc: u32) -> u6
             PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
         );
     }
-    let dest = (fields & 31) as u8;
-    let a = cpu.fpr[((fields >> 5) & 31) as usize];
-    let b = cpu.fpr[((fields >> 10) & 31) as usize];
-    let rc = fields & (1 << 17) != 0;
-    match (fields >> 15) & 3 {
+    let dest = (fields & FP_REGISTER_MASK) as u8;
+    let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
+    let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
+    let rc = fields & FP_RECORD_BIT != 0;
+    match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
         0 => {
             if let Some(value) = cpu
                 .fast_convert_to_i32_toward_zero(b)
@@ -87,16 +103,16 @@ pub(super) extern "C" fn single_binary(ctx: *mut JitCtx, fields: u32, pc: u32) -
             PpcStepResult::Exception(PpcException::FloatingPointUnavailable),
         );
     }
-    let frt = (fields & 31) as u8;
-    let a = cpu.fpr[((fields >> 5) & 31) as usize];
-    let b = cpu.fpr[((fields >> 10) & 31) as usize];
-    let operation = match (fields >> 15) & 3 {
+    let frt = (fields & FP_REGISTER_MASK) as u8;
+    let a = cpu.fpr[((fields >> FP_A_SHIFT) & FP_REGISTER_MASK) as usize];
+    let b = cpu.fpr[((fields >> FP_B_SHIFT) & FP_REGISTER_MASK) as usize];
+    let operation = match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
         0 => FpBinaryOperation::Add,
         1 => FpBinaryOperation::Subtract,
         2 => FpBinaryOperation::Multiply,
         _ => FpBinaryOperation::Divide,
     };
-    let rc = fields & (1 << 17) != 0;
+    let rc = fields & FP_RECORD_BIT != 0;
     if matches!(operation, FpBinaryOperation::Divide) {
         cpu.execute_single_binary(frt, a, b, operation, rc);
     } else {
@@ -139,10 +155,7 @@ fn alignment(ctx: &mut JitCtx, pc: u32, ea: u32, size: u8, access: PpcMemoryAcce
     )
 }
 
-/// Run one instruction through the interpreter.
-///
-/// `cpu.pc` is set to `pc` first so the interpreter sees the same state it
-/// would have seen stepping the block itself.
+/// Interpret one instruction with `cpu.pc` set to its address.
 pub(super) extern "C" fn step(ctx: *mut JitCtx, word: u32, pc: u32) -> u64 {
     // SAFETY: generated code passes the context it was invoked with.
     let ctx = unsafe { &mut *ctx };
@@ -166,37 +179,6 @@ pub(super) extern "C" fn code_changed(ctx: *mut JitCtx) -> u64 {
     u64::from(mem.code_epoch().unwrap_or(0) != ctx.epoch)
 }
 
-/// After a load the generated fast path could not serve, record whether
-/// the page has a host window so the next access to it can be inline.
-#[inline]
-fn note_window(ctx: &mut JitCtx, ea: u32) {
-    if !ctx.windows_enabled {
-        return;
-    }
-    let page = ea & !((1 << PAGE_SHIFT) - 1);
-    // SAFETY: `windows` points at `WINDOW_ENTRIES` entries for the session.
-    let entry = unsafe {
-        &mut *ctx
-            .windows
-            .add((ea >> PAGE_SHIFT) as usize & (WINDOW_ENTRIES - 1))
-    };
-    if entry.tag == page | WINDOW_READ || entry.tag == page | WINDOW_NONE {
-        return;
-    }
-    // SAFETY: see `step`.
-    let mem = unsafe { &mut *ctx.mem };
-    *entry = match mem.page_window(ea) {
-        Some(base) => JitWindow {
-            tag: page | WINDOW_READ,
-            base: base.as_ptr() as usize,
-        },
-        None => JitWindow {
-            tag: page | WINDOW_NONE,
-            base: 0,
-        },
-    };
-}
-
 macro_rules! load_helper {
     ($name:ident, $size:expr, |$mem:ident, $ea:ident| $read:expr) => {
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, pc: u32) -> u64 {
@@ -207,10 +189,7 @@ macro_rules! load_helper {
                 return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Load);
             }
             match $read {
-                Some(value) => {
-                    note_window(ctx, $ea);
-                    u64::from(value)
-                }
+                Some(value) => u64::from(value),
                 None => stop(
                     ctx,
                     pc,

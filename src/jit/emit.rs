@@ -1,4 +1,4 @@
-//! CLIF generation for one basic block.
+//! CLIF generation for basic blocks and regions.
 //!
 //! Registers live in the `PpcCpu` struct; the block receives `(cpu, ctx)` and
 //! reads/writes them with plain loads and stores (write-through, with a small
@@ -8,7 +8,7 @@
 //! Bookkeeping the interpreter does per instruction is batched:
 //!
 //! * `time_base` is advanced once per run of inline instructions
-//!   (`pending`), flushed before any helper that reads it or at block exit.
+//!   (`pending_cycles`), flushed before any helper that reads it or at block exit.
 //! * `cpu.pc` is written only at block exit (or by helpers), tracked by
 //!   `pc_in_sync`.
 
@@ -25,6 +25,12 @@ use cranelift_frontend::FunctionBuilder;
 use super::helpers;
 use crate::{PpcCpu, PpcInstr, decode};
 
+// PowerPC branch-option bits (BO).
+const BO_IGNORE_CTR: u8 = 0x04;
+const BO_CTR_ZERO: u8 = 0x02;
+const BO_IGNORE_CONDITION: u8 = 0x10;
+const BO_CONDITION_TRUE: u8 = 0x08;
+
 const CA_MASK: u32 = 1 << 29;
 
 /// Address of a helper, for `Emitter::call`.
@@ -34,7 +40,6 @@ macro_rules! helper {
     };
 }
 
-/// Integer load widths, each with an inline page-window fast path.
 #[derive(Clone, Copy)]
 enum Load {
     Byte,
@@ -50,14 +55,6 @@ impl Load {
             Load::Half => helper!(lhz),
             Load::HalfAlgebraic => helper!(lha),
             Load::Word => helper!(lwz),
-        }
-    }
-
-    fn size(self) -> u32 {
-        match self {
-            Load::Byte => 1,
-            Load::Half | Load::HalfAlgebraic => 2,
-            Load::Word => 4,
         }
     }
 }
@@ -89,25 +86,23 @@ struct Emitter<'a, 'f> {
     b: &'a mut FunctionBuilder<'f>,
     cpu: Value,
     ctx: Value,
-    windows: Value,
     ptr: Type,
     sig3: SigRef,
     sig4: SigRef,
     sig1: SigRef,
     gpr: [Option<Value>; 32],
     special: [Option<Value>; 4],
-    pending: u32,
+    pending_cycles: u32,
     pc_in_sync: bool,
     /// `cpu.pc` as last written by a branch in this block, if any.
     next_pc: Option<Value>,
     /// Instructions completed by earlier blocks of the region.
     done: Value,
-    /// Whether this block may have written guest memory.
     may_write: bool,
     fault: Block,
     normal_exit: Block,
-    /// Cold fault exits: `(block, pending, index in block, done)`.
-    tramps: Vec<(Block, u32, u32, Value)>,
+    /// `(exit block, pending cycles, instruction index, prior completed count)`.
+    fault_exits: Vec<(Block, u32, u32, Value)>,
 }
 
 /// One block of a region: its guest code and the region blocks it may be
@@ -168,12 +163,6 @@ pub(super) fn build_region(
     };
     let (sig1, sig3, sig4) = (sig(1), sig(3), sig(4));
 
-    let windows = b.ins().load(
-        ptr,
-        MemFlags::trusted(),
-        ctx,
-        std::mem::offset_of!(super::JitCtx, windows) as i32,
-    );
     let has_edges = blocks.iter().any(|block| !block.successors.is_empty());
     let budget = has_edges.then(|| {
         b.ins().load(
@@ -208,21 +197,20 @@ pub(super) fn build_region(
         b,
         cpu,
         ctx,
-        windows,
         ptr,
         sig3,
         sig4,
         sig1,
         gpr: [None; 32],
         special: [None; 4],
-        pending: 0,
+        pending_cycles: 0,
         pc_in_sync: true,
         next_pc: None,
         done: zero,
         may_write: false,
         fault,
         normal_exit,
-        tramps: Vec::new(),
+        fault_exits: Vec::new(),
     };
     let mut line = 1;
     for (index, block) in blocks.iter().enumerate() {
@@ -231,7 +219,7 @@ pub(super) fn build_region(
             e.done = e.b.block_params(head)[0];
         }
         e.invalidate();
-        e.pending = 0;
+        e.pending_cycles = 0;
         e.pc_in_sync = true;
         e.next_pc = None;
         e.may_write = false;
@@ -327,7 +315,7 @@ impl Emitter<'_, '_> {
     }
 
     fn flush_time_base(&mut self) {
-        if self.pending == 0 {
+        if self.pending_cycles == 0 {
             return;
         }
         let offset = offset_of!(PpcCpu, time_base) as i32;
@@ -335,9 +323,12 @@ impl Emitter<'_, '_> {
             .b
             .ins()
             .load(types::I64, Self::flags(), self.cpu, offset);
-        let next = self.b.ins().iadd_imm(current, i64::from(self.pending));
+        let next = self
+            .b
+            .ins()
+            .iadd_imm(current, i64::from(self.pending_cycles));
         self.b.ins().store(Self::flags(), next, self.cpu, offset);
-        self.pending = 0;
+        self.pending_cycles = 0;
     }
 
     fn call(&mut self, helper: usize, four: bool, args: &[Value]) -> Value {
@@ -350,15 +341,15 @@ impl Emitter<'_, '_> {
         self.b.inst_results(call)[0]
     }
 
-    /// Branch to a cold exit if the helper reported a fault. `pending` inline
-    /// instructions still owe their time-base increment on that path.
+    /// Branch to a cold fault exit, flushing pending time-base increments there.
     fn check_fault(&mut self, result: Value, index: u32) {
         let tramp = self.b.create_block();
         self.b.set_cold_block(tramp);
         let next = self.b.create_block();
         let faulted = self.b.ins().ushr_imm(result, i64::from(helpers::FAULT_BIT));
         self.b.ins().brif(faulted, tramp, &[], next, &[]);
-        self.tramps.push((tramp, self.pending, index, self.done));
+        self.fault_exits
+            .push((tramp, self.pending_cycles, index, self.done));
         self.b.switch_to_block(next);
     }
 
@@ -397,35 +388,8 @@ impl Emitter<'_, '_> {
         });
         let exit = self.b.create_block();
         if self.may_write {
-            // A store may have changed code later blocks were built from:
-            // compare the code epoch with the one the region was entered
-            // under, read in place when the memory allows.
-            let epoch_ptr = self.b.ins().load(
-                self.ptr,
-                Self::flags(),
-                self.ctx,
-                offset_of!(super::JitCtx, epoch_ptr) as i32,
-            );
-            let (direct, indirect, same) = (
-                self.b.create_block(),
-                self.b.create_block(),
-                self.b.create_block(),
-            );
-            self.b.set_cold_block(indirect);
-            self.b.ins().brif(epoch_ptr, direct, &[], indirect, &[]);
-
-            self.b.switch_to_block(direct);
-            let now = self.b.ins().load(types::I64, MemFlags::new(), epoch_ptr, 0);
-            let entered = self.b.ins().load(
-                types::I64,
-                Self::flags(),
-                self.ctx,
-                offset_of!(super::JitCtx, epoch) as i32,
-            );
-            let changed = self.b.ins().icmp(IntCC::NotEqual, now, entered);
-            self.b.ins().brif(changed, exit, &[], same, &[]);
-
-            self.b.switch_to_block(indirect);
+            // A callback may have changed code later blocks were built from.
+            let same = self.b.create_block();
             let callee = self
                 .b
                 .ins()
@@ -466,9 +430,9 @@ impl Emitter<'_, '_> {
         self.b.switch_to_block(self.normal_exit);
         let completed = self.b.block_params(self.normal_exit)[0];
         self.b.ins().return_(&[completed]);
-        for (tramp, pending, index, done) in std::mem::take(&mut self.tramps) {
+        for (tramp, pending_cycles, index, done) in std::mem::take(&mut self.fault_exits) {
             self.b.switch_to_block(tramp);
-            self.pending = pending;
+            self.pending_cycles = pending_cycles;
             self.flush_time_base();
             let completed = self.b.ins().iadd_imm(done, i64::from(index));
             self.b.ins().jump(self.fault, &[BlockArg::Value(completed)]);
@@ -556,22 +520,22 @@ impl Emitter<'_, '_> {
     /// `evaluate_branch_condition` including the CTR side effect.
     fn branch_taken(&mut self, bo: u8, bi: u8) -> Option<Value> {
         let mut taken: Option<Value> = None;
-        if bo & 0x04 == 0 {
+        if bo & BO_IGNORE_CTR == 0 {
             let ctr = self.sp(Special::Ctr);
             let decremented = self.b.ins().iadd_imm(ctr, -1);
             self.set_sp(Special::Ctr, decremented);
-            let cc = if bo & 0x02 != 0 {
+            let cc = if bo & BO_CTR_ZERO != 0 {
                 IntCC::Equal
             } else {
                 IntCC::NotEqual
             };
             taken = Some(self.b.ins().icmp_imm(cc, decremented, 0));
         }
-        if bo & 0x10 == 0 {
+        if bo & BO_IGNORE_CONDITION == 0 {
             let cr = self.sp(Special::Cr);
             let shifted = self.b.ins().ushr_imm(cr, i64::from(31 - u32::from(bi)));
             let bit = self.b.ins().band_imm(shifted, 1);
-            let cc = if bo & 0x08 != 0 {
+            let cc = if bo & BO_CONDITION_TRUE != 0 {
                 IntCC::NotEqual
             } else {
                 IntCC::Equal
@@ -602,85 +566,11 @@ impl Emitter<'_, '_> {
 
     // ---- memory ---------------------------------------------------------
 
-    /// An integer load: inline through the page window when the page has
-    /// one and the access is aligned, otherwise through the helper (which
-    /// also fills the window for the next access).
     fn load(&mut self, kind: Load, index: u32, pc: u32, rt: u8, ea: Value) {
-        let size = kind.size();
-        let fast = self.b.create_block();
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I32);
-        self.b.set_cold_block(slow);
-
-        // tag check: page base | READ, keeping the alignment bits so that
-        // a misaligned access never matches.
-        let index_value = self.b.ins().ushr_imm(ea, i64::from(super::PAGE_SHIFT));
-        let index_value = self
-            .b
-            .ins()
-            .band_imm(index_value, (super::WINDOW_ENTRIES - 1) as i64);
-        let index_value = self.b.ins().uextend(self.ptr, index_value);
-        let entry_size = std::mem::size_of::<super::JitWindow>() as i64;
-        let offset = self.b.ins().imul_imm(index_value, entry_size);
-        let entry = self.b.ins().iadd(self.windows, offset);
-        let tag = self.b.ins().load(
-            types::I32,
-            Self::flags(),
-            entry,
-            std::mem::offset_of!(super::JitWindow, tag) as i32,
-        );
-        let page_mask = !((1u32 << super::PAGE_SHIFT) - 1) | (size - 1);
-        let key = self.b.ins().band_imm(ea, i64::from(page_mask as i32));
-        let key = self.b.ins().bor_imm(key, i64::from(super::WINDOW_READ));
-        let hit = self.b.ins().icmp(IntCC::Equal, tag, key);
-        self.b.ins().brif(hit, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
-        let base = self.b.ins().load(
-            self.ptr,
-            Self::flags(),
-            entry,
-            std::mem::offset_of!(super::JitWindow, base) as i32,
-        );
-        let in_page = self
-            .b
-            .ins()
-            .band_imm(ea, i64::from((1u32 << super::PAGE_SHIFT) - 1));
-        let in_page = self.b.ins().uextend(self.ptr, in_page);
-        let host = self.b.ins().iadd(base, in_page);
-        // Host bytes may be unaligned; the load cannot trap.
-        let flags = MemFlags::new().with_notrap();
-        let value = match kind {
-            Load::Byte => {
-                let byte = self.b.ins().load(types::I8, flags, host, 0);
-                self.b.ins().uextend(types::I32, byte)
-            }
-            Load::Half | Load::HalfAlgebraic => {
-                let half = self.b.ins().load(types::I16, flags, host, 0);
-                let half = self.b.ins().bswap(half);
-                if matches!(kind, Load::Half) {
-                    self.b.ins().uextend(types::I32, half)
-                } else {
-                    self.b.ins().sextend(types::I32, half)
-                }
-            }
-            Load::Word => {
-                let word = self.b.ins().load(types::I32, flags, host, 0);
-                self.b.ins().bswap(word)
-            }
-        };
-        self.b.ins().jump(done, &[BlockArg::Value(value)]);
-
-        self.b.switch_to_block(slow);
         let pc_value = self.c32(pc);
         let result = self.call(kind.helper(), false, &[ea, pc_value]);
         self.check_fault(result, index);
         let value = self.b.ins().ireduce(types::I32, result);
-        self.b.ins().jump(done, &[BlockArg::Value(value)]);
-
-        self.b.switch_to_block(done);
-        let value = self.b.block_params(done)[0];
         self.set(rt, value);
     }
 
@@ -701,11 +591,7 @@ impl Emitter<'_, '_> {
 
     #[allow(clippy::too_many_arguments)]
     fn double_op(&mut self, index: u32, pc: u32, dest: u8, fra: u8, frb: u8, op: u32, rc: bool) {
-        let fields = u32::from(dest)
-            | (u32::from(fra) << 5)
-            | (u32::from(frb) << 10)
-            | (op << 15)
-            | (u32::from(rc) << 17);
+        let fields = helpers::fp_fields(dest, fra, frb, op, rc);
         let fields = self.c32(fields);
         let pc = self.c32(pc);
         let result = self.call(helper!(double_op), false, &[fields, pc]);
@@ -773,7 +659,7 @@ impl Emitter<'_, '_> {
             PpcInstr::Mfspr { spr, .. } | PpcInstr::Mtspr { spr, .. } => {
                 matches!(spr, 1 | 8 | 9)
             }
-            PpcInstr::Bcctr { bo, .. } => bo & 0x04 != 0,
+            PpcInstr::Bcctr { bo, .. } => bo & BO_IGNORE_CTR != 0,
             PpcInstr::Lmw { rt, ra, .. } => ra < rt,
             PpcInstr::Lbzu { rt, ra, .. }
             | PpcInstr::Lhzu { rt, ra, .. }
@@ -907,11 +793,7 @@ impl Emitter<'_, '_> {
                     PpcInstr::Fmuls { .. } => 2,
                     _ => 3,
                 };
-                let fields = u32::from(frt)
-                    | (u32::from(fra) << 5)
-                    | (u32::from(frb) << 10)
-                    | (op << 15)
-                    | (u32::from(rc) << 17);
+                let fields = helpers::fp_fields(frt, fra, frb, op, rc);
                 let fields = self.c32(fields);
                 let pc_value = self.c32(pc);
                 let result = self.call(helper!(single_binary), false, &[fields, pc_value]);
@@ -1338,32 +1220,32 @@ impl Emitter<'_, '_> {
             }
             PpcInstr::Stw { rs, ra, d } => {
                 let (ea, value) = (self.d_ea(ra, d), self.get(rs));
-                self.store(helpers::stw as *const () as usize, index, pc, ea, value);
+                self.store(helper!(stw), index, pc, ea, value);
             }
             PpcInstr::Stb { rs, ra, d } => {
                 let (ea, value) = (self.d_ea(ra, d), self.get(rs));
-                self.store(helpers::stb as *const () as usize, index, pc, ea, value);
+                self.store(helper!(stb), index, pc, ea, value);
             }
             PpcInstr::Sth { rs, ra, d } => {
                 let (ea, value) = (self.d_ea(ra, d), self.get(rs));
-                self.store(helpers::sth as *const () as usize, index, pc, ea, value);
+                self.store(helper!(sth), index, pc, ea, value);
             }
             PpcInstr::Stwx { rs, ra, rb } => {
                 let (ea, value) = (self.x_ea(ra, rb), self.get(rs));
-                self.store(helpers::stw as *const () as usize, index, pc, ea, value);
+                self.store(helper!(stw), index, pc, ea, value);
             }
             PpcInstr::Stbx { rs, ra, rb } => {
                 let (ea, value) = (self.x_ea(ra, rb), self.get(rs));
-                self.store(helpers::stb as *const () as usize, index, pc, ea, value);
+                self.store(helper!(stb), index, pc, ea, value);
             }
             PpcInstr::Sthx { rs, ra, rb } => {
                 let (ea, value) = (self.x_ea(ra, rb), self.get(rs));
-                self.store(helpers::sth as *const () as usize, index, pc, ea, value);
+                self.store(helper!(sth), index, pc, ea, value);
             }
             PpcInstr::Stwu { rs, ra, d } => {
                 let ea = self.d_ea(ra, d);
                 let value = self.get(rs);
-                self.store(helpers::stw as *const () as usize, index, pc, ea, value);
+                self.store(helper!(stw), index, pc, ea, value);
                 // RA is updated only once the store has succeeded.
                 self.set(ra, ea);
             }
@@ -1457,7 +1339,7 @@ impl Emitter<'_, '_> {
             }
             _ => unreachable!("filtered by `inline`"),
         }
-        self.pending += 1;
+        self.pending_cycles += 1;
         if is_branch {
             // `finish_branch` already wrote `cpu.pc`.
         } else {

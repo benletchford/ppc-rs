@@ -29,7 +29,10 @@ pub(crate) enum Event {
     TokenAdopted,
 }
 
-const NAMES: [&str; 12] = [
+const EVENT_COUNT: usize = Event::TokenAdopted as usize + 1;
+const MAX_REPORTED_ROOTS: usize = 12;
+
+const NAMES: [&str; EVENT_COUNT] = [
     "form-attempt",
     "form-root-stale",
     "form-no-edges",
@@ -44,7 +47,7 @@ const NAMES: [&str; 12] = [
     "token-adopted",
 ];
 
-static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static COUNTS: [AtomicU64; EVENT_COUNT] = [const { AtomicU64::new(0) }; EVENT_COUNT];
 static ROOTS: LazyLock<Mutex<HashMap<u32, u64>>> = LazyLock::new(Default::default);
 static STALE_ROOTS: LazyLock<Mutex<HashMap<u32, u64>>> = LazyLock::new(Default::default);
 
@@ -113,7 +116,7 @@ fn print() {
         let all = std::mem::take(&mut *map.lock().unwrap_or_else(|poison| poison.into_inner()));
         let mut top: Vec<(u32, u64)> = all.into_iter().filter(|&(_, n)| n >= min).collect();
         top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-        top.truncate(12);
+        top.truncate(MAX_REPORTED_ROOTS);
         top
     };
     for (pc, n) in top(&ROOTS, 2) {

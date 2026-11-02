@@ -24,14 +24,13 @@ exclude = [
 
 [features]
 trace-wasm = ["dep:wasm-encoder"]
-# Experimental Cranelift baseline JIT. Contains `unsafe` code; the rest of the
+# Cranelift baseline JIT. Contains `unsafe` code; the rest of the
 # crate remains safe.
 jit = [
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",
     "dep:cranelift-jit",
     "dep:cranelift-module",
-    "dep:cranelift-native",
 ]
 
 [dependencies]
@@ -41,7 +40,6 @@ cranelift-codegen = { version = "=0.132.0", optional = true }
 cranelift-frontend = { version = "=0.132.0", optional = true }
 cranelift-jit = { version = "=0.132.0", optional = true }
 cranelift-module = { version = "=0.132.0", optional = true }
-cranelift-native = { version = "=0.132.0", optional = true }
 
 [dev-dependencies]
 ieee-apsqrt = "0.1.1"

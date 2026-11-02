@@ -116,38 +116,6 @@ pub trait PpcMemory {
         None
     }
 
-    /// Where [`Self::code_epoch`] is stored, if it is a plain `u64` (`0`
-    /// meaning `None`) that stays at this address, and is updated in place,
-    /// for as long as the memory is borrowed. Generated code then reads it
-    /// directly instead of calling [`Self::code_epoch`].
-    #[inline]
-    fn code_epoch_ptr(&self) -> Option<std::ptr::NonNull<u64>> {
-        None
-    }
-
-    /// Identity of the host pointers returned by [`Self::page_window`].
-    ///
-    /// Every pointer handed out stays valid, and keeps showing exactly the
-    /// bytes `read_u8` returns for its page, until this value changes. The
-    /// value must change whenever the mapping changes, and must differ
-    /// between independent memories (including clones), because the JIT
-    /// keeps windows across runs and discards them only when it sees a new
-    /// value. `None` (the default) disables page windows.
-    #[inline]
-    fn page_window_epoch(&self) -> Option<u64> {
-        None
-    }
-
-    /// Host address of the first byte of the 4 KiB page holding `addr`, when
-    /// every byte of that page is ordinary readable memory stored
-    /// contiguously at that address in guest (big-endian) byte order, and a
-    /// plain read of it is equivalent to [`Self::read_u8`]. See
-    /// [`Self::page_window_epoch`] for how long the pointer stays valid.
-    #[inline]
-    fn page_window(&mut self, _addr: u32) -> Option<std::ptr::NonNull<u8>> {
-        None
-    }
-
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -195,7 +163,7 @@ impl PpcMemory for NullMemory {
 /// the host via [`Self::add_readonly_region`]; writes to read-only
 /// regions return `None` and surface as a `MemoryFault` rather
 /// than silently mutating the shared backing store.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PpcSectionMem {
     regions: Vec<PpcMemRegion>,
     page_cache: Box<[Option<(u32, usize)>]>,
@@ -204,25 +172,6 @@ pub struct PpcSectionMem {
     instruction_cache: Box<[Option<(u32, u32)>]>,
     instruction_mapping_token: u64,
     has_overlapping_regions: bool,
-    /// [`PpcMemory::page_window_epoch`]: renewed by every mapping change and
-    /// by every clone, whose regions are new allocations. `0` disables
-    /// windows (token space exhausted).
-    window_epoch: u64,
-}
-
-impl Clone for PpcSectionMem {
-    fn clone(&self) -> Self {
-        Self {
-            regions: self.regions.clone(),
-            page_cache: self.page_cache.clone(),
-            overlap_span_cache: self.overlap_span_cache.clone(),
-            region_cache: self.region_cache,
-            instruction_cache: self.instruction_cache.clone(),
-            instruction_mapping_token: self.instruction_mapping_token,
-            has_overlapping_regions: self.has_overlapping_regions,
-            window_epoch: try_allocate_instruction_cache_token().unwrap_or(0),
-        }
-    }
 }
 
 /// Cached span inside a single mapped [`PpcSectionMem`] region.
@@ -287,7 +236,6 @@ impl Default for PpcSectionMem {
                 .into_boxed_slice(),
             instruction_mapping_token: 0,
             has_overlapping_regions: false,
-            window_epoch: 0,
         }
     }
 }
@@ -332,7 +280,6 @@ impl PpcSectionMem {
             writable,
         });
         self.clear_region_cache(instruction_mapping_token);
-        self.window_epoch = try_allocate_instruction_cache_token().unwrap_or(0);
     }
 
     /// Number of regions currently mapped.
@@ -875,28 +822,6 @@ impl PpcMemory for PpcSectionMem {
         self.global_instruction_cache_token()
     }
 
-    #[inline]
-    fn page_window_epoch(&self) -> Option<u64> {
-        (self.window_epoch != 0).then_some(self.window_epoch)
-    }
-
-    fn page_window(&mut self, addr: u32) -> Option<std::ptr::NonNull<u8>> {
-        let page = addr & !((1 << PPC_SECTION_MEM_PAGE_SHIFT) - 1);
-        let page_end = u64::from(page) + (1 << PPC_SECTION_MEM_PAGE_SHIFT);
-        let (index, offset) = self.locate_cached(page)?;
-        if self.has_overlapping_regions {
-            let (_, end, _) = self.visible_region_span(index, page)?;
-            if u64::from(end) < page_end {
-                return None;
-            }
-        }
-        let region = &mut self.regions[index];
-        if region.bytes.len() - offset < 1 << PPC_SECTION_MEM_PAGE_SHIFT {
-            return None;
-        }
-        std::ptr::NonNull::new(region.bytes[offset..].as_mut_ptr())
-    }
-
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {
         if let Some(value) = self.read_same_region_u64(addr) {
             return Some(value);
@@ -938,114 +863,4 @@ impl PpcMemory for PpcSectionMem {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[test]
-    fn bulk_read_follows_visible_regions_across_overlays_and_gaps() {
-        let mut mem = PpcSectionMem::new();
-        mem.add_region(0x1000, vec![0, 1, 2, 3, 4, 5]);
-        mem.add_region(0x1003, vec![30, 31]);
-
-        let mut bytes = [0; 6];
-        assert_eq!(mem.read_bytes_into(0x1000, &mut bytes), Some(()));
-        assert_eq!(bytes, [0, 1, 2, 30, 31, 5]);
-
-        let mut across_gap = [0xff; 4];
-        assert_eq!(mem.read_bytes_into(0x1004, &mut across_gap), None);
-        assert_eq!(across_gap, [31, 5, 0xff, 0xff]);
-
-        mem.add_region(0x1006, vec![6, 7]);
-        let mut adjacent = [0; 8];
-        assert_eq!(mem.read_bytes_into(0x1000, &mut adjacent), Some(()));
-        assert_eq!(adjacent, [0, 1, 2, 30, 31, 5, 6, 7]);
-    }
-
-    #[test]
-    fn bulk_read_preserves_wrapping_at_the_address_space_limit() {
-        let mut mem = PpcSectionMem::new();
-        mem.add_region(0x1000, vec![1, 2]);
-        mem.add_region(0x1001, vec![3]);
-        mem.add_region(u32::MAX, vec![0xaa]);
-        mem.add_region(0, vec![0xbb]);
-
-        let mut bytes = [0; 2];
-        assert_eq!(mem.read_bytes_into(u32::MAX, &mut bytes), Some(()));
-        assert_eq!(bytes, [0xaa, 0xbb]);
-    }
-
-    #[test]
-    fn readable_bytes_admits_only_one_visible_region() {
-        let mut mem = PpcSectionMem::new();
-        mem.add_readonly_region(0x1000, vec![0, 1, 2, 3]);
-        mem.add_region(0x1004, vec![4, 5, 6, 7]);
-
-        assert_eq!(mem.readable_bytes(0x1001, 3), Some(&[1, 2, 3][..]));
-        assert_eq!(mem.readable_bytes(0x1004, 4), Some(&[4, 5, 6, 7][..]));
-        assert_eq!(mem.readable_bytes(0x1003, 2), None);
-        assert_eq!(mem.readable_bytes(0x1008, 1), None);
-        assert_eq!(mem.readable_bytes(0x1000, 0), Some(&[][..]));
-
-        mem.add_region(0x1002, vec![20, 21, 22]);
-        assert_eq!(mem.readable_bytes(0x1000, 2), Some(&[0, 1][..]));
-        assert_eq!(mem.readable_bytes(0x1001, 2), None);
-        assert_eq!(mem.readable_bytes(0x1002, 3), Some(&[20, 21, 22][..]));
-        assert_eq!(mem.readable_bytes(0x1004, 2), None);
-        assert_eq!(mem.readable_bytes(0x1005, 3), Some(&[5, 6, 7][..]));
-    }
-
-    #[test]
-    fn readable_bytes_declines_wrapping_range_and_uses_new_mapping() {
-        let mut mem = PpcSectionMem::new();
-        mem.add_region(0x2000, vec![1, 2, 3, 4]);
-        assert_eq!(mem.readable_bytes(0x2000, 4), Some(&[1, 2, 3, 4][..]));
-        mem.add_readonly_region(0x2000, vec![9, 8, 7, 6]);
-        assert_eq!(mem.readable_bytes(0x2000, 4), Some(&[9, 8, 7, 6][..]));
-
-        mem.add_region(u32::MAX, vec![0xaa]);
-        assert_eq!(mem.read_u8(u32::MAX), Some(0xaa));
-        assert_eq!(mem.readable_bytes(u32::MAX, 1), None);
-    }
-
-    #[test]
-    fn public_instruction_tokens_share_one_non_reusing_namespace() {
-        let first = try_allocate_instruction_cache_token().expect("first token");
-        let second = try_allocate_instruction_cache_token().expect("second token");
-        let mut mem = PpcSectionMem::new();
-        mem.add_readonly_region(0x1000, 0x6000_0000u32.to_be_bytes().to_vec());
-        let mapping = mem.instruction_cache_token(0x1000).expect("mapping token");
-
-        assert_ne!(first, second);
-        assert_ne!(first, mapping);
-        assert_ne!(second, mapping);
-    }
-
-    #[test]
-    fn exhausted_instruction_token_allocation_cannot_mutate_a_mapping() {
-        let mut mem = PpcSectionMem::new();
-        let available = AtomicU64::new(42);
-        mem.add_mapped_region(
-            0x1000,
-            0x6000_0000u32.to_be_bytes().to_vec(),
-            false,
-            &available,
-        );
-        let exhausted = AtomicU64::new(u64::MAX);
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            mem.add_mapped_region(
-                0x1000,
-                0x4E80_0020u32.to_be_bytes().to_vec(),
-                false,
-                &exhausted,
-            );
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(mem.region_count(), 1);
-        assert_eq!(mem.read_instruction_u32_be(0x1000), Some(0x6000_0000));
-        assert_eq!(mem.instruction_cache_token(0x1000), Some(42));
-        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
-    }
-}
+mod tests;
