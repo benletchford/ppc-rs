@@ -667,6 +667,7 @@ fn memory_remapping_during_a_native_block_matches_interpreter() {
                 self.code.read_u8(addr)
             }
         }
+        #[allow(clippy::replace_box)] // Replacing the allocation simulates memory remapping.
         fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
             if addr != DATA {
                 return None;
