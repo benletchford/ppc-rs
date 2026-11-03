@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.3...ppc-v0.8.0) (2026-11-03)
+
+
+### Features
+
+* **jit:** add Cranelift baseline JIT ([6456165](https://github.com/benletchford/ppc-rs/commit/645616522f251709a35a17a87ec7335a9f40546f))
+
 ## [0.7.3](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.2...ppc-v0.7.3) (2026-10-30)
 
 
