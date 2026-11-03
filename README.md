@@ -1,6 +1,6 @@
 # ppc-rs
 
-A safe, pure Rust 32-bit PowerPC user-mode CPU interpreter.
+A pure Rust 32-bit PowerPC user-mode CPU interpreter.
 
 An architecture-only core for high-level emulation (HLE), executable analysis,
 and other hosts that provide their own memory map, loader, and operating-system
@@ -20,6 +20,53 @@ services.
 - **Host-controlled alignment**: strict architectural traps by default, with optional unaligned data-access emulation for operating systems that provide fixups
 - **Ready-made memory bus**: `PpcSectionMem` maps arbitrary read-only and writable guest regions, including deliberate overlays
 - **Deterministic software floating point**: scalar arithmetic honors FPSCR rounding and exception status without relying on the host FPU mode
+
+## Optional native JIT
+
+Enable the `jit` Cargo feature to compile frequently executed basic blocks and
+hot regions with Cranelift:
+
+```toml
+ppc = { version = "0.7", features = ["jit"] }
+```
+
+```rust
+# #[cfg(feature = "jit")]
+# fn enable(cpu: &mut ppc::PpcCpu) -> Result<(), String> {
+cpu.enable_jit(ppc::PpcJitConfig::default())?;
+# Ok(())
+# }
+```
+
+The JIT targets native hosts supported by Cranelift, including x86-64 and
+AArch64. `enable_jit` returns an error if the host backend is unavailable.
+On WebAssembly, the feature remains available for dependency feature unification,
+but brings in no Cranelift dependencies and `enable_jit` returns an error;
+execution continues through the interpreter.
+
+Compilation runs in the background by default. Unsupported guest instructions
+use interpreter helpers. Call `disable_jit()` to return to interpreter execution,
+and `jit_stats()` to inspect compilation and execution counters.
+
+`PpcJitConfig::default()` reads these environment variables; explicit config
+fields override those defaults:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `PPC_JIT_THRESHOLD` | `8` | Interpreter runs before compiling a block; `0` compiles on first execution |
+| `PPC_JIT_HOT_THRESHOLD` | `1000` | Edge observations before compiling a hot region; `off` disables regions |
+| `PPC_JIT_SYNC` | unset | Set to `1` to compile on the CPU thread |
+| `PPC_JIT_VERIFY` | unset | Set to `1` to verify generated Cranelift IR |
+| `PPC_JIT_JITDUMP` | unset | Set to `1` to write baseline/hot jitdump files and guest `.ppc` listings to the temporary directory for samply/perf |
+| `PPC_JIT_STATS` | unset | Set to `1` before first enabling JIT to print periodic process-wide diagnostics; independent of config fields |
+
+With unwinding enabled, panics in host memory callbacks propagate to the caller:
+the JIT catches them inside its Rust helpers, exits generated code normally, and
+resumes the original panic. It does not retry the instruction or roll back CPU or
+memory side effects. `panic = "abort"` retains its usual process-abort behavior.
+
+Hot-region symbols use the `IonIC:` prefix as a samply categorization workaround,
+so hot regions and baseline blocks appear in different profiler categories.
 
 ## Quick Start
 

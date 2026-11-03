@@ -102,6 +102,20 @@ pub trait PpcMemory {
         None
     }
 
+    /// A value that stays the same only while every result of
+    /// [`Self::instruction_cache_token`] and
+    /// [`Self::global_instruction_cache_token`] stays the same.
+    ///
+    /// The JIT remembers which compiled blocks it validated under an epoch
+    /// and skips their token checks while the epoch is unchanged, so the
+    /// value must change whenever any token could, and must differ between
+    /// independent memories whose tokens could differ. `None` (the default)
+    /// means every dispatch checks tokens.
+    #[inline]
+    fn code_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -799,6 +813,13 @@ impl PpcMemory for PpcSectionMem {
     #[inline]
     fn global_instruction_cache_token(&self) -> Option<u64> {
         (self.instruction_mapping_token != 0).then_some(self.instruction_mapping_token)
+    }
+
+    #[inline]
+    fn code_epoch(&self) -> Option<u64> {
+        // Every token this memory hands out is the mapping token, which
+        // changes with every mapping change.
+        self.global_instruction_cache_token()
     }
 
     fn read_u64_be(&mut self, addr: u32) -> Option<u64> {

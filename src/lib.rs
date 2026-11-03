@@ -89,6 +89,9 @@ impl PpcCachedWordCopy {
     }
 }
 
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+use jit::runtime::{PpcJitEntry, PpcJitLimits};
+
 #[derive(Debug, Clone)]
 struct PpcBasicBlockCacheEntry {
     start_pc: u32,
@@ -496,6 +499,23 @@ pub struct PpcCpu {
     decode_cache: Box<[PpcDecodeCacheEntry]>,
 
     basic_block_cache: Box<[Option<PpcBasicBlockCacheEntry>]>,
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit: Option<std::sync::Arc<jit::JitShared>>,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_stats: PpcJitStats,
+    /// Allocated while the JIT is enabled.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_table: Box<[PpcJitEntry]>,
+    /// JIT table indices whose region is compiling in the background.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_pending_regions: Vec<usize>,
+    /// [`jit::JitShared::finished`] when `jit_pending_regions` was last polled.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_finished_seen: usize,
+    /// Links made under another generation are ignored.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_link_gen: u32,
 }
 
 /// How a native import callback should finalize GPR3 when it
@@ -568,6 +588,18 @@ impl PpcCpu {
             import_call_stack: Vec::new(),
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit: None,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_stats: PpcJitStats::default(),
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_table: Box::default(),
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_pending_regions: Vec::new(),
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_finished_seen: 0,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_link_gen: 0,
         }
     }
 
@@ -3096,6 +3128,35 @@ impl PpcCpu {
         true
     }
 
+    /// The software (rustc_apfloat) implementation of the single-precision
+    /// binary operations.
+    fn single_binary_reference(
+        &mut self,
+        frt: u8,
+        a_bits: u64,
+        b_bits: u64,
+        operation: FpBinaryOperation,
+        rc: bool,
+    ) {
+        let (mut result, truncated) = self.fp_binary_single(a_bits, b_bits, operation);
+        let default = match operation {
+            FpBinaryOperation::Add | FpBinaryOperation::Subtract => FPSCR_VXISI,
+            FpBinaryOperation::Multiply => FPSCR_VXIMZ,
+            FpBinaryOperation::Divide => {
+                if Self::fp_is_zero(a_bits) && Self::fp_is_zero(b_bits) {
+                    FPSCR_VXZDZ
+                } else if Self::fp_is_infinite(a_bits) && Self::fp_is_infinite(b_bits) {
+                    FPSCR_VXIDI
+                } else {
+                    FPSCR_VXSOFT
+                }
+            }
+        };
+        let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
+        let adjusted = self.fp_adjusted_binary_result(a_bits, b_bits, operation, true, &mut result);
+        self.finish_ap_single_result_adjusted(frt, result, truncated, adjusted, invalid, rc);
+    }
+
     fn fp_single_bits(&self, bits: u64) -> u32 {
         let sign = ((bits >> 32) as u32) & 0x8000_0000;
         let exponent = (bits >> 52) & 0x7ff;
@@ -3389,6 +3450,11 @@ mod sqrt;
 
 #[cfg(feature = "trace-wasm")]
 pub mod trace_wasm;
+
+#[cfg(feature = "jit")]
+mod jit;
+#[cfg(feature = "jit")]
+pub use jit::{PpcJitConfig, PpcJitStats};
 
 const XER_SO_MASK: u32 = 1 << 31;
 const XER_OV_MASK: u32 = 1 << 30;
@@ -3956,6 +4022,29 @@ impl PpcCpu {
         }
     }
 
+    /// Move the cached block at `cache_index` (shown to be unchanged) to
+    /// `memory_token`, along with its JIT entry.
+    fn adopt_basic_block_token(&mut self, cache_index: usize, memory_token: u64) {
+        let Some(entry) = self.basic_block_cache[cache_index].as_mut() else {
+            return;
+        };
+        let old_token = entry.memory_token;
+        entry.memory_token = memory_token;
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        {
+            let (start_pc, len) = (entry.start_pc, u32::from(entry.len));
+            if let Some(slot) = self.jit_table.get_mut(Self::jit_table_index(start_pc))
+                && slot.start_pc == start_pc
+                && slot.len == len
+                && slot.memory_token == old_token
+            {
+                slot.memory_token = memory_token;
+            }
+        }
+        #[cfg(not(all(feature = "jit", not(target_family = "wasm"))))]
+        let _ = old_token;
+    }
+
     fn run_cached_basic_block<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
@@ -3963,6 +4052,11 @@ impl PpcCpu {
         halt_pc: u32,
         trap_base: u32,
         import_count: u32,
+        #[cfg_attr(
+            not(all(feature = "jit", not(target_family = "wasm"))),
+            allow(unused_variables)
+        )]
+        chain: bool,
     ) -> Option<PpcBasicBlockRunResult> {
         let start_pc = self.pc;
         let cache_index = Self::basic_block_cache_index(start_pc);
@@ -4009,16 +4103,31 @@ impl PpcCpu {
             if len == 0 {
                 return None;
             }
-            self.basic_block_cache[cache_index] = Some(PpcBasicBlockCacheEntry {
-                start_pc,
-                memory_token,
-                words,
-                decoded,
-                word_copy: (len == 2)
-                    .then(|| PpcCachedWordCopy::from_words(words[0], words[1]))
-                    .flatten(),
-                len: len as u8,
-            });
+            // A write elsewhere in the page renewed its token: if the block
+            // is unchanged, keep the entry (and everything derived from it).
+            let unchanged = self.basic_block_cache[cache_index]
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry.start_pc == start_pc
+                        && usize::from(entry.len) == len
+                        && entry.words[..len] == words[..len]
+                });
+            if unchanged {
+                #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+                jit::diag::count(jit::diag::Event::TokenAdopted);
+                self.adopt_basic_block_token(cache_index, memory_token);
+            } else {
+                self.basic_block_cache[cache_index] = Some(PpcBasicBlockCacheEntry {
+                    start_pc,
+                    memory_token,
+                    words,
+                    decoded,
+                    word_copy: (len == 2)
+                        .then(|| PpcCachedWordCopy::from_words(words[0], words[1]))
+                        .flatten(),
+                    len: len as u8,
+                });
+            }
         }
 
         let block_len = usize::from(self.basic_block_cache[cache_index].as_ref()?.len);
@@ -4104,6 +4213,24 @@ impl PpcCpu {
             self.pc = start_pc.wrapping_add(8);
             self.time_base = self.time_base.wrapping_add(1);
             return Some(PpcBasicBlockRunResult::Advanced(2));
+        }
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        if stop_before == block_len
+            && max_cycles >= block_len as u64
+            && let Some(result) = self.run_jit_block(
+                mem,
+                cache_index,
+                block_len,
+                PpcJitLimits {
+                    max_cycles,
+                    halt_pc,
+                    trap_base,
+                    import_count,
+                    chain,
+                },
+            )
+        {
+            return Some(result);
         }
         let mut completed = 0u64;
         let mut write_observer = PpcNoopMemoryWriteObserver;
@@ -4230,6 +4357,7 @@ impl PpcCpu {
             import_count,
             handler,
             |_, _, _, _, _, _| None,
+            true,
         )
     }
 
@@ -4266,6 +4394,7 @@ impl PpcCpu {
             import_count,
             handler,
             trace,
+            false,
         )
     }
 
@@ -4279,6 +4408,9 @@ impl PpcCpu {
         import_count: u32,
         mut handler: F,
         mut trace: T,
+        // Whether native JIT blocks may run back to back. Disabled when a host
+        // trace must be offered before every block.
+        chain: bool,
     ) -> PpcRunResult
     where
         F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
@@ -4415,7 +4547,7 @@ impl PpcCpu {
                 continue;
             }
             if let Some(block_result) =
-                self.run_cached_basic_block(mem, remaining, halt_pc, trap_base, import_count)
+                self.run_cached_basic_block(mem, remaining, halt_pc, trap_base, import_count, chain)
             {
                 match block_result {
                     PpcBasicBlockRunResult::Advanced(completed) if completed > 0 => {
@@ -6077,79 +6209,20 @@ impl PpcCpu {
                 self.execute_frsqrte(frt, bits, rc);
             }
             PpcInstr::Fadds { frt, fra, frb, rc } => {
-                let a_bits = self.fpr[fra as usize];
-                let b_bits = self.fpr[frb as usize];
-                let (mut result, truncated) =
-                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Add);
-                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
-                let adjusted = self.fp_adjusted_binary_result(
-                    a_bits,
-                    b_bits,
-                    FpBinaryOperation::Add,
-                    true,
-                    &mut result,
-                );
-                self.finish_ap_single_result_adjusted(
-                    frt, result, truncated, adjusted, invalid, rc,
-                );
+                let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Add, rc);
             }
             PpcInstr::Fsubs { frt, fra, frb, rc } => {
-                let a_bits = self.fpr[fra as usize];
-                let b_bits = self.fpr[frb as usize];
-                let (mut result, truncated) =
-                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Subtract);
-                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), FPSCR_VXISI);
-                let adjusted = self.fp_adjusted_binary_result(
-                    a_bits,
-                    b_bits,
-                    FpBinaryOperation::Subtract,
-                    true,
-                    &mut result,
-                );
-                self.finish_ap_single_result_adjusted(
-                    frt, result, truncated, adjusted, invalid, rc,
-                );
+                let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Subtract, rc);
             }
             PpcInstr::Fmuls { frt, fra, frc, rc } => {
-                let a_bits = self.fpr[fra as usize];
-                let c_bits = self.fpr[frc as usize];
-                let (mut result, truncated) =
-                    self.fp_binary_single(a_bits, c_bits, FpBinaryOperation::Multiply);
-                let invalid = Self::fp_invalid_flags(a_bits, Some(c_bits), FPSCR_VXIMZ);
-                let adjusted = self.fp_adjusted_binary_result(
-                    a_bits,
-                    c_bits,
-                    FpBinaryOperation::Multiply,
-                    true,
-                    &mut result,
-                );
-                self.finish_ap_single_result_adjusted(
-                    frt, result, truncated, adjusted, invalid, rc,
-                );
+                let (a, c) = (self.fpr[fra as usize], self.fpr[frc as usize]);
+                self.single_binary_reference(frt, a, c, FpBinaryOperation::Multiply, rc);
             }
             PpcInstr::Fdivs { frt, fra, frb, rc } => {
-                let a_bits = self.fpr[fra as usize];
-                let b_bits = self.fpr[frb as usize];
-                let (mut result, truncated) =
-                    self.fp_binary_single(a_bits, b_bits, FpBinaryOperation::Divide);
-                let default = if Self::fp_is_zero(a_bits) && Self::fp_is_zero(b_bits) {
-                    FPSCR_VXZDZ
-                } else if Self::fp_is_infinite(a_bits) && Self::fp_is_infinite(b_bits) {
-                    FPSCR_VXIDI
-                } else {
-                    FPSCR_VXSOFT
-                };
-                let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
-                let adjusted = self.fp_adjusted_binary_result(
-                    a_bits,
-                    b_bits,
-                    FpBinaryOperation::Divide,
-                    true,
-                    &mut result,
-                );
-                self.finish_ap_single_result_adjusted(
-                    frt, result, truncated, adjusted, invalid, rc,
-                );
+                let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
+                self.single_binary_reference(frt, a, b, FpBinaryOperation::Divide, rc);
             }
             PpcInstr::Fmadd {
                 frt,
