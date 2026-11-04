@@ -3128,6 +3128,84 @@ impl PpcCpu {
         true
     }
 
+    /// `fadds`/`fsubs`/`fmuls`/`fdivs`: a native fast path, falling back to
+    /// the software reference for every case it does not prove exact.
+    fn execute_single_binary(
+        &mut self,
+        frt: u8,
+        a_bits: u64,
+        b_bits: u64,
+        operation: FpBinaryOperation,
+        rc: bool,
+    ) {
+        if !self.try_fast_single_binary(frt, a_bits, b_bits, operation, rc) {
+            self.single_binary_reference(frt, a_bits, b_bits, operation, rc);
+        }
+    }
+
+    /// Whether `bits` is a normal binary32 value widened to binary64.
+    fn is_exact_normal_single(bits: u64) -> bool {
+        (897..=1150).contains(&((bits >> 52) & 0x7ff)) && bits & 0x1fff_ffff == 0
+    }
+
+    /// Native evaluation for operands that are normal singles.
+    ///
+    /// The single-precision operation is computed in binary64 and then
+    /// rounded once more by [`Self::fast_single_round`] in the FPSCR mode.
+    /// That is exact in every case accepted here:
+    ///
+    /// * Products of two 24-bit significands have at most 48 bits, and sums
+    ///   whose exponents differ by at most 28 have at most 53, so the
+    ///   binary64 result *is* the exact result.
+    /// * A quotient of 24-bit significands that is not itself a 24- or
+    ///   25-bit number lies at least 2^-48 (relative) away from every 24-bit
+    ///   value and every midpoint between two of them, further than the
+    ///   2^-53 binary64 rounding error. So the binary64 quotient truncates
+    ///   to the same 24 bits as the exact one, has a nonzero sticky part
+    ///   exactly when the quotient is inexact, and lies on the same side of
+    ///   every midpoint: rounding it again gives the correctly rounded
+    ///   single, the right INEXACT, and the right FR in every mode.
+    ///
+    /// Results are required to be normal, nonzero, below the largest finite
+    /// single and above the smallest normal binade, which excludes every
+    /// overflow, underflow and tininess case (and with them the FPSCR\[OE\]
+    /// and FPSCR\[UE\] result adjustments) as well as zero signs.
+    fn try_fast_single_binary(
+        &mut self,
+        frt: u8,
+        a_bits: u64,
+        b_bits: u64,
+        operation: FpBinaryOperation,
+        rc: bool,
+    ) -> bool {
+        if !Self::is_exact_normal_single(a_bits) || !Self::is_exact_normal_single(b_bits) {
+            return false;
+        }
+        let (a, b) = (f64::from_bits(a_bits), f64::from_bits(b_bits));
+        let exponent_gap = || ((a_bits >> 52) & 0x7ff).abs_diff((b_bits >> 52) & 0x7ff);
+        let exact = match operation {
+            FpBinaryOperation::Add if exponent_gap() <= 28 => a + b,
+            FpBinaryOperation::Subtract if exponent_gap() <= 28 => a - b,
+            FpBinaryOperation::Multiply => a * b,
+            FpBinaryOperation::Divide => a / b,
+            _ => return false,
+        };
+        let bits = exact.to_bits();
+        if !(898..=1150).contains(&((bits >> 52) & 0x7ff)) {
+            return false;
+        }
+        let Some((rounded, status, incremented)) = Self::fast_single_round(bits, self.fpscr & 3)
+        else {
+            return false;
+        };
+        if rounded & 0x7fff_ffff_ffff_ffff == 0x47ef_ffff_e000_0000 {
+            return false;
+        }
+        self.apply_fp_status(status, 0, incremented, true);
+        self.finish_fp_result(frt, rounded, rc);
+        true
+    }
+
     /// The software (rustc_apfloat) implementation of the single-precision
     /// binary operations.
     fn single_binary_reference(
@@ -3155,6 +3233,24 @@ impl PpcCpu {
         let invalid = Self::fp_invalid_flags(a_bits, Some(b_bits), default);
         let adjusted = self.fp_adjusted_binary_result(a_bits, b_bits, operation, true, &mut result);
         self.finish_ap_single_result_adjusted(frt, result, truncated, adjusted, invalid, rc);
+    }
+
+    /// `fctiwz` for finite values whose truncation fits in an `i32`: the
+    /// result can only be exact or INEXACT, and rounding toward zero never
+    /// increments the fraction.
+    fn fast_convert_to_i32_toward_zero(&mut self, bits: u64) -> Option<u32> {
+        let value = f64::from_bits(bits);
+        if !(value > -2_147_483_649.0 && value < 2_147_483_648.0) {
+            return None;
+        }
+        let truncated = value.trunc();
+        let status = if truncated == value {
+            ApStatus::OK
+        } else {
+            ApStatus::INEXACT
+        };
+        self.apply_fp_status(status, 1u32 << FPSCR_VXCVI, false, true);
+        Some(truncated as i32 as u32)
     }
 
     fn fp_single_bits(&self, bits: u64) -> u32 {
@@ -6210,19 +6306,19 @@ impl PpcCpu {
             }
             PpcInstr::Fadds { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.single_binary_reference(frt, a, b, FpBinaryOperation::Add, rc);
+                self.execute_single_binary(frt, a, b, FpBinaryOperation::Add, rc);
             }
             PpcInstr::Fsubs { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.single_binary_reference(frt, a, b, FpBinaryOperation::Subtract, rc);
+                self.execute_single_binary(frt, a, b, FpBinaryOperation::Subtract, rc);
             }
             PpcInstr::Fmuls { frt, fra, frc, rc } => {
                 let (a, c) = (self.fpr[fra as usize], self.fpr[frc as usize]);
-                self.single_binary_reference(frt, a, c, FpBinaryOperation::Multiply, rc);
+                self.execute_single_binary(frt, a, c, FpBinaryOperation::Multiply, rc);
             }
             PpcInstr::Fdivs { frt, fra, frb, rc } => {
                 let (a, b) = (self.fpr[fra as usize], self.fpr[frb as usize]);
-                self.single_binary_reference(frt, a, b, FpBinaryOperation::Divide, rc);
+                self.execute_single_binary(frt, a, b, FpBinaryOperation::Divide, rc);
             }
             PpcInstr::Fmadd {
                 frt,
@@ -6502,7 +6598,10 @@ impl PpcCpu {
                 // fctiwz uses round-toward-zero regardless of
                 // FPSCR.RN.
                 let bits = self.fpr[frb as usize];
-                if let Some(value) = self.fp_convert_to_i32(bits, ApRound::TowardZero) {
+                if let Some(value) = self
+                    .fast_convert_to_i32_toward_zero(bits)
+                    .or_else(|| self.fp_convert_to_i32(bits, ApRound::TowardZero))
+                {
                     self.fpr[frt as usize] = u64::from(value);
                 }
                 self.finish_fp_record(rc);
@@ -8875,3 +8974,7 @@ mod fast_frsqrte_dispatch_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/fp_fast_paths.rs"]
+mod fp_fast_paths_tests;

@@ -72,7 +72,10 @@ pub(super) extern "C" fn double_op(ctx: *mut JitCtx, fields: u32, pc: u32) -> u6
         let rc = fields & FP_RECORD_BIT != 0;
         match (fields >> FP_OPERATION_SHIFT) & FP_OPERATION_MASK {
             0 => {
-                if let Some(value) = cpu.fp_convert_to_i32(b, ApRound::TowardZero) {
+                if let Some(value) = cpu
+                    .fast_convert_to_i32_toward_zero(b)
+                    .or_else(|| cpu.fp_convert_to_i32(b, ApRound::TowardZero))
+                {
                     cpu.fpr[dest as usize] = u64::from(value);
                 }
                 cpu.finish_fp_record(rc);
@@ -144,7 +147,7 @@ pub(super) extern "C" fn single_binary(ctx: *mut JitCtx, fields: u32, pc: u32) -
         };
         let rc = fields & FP_RECORD_BIT != 0;
         if matches!(operation, FpBinaryOperation::Divide) {
-            cpu.single_binary_reference(frt, a, b, operation, rc);
+            cpu.execute_single_binary(frt, a, b, operation, rc);
         } else {
             // Match the unobserved execution path used by the block runner.
             let (a, b) = (f64::from_bits(a), f64::from_bits(b));
