@@ -2423,7 +2423,7 @@ impl PpcCpu {
                     }
                     _ => return None,
                 };
-                self.finish_fp_result(frt as u8, (result as f64).to_bits(), rc);
+                self.finish_fp_single_result(frt as u8, (result as f64).to_bits(), rc);
                 Some(PpcStepResult::Stepped)
             }
             63 => {
@@ -3569,7 +3569,7 @@ impl PpcCpu {
             self.set_fpscr_bit(FPSCR_FI, false);
             self.finish_fp_record(rc);
         } else {
-            self.finish_fp_result(
+            self.finish_fp_single_result(
                 frt,
                 adjusted.map_or(widened.value.to_bits() as u64, |value| value.bits),
                 rc,
@@ -3584,6 +3584,17 @@ impl PpcCpu {
             self.update_cr1_from_fpscr();
         }
         self.pc = self.pc.wrapping_add(4);
+    }
+
+    /// [`Self::finish_fp_result`] for a single-precision result widened to
+    /// double: FPRF reflects the single-precision result (MPCFPE32B Rev. 2
+    /// §3.3.4). A single denormal is a normal double with a biased exponent of
+    /// at most 896; FPCC is the same for both classes, so only C differs.
+    fn finish_fp_single_result(&mut self, frt: u8, bits: u64, rc: bool) {
+        self.finish_fp_result(frt, bits, rc);
+        if (1..=896).contains(&((bits >> 52) & 0x7ff)) {
+            self.set_fpscr_bit(15, true);
+        }
     }
 
     fn finish_fp_move(&mut self, frt: u8, bits: u64, rc: bool) {

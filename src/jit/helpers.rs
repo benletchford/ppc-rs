@@ -157,7 +157,7 @@ pub(super) extern "C" fn single_binary(ctx: *mut JitCtx, fields: u32, pc: u32) -
                 FpBinaryOperation::Multiply => a * b,
                 _ => unreachable!(),
             } as f32;
-            cpu.finish_fp_result(frt, f64::from(result).to_bits(), rc);
+            cpu.finish_fp_single_result(frt, f64::from(result).to_bits(), rc);
         }
         0
     })
