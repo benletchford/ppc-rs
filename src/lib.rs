@@ -3412,16 +3412,6 @@ impl PpcCpu {
         }
     }
 
-    fn finish_ap_single_result(
-        &mut self,
-        frt: u8,
-        result: StatusAnd<ApDouble>,
-        invalid_flags: u32,
-        rc: bool,
-    ) {
-        self.finish_ap_single_result_rounded(frt, result, result.value, invalid_flags, rc);
-    }
-
     fn finish_ap_single_result_rounded(
         &mut self,
         frt: u8,
@@ -6293,12 +6283,36 @@ impl PpcCpu {
             PpcInstr::Fres { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
                 let one = ApDouble::from_bits(u128::from(1.0f64.to_bits()));
-                let result = one.div_r(
+                let mut result = one.div_r(
                     ApDouble::from_bits(u128::from(bits)),
                     self.fp_rounding_mode(),
                 );
                 let invalid = Self::fp_invalid_flags(bits, None, FPSCR_VXSOFT);
-                self.finish_ap_single_result(frt, result, invalid, rc);
+                // The quotient is a double here, so whether it is out of
+                // range for a single is only known after narrowing.
+                let mut ignored = false;
+                let narrowed: StatusAnd<ApSingle> = result
+                    .value
+                    .convert_r(self.fp_rounding_mode(), &mut ignored);
+                let widened: StatusAnd<ApDouble> = narrowed
+                    .value
+                    .convert_r(ApRound::NearestTiesToEven, &mut ignored);
+                let mut single_result = StatusAnd {
+                    status: result.status | narrowed.status,
+                    value: widened.value,
+                };
+                let adjusted = self.fp_adjusted_binary_result(
+                    1.0f64.to_bits(),
+                    bits,
+                    FpBinaryOperation::Divide,
+                    true,
+                    &mut single_result,
+                );
+                result.status = single_result.status;
+                let truncated = result.value;
+                self.finish_ap_single_result_adjusted(
+                    frt, result, truncated, adjusted, invalid, rc,
+                );
             }
             PpcInstr::Frsqrte { frt, frb, rc } => {
                 let bits = self.fpr[frb as usize];
