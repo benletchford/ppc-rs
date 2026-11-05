@@ -2781,6 +2781,33 @@ impl PpcCpu {
             }
     }
 
+    /// Whether a result is tiny: nonzero and, with unbounded precision and
+    /// exponent range, below the format's smallest normal number. Tininess is
+    /// detected before rounding (MPCFPE32B Rev. 2 §3.3.6.2.2).
+    ///
+    /// `nearest` is the result rounded to nearest in quad precision, which can
+    /// itself have carried up to 2^emin. `truncated_exact` is the result
+    /// rounded toward zero in quad, which stays below 2^emin when the exact
+    /// result does; it is only evaluated in that one binade.
+    fn fp_is_tiny(nearest: ApQuad, single: bool, truncated_exact: impl FnOnce() -> ApQuad) -> bool {
+        if !nearest.is_finite() || nearest.is_zero() {
+            return false;
+        }
+        let min_exponent = if single { -126 } else { -1022 };
+        let exponent = nearest.ilogb();
+        exponent < min_exponent
+            || (exponent == min_exponent && truncated_exact().ilogb() < min_exponent)
+    }
+
+    /// With FPSCR\[UE\] = 0, underflow is a tiny result that is inexact. The
+    /// arithmetic library reports it only when the rounded result is still
+    /// subnormal, missing a tiny result that rounds up to 2^emin.
+    fn fp_note_disabled_underflow(&self, status: &mut ApStatus, tiny: bool) {
+        if tiny && status.contains(ApStatus::INEXACT) && !self.fpscr_bit(FPSCR_UE) {
+            *status |= ApStatus::UNDERFLOW;
+        }
+    }
+
     fn fp_adjusted_binary_result(
         &self,
         a_bits: u64,
@@ -2809,11 +2836,10 @@ impl PpcCpu {
             Self::fp_is_largest(result.value, single),
             || calculate(ApRound::TowardZero).value,
         );
-        let status = result.status;
         let exact = calculate(ApRound::NearestTiesToEven);
-        let tiny = exact.value.is_finite()
-            && !exact.value.is_zero()
-            && exact.value.ilogb() < if single { -126 } else { -1022 };
+        let tiny = Self::fp_is_tiny(exact.value, single, || calculate(ApRound::TowardZero).value);
+        self.fp_note_disabled_underflow(&mut result.status, tiny);
+        let status = result.status;
         let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
             if single { -192 } else { -1536 }
         } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {
@@ -2856,11 +2882,12 @@ impl PpcCpu {
             Self::fp_is_largest(result.value, control.single),
             || unnegated(ApRound::TowardZero).value,
         );
-        let status = result.status;
         let exact = unnegated(ApRound::NearestTiesToEven);
-        let tiny = exact.value.is_finite()
-            && !exact.value.is_zero()
-            && exact.value.ilogb() < if control.single { -126 } else { -1022 };
+        let tiny = Self::fp_is_tiny(exact.value, control.single, || {
+            unnegated(ApRound::TowardZero).value
+        });
+        self.fp_note_disabled_underflow(&mut result.status, tiny);
+        let status = result.status;
         let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
             if control.single { -192 } else { -1536 }
         } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {
@@ -2925,9 +2952,9 @@ impl PpcCpu {
         let source: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
             .convert_r(ApRound::NearestTiesToEven, &mut ignored);
         Self::fp_note_overflow(status, true, delivered_largest, || source.value);
+        let tiny = Self::fp_is_tiny(source.value, true, || source.value);
+        self.fp_note_disabled_underflow(status, tiny);
         let status = *status;
-        let tiny =
-            source.value.is_finite() && !source.value.is_zero() && source.value.ilogb() < -126;
         let adjustment = if status.contains(ApStatus::OVERFLOW) && self.fpscr_bit(FPSCR_OE) {
             -192
         } else if (status.contains(ApStatus::UNDERFLOW) || tiny) && self.fpscr_bit(FPSCR_UE) {

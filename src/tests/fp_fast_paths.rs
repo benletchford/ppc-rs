@@ -97,3 +97,27 @@ fn fast_single_arithmetic_matches_the_software_reference() {
         "fast path rarely taken: {fast_hits}"
     );
 }
+
+/// Tiny results must reach the software path, which sets UX for a tiny inexact
+/// result even when rounding carries it up to the smallest normal number.
+#[test]
+fn fast_paths_decline_tiny_results_that_round_to_smallest_normal() {
+    const BELOW_ONE: u64 = 0x3fef_ffff_e000_0000;
+    const MIN_NORMAL: u64 = 0x3810_0000_0000_0000;
+    let mut cpu = PpcCpu::new();
+    assert!(!cpu.try_fast_single_binary(
+        1,
+        BELOW_ONE,
+        MIN_NORMAL,
+        FpBinaryOperation::Multiply,
+        false
+    ));
+    assert!(!cpu.try_fast_single_binary(
+        1,
+        BELOW_ONE,
+        0x47d0_0000_0000_0000,
+        FpBinaryOperation::Divide,
+        false
+    ));
+    assert!(!cpu.try_fast_frsp(1, 0x380f_ffff_ff80_0000, false));
+}
