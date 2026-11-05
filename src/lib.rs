@@ -57,6 +57,22 @@ struct FpMulAddControl {
     single: bool,
 }
 
+/// A result with its exponent adjusted for an enabled overflow or underflow,
+/// and how rounding the scaled value went.
+#[derive(Clone, Copy)]
+struct FpAdjustedResult {
+    bits: u64,
+    inexact: bool,
+    fraction_incremented: bool,
+}
+
+impl FpAdjustedResult {
+    fn replace_rounding_status(self, status: &mut ApStatus, fraction_incremented: &mut bool) {
+        status.set(ApStatus::INEXACT, self.inexact);
+        *fraction_incremented = self.fraction_incremented;
+    }
+}
+
 const PPC_DECODE_CACHE_MAX_ENTRIES: usize = 4096;
 const PPC_DECODE_CACHE_INDEX_MASK: usize = PPC_DECODE_CACHE_MAX_ENTRIES - 1;
 type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
@@ -2815,7 +2831,7 @@ impl PpcCpu {
         operation: FpBinaryOperation,
         single: bool,
         result: &mut StatusAnd<ApDouble>,
-    ) -> Option<u64> {
+    ) -> Option<FpAdjustedResult> {
         let to_quad = |bits: u64| {
             let mut ignored = false;
             let converted: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
@@ -2849,7 +2865,12 @@ impl PpcCpu {
         };
         let intermediate =
             self.fp_adjusted_intermediate(exact.value, || calculate(self.fp_rounding_mode()).value);
-        self.fp_narrow_adjusted_quad(intermediate.scalbn(adjustment), single)
+        Some(self.fp_narrow_adjusted_quad(
+            intermediate,
+            calculate(ApRound::TowardZero),
+            adjustment,
+            single,
+        ))
     }
 
     fn fp_adjusted_mul_add_result(
@@ -2859,7 +2880,7 @@ impl PpcCpu {
         b_bits: u64,
         control: FpMulAddControl,
         result: &mut StatusAnd<ApDouble>,
-    ) -> Option<u64> {
+    ) -> Option<FpAdjustedResult> {
         let to_quad = |bits: u64| {
             let mut ignored = false;
             let converted: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
@@ -2897,12 +2918,16 @@ impl PpcCpu {
         };
         let intermediate =
             self.fp_adjusted_intermediate(exact.value, || unnegated(self.fp_rounding_mode()).value);
-        let bits = self.fp_narrow_adjusted_quad(intermediate.scalbn(adjustment), control.single)?;
-        Some(if control.negate_result {
-            bits ^ (1 << 63)
-        } else {
-            bits
-        })
+        let mut adjusted = self.fp_narrow_adjusted_quad(
+            intermediate,
+            unnegated(ApRound::TowardZero),
+            adjustment,
+            control.single,
+        );
+        if control.negate_result {
+            adjusted.bits ^= 1 << 63;
+        }
+        Some(adjusted)
     }
 
     /// The quad intermediate that `fp_narrow_adjusted_quad` rounds again.
@@ -2926,19 +2951,57 @@ impl PpcCpu {
         }
     }
 
-    fn fp_narrow_adjusted_quad(&self, value: ApQuad, single: bool) -> Option<u64> {
+    /// Scale `intermediate` and round it to the destination format, recording
+    /// how that rounding went: with an enabled overflow or underflow, XX, FI
+    /// and FR describe the rounding of the scaled result (Tables 3-14 and
+    /// 3-16; §3.3.6.2.3), not the out-of-range result the arithmetic library
+    /// produced first.
+    ///
+    /// `truncated` is the exact result rounded toward zero in quad precision.
+    /// Its status says whether the quad step lost anything, and narrowing it
+    /// toward zero gives the reference that tells whether rounding increased
+    /// the magnitude.
+    fn fp_narrow_adjusted_quad(
+        &self,
+        intermediate: ApQuad,
+        truncated: StatusAnd<ApQuad>,
+        adjustment: i32,
+        single: bool,
+    ) -> FpAdjustedResult {
         let mut ignored = false;
-        if single {
+        let scaled = intermediate.scalbn(adjustment);
+        let scaled_truncated = truncated.value.scalbn(adjustment);
+        let (bits, narrowing_status, incremented) = if single {
             let narrowed: StatusAnd<ApSingle> =
-                value.convert_r(self.fp_rounding_mode(), &mut ignored);
+                scaled.convert_r(self.fp_rounding_mode(), &mut ignored);
+            let reference: StatusAnd<ApSingle> =
+                scaled_truncated.convert_r(ApRound::TowardZero, &mut ignored);
             let widened: StatusAnd<ApDouble> = narrowed
                 .value
                 .convert_r(ApRound::NearestTiesToEven, &mut ignored);
-            Some(widened.value.to_bits() as u64)
+            (
+                widened.value.to_bits() as u64,
+                narrowed.status,
+                (narrowed.value.to_bits() as u32 & 0x7fff_ffff)
+                    > (reference.value.to_bits() as u32 & 0x7fff_ffff),
+            )
         } else {
             let narrowed: StatusAnd<ApDouble> =
-                value.convert_r(self.fp_rounding_mode(), &mut ignored);
-            Some(narrowed.value.to_bits() as u64)
+                scaled.convert_r(self.fp_rounding_mode(), &mut ignored);
+            let reference: StatusAnd<ApDouble> =
+                scaled_truncated.convert_r(ApRound::TowardZero, &mut ignored);
+            (
+                narrowed.value.to_bits() as u64,
+                narrowed.status,
+                (narrowed.value.to_bits() as u64 & 0x7fff_ffff_ffff_ffff)
+                    > (reference.value.to_bits() as u64 & 0x7fff_ffff_ffff_ffff),
+            )
+        };
+        FpAdjustedResult {
+            bits,
+            inexact: truncated.status.contains(ApStatus::INEXACT)
+                || narrowing_status.contains(ApStatus::INEXACT),
+            fraction_incremented: incremented,
         }
     }
 
@@ -2947,7 +3010,7 @@ impl PpcCpu {
         bits: u64,
         status: &mut ApStatus,
         delivered_largest: bool,
-    ) -> Option<u64> {
+    ) -> Option<FpAdjustedResult> {
         let mut ignored = false;
         let source: StatusAnd<ApQuad> = ApDouble::from_bits(u128::from(bits))
             .convert_r(ApRound::NearestTiesToEven, &mut ignored);
@@ -2962,7 +3025,7 @@ impl PpcCpu {
         } else {
             return None;
         };
-        self.fp_narrow_adjusted_quad(source.value.scalbn(adjustment), true)
+        Some(self.fp_narrow_adjusted_quad(source.value, source, adjustment, true))
     }
 
     fn fp_mul_add(
@@ -3411,11 +3474,11 @@ impl PpcCpu {
         frt: u8,
         mut result: StatusAnd<ApDouble>,
         truncated: ApDouble,
-        adjusted_bits: Option<u64>,
+        adjusted: Option<FpAdjustedResult>,
         invalid_flags: u32,
         rc: bool,
     ) {
-        if adjusted_bits.is_some()
+        if adjusted.is_some()
             && self.fpscr_bit(FPSCR_UE)
             && !result.status.contains(ApStatus::OVERFLOW)
         {
@@ -3425,10 +3488,13 @@ impl PpcCpu {
             result.status.contains(ApStatus::INVALID_OP) && self.fpscr_bit(FPSCR_VE);
         let zero_divide_enabled =
             result.status.contains(ApStatus::DIV_BY_ZERO) && self.fpscr_bit(FPSCR_ZE);
-        let rounded_bits = adjusted_bits.unwrap_or(result.value.to_bits() as u64);
+        let rounded_bits = adjusted.map_or(result.value.to_bits() as u64, |value| value.bits);
         let truncated_bits = truncated.to_bits() as u64;
-        let fraction_incremented =
+        let mut fraction_incremented =
             (rounded_bits & 0x7fff_ffff_ffff_ffff) > (truncated_bits & 0x7fff_ffff_ffff_ffff);
+        if let Some(value) = adjusted {
+            value.replace_rounding_status(&mut result.status, &mut fraction_incremented);
+        }
         self.apply_fp_status(result.status, invalid_flags, fraction_incremented, true);
         if invalid_enabled || zero_divide_enabled {
             self.set_fpscr_bit(FPSCR_FR, false);
@@ -3455,11 +3521,11 @@ impl PpcCpu {
         frt: u8,
         mut result: StatusAnd<ApDouble>,
         truncated: ApDouble,
-        adjusted_bits: Option<u64>,
+        adjusted: Option<FpAdjustedResult>,
         invalid_flags: u32,
         rc: bool,
     ) {
-        if adjusted_bits.is_some()
+        if adjusted.is_some()
             && self.fpscr_bit(FPSCR_UE)
             && !result.status.contains(ApStatus::OVERFLOW)
         {
@@ -3489,8 +3555,11 @@ impl PpcCpu {
         let mut truncated_loses_info = false;
         let truncated_single: StatusAnd<ApSingle> =
             truncated.convert_r(ApRound::TowardZero, &mut truncated_loses_info);
-        let fraction_incremented = (narrowed.value.to_bits() as u32 & 0x7fff_ffff)
+        let mut fraction_incremented = (narrowed.value.to_bits() as u32 & 0x7fff_ffff)
             > (truncated_single.value.to_bits() as u32 & 0x7fff_ffff);
+        if let Some(value) = adjusted {
+            value.replace_rounding_status(&mut status, &mut fraction_incremented);
+        }
         let invalid_enabled = status.contains(ApStatus::INVALID_OP) && self.fpscr_bit(FPSCR_VE);
         let zero_divide_enabled =
             status.contains(ApStatus::DIV_BY_ZERO) && self.fpscr_bit(FPSCR_ZE);
@@ -3502,7 +3571,7 @@ impl PpcCpu {
         } else {
             self.finish_fp_result(
                 frt,
-                adjusted_bits.unwrap_or(widened.value.to_bits() as u64),
+                adjusted.map_or(widened.value.to_bits() as u64, |value| value.bits),
                 rc,
             );
         }

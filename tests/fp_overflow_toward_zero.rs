@@ -102,7 +102,8 @@ fn fmul_enabled_overflow_toward_zero_delivers_adjusted_result() {
     // 2^1200 × 2^-1536 = 2^-336, with OX and FEX set, as in round to nearest.
     let (value, fpscr) = run(op(FMUL), FPSCR_OE | RN_TOWARD_ZERO, pow2(600), 0, pow2(600));
     assert_eq!(value, 0x2af0_0000_0000_0000);
-    assert_eq!(fpscr, 0xd202_4041);
+    // The scaled result is exact, so XX, FR and FI stay clear (issue #86).
+    assert_eq!(fpscr, 0xd000_4041);
     let (nearest_value, nearest_fpscr) = run(op(FMUL), FPSCR_OE, pow2(600), 0, pow2(600));
     assert_eq!(nearest_value, 0x2af0_0000_0000_0000);
     assert_eq!(nearest_fpscr & (FX | FEX | OX), FX | FEX | OX);
