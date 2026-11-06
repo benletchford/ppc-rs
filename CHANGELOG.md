@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.8.0...ppc-v0.8.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **fpu:** apply enabled exponent adjustment to fres ([#103](https://github.com/benletchford/ppc-rs/issues/103)) ([52f435e](https://github.com/benletchford/ppc-rs/commit/52f435e6689bc283dcc2a12a1799824720e76e90))
+* **fpu:** classify single-precision denormals in fprf ([#106](https://github.com/benletchford/ppc-rs/issues/106)) ([d793c84](https://github.com/benletchford/ppc-rs/commit/d793c844ca7c82da6a6b297d70e9f0b54b454800))
+* **fpu:** detect disabled underflow before rounding ([#104](https://github.com/benletchford/ppc-rs/issues/104)) ([49c5d14](https://github.com/benletchford/ppc-rs/commit/49c5d142cb369717c49bb2505b0206fac33e43c2))
+* **fpu:** report rounding status of adjusted results ([#105](https://github.com/benletchford/ppc-rs/issues/105)) ([31fbf12](https://github.com/benletchford/ppc-rs/commit/31fbf12ec4cf3166958fe83ef9deed92b05f99cd))
+
+
+### Performance Improvements
+
+* **fpu:** add guarded native single-precision arithmetic and fctiwz fast paths ([54796ab](https://github.com/benletchford/ppc-rs/commit/54796ab80582a01163ea8ee82674ef68743e65d7))
+
 ## [0.8.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.7.3...ppc-v0.8.0) (2026-11-03)
 
 
