@@ -35,7 +35,7 @@ jit = [
 
 [dependencies]
 rustc_apfloat = "0.2.3"
-wasm-encoder = { version = "0.262.0", optional = true }
+wasm-encoder = { version = "0.263.0", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 cranelift-codegen = { version = "=0.132.0", optional = true }
