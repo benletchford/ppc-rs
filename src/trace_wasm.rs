@@ -254,7 +254,8 @@ fn memarg(offset: u64, align: u32) -> MemArg {
     MemArg {
         offset,
         align,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }
 }
 
