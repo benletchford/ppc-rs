@@ -135,12 +135,17 @@ impl PpcCpu {
     /// direct-write epoch (see `PpcMemory::direct_read_page`). Called after
     /// lookups made between chained blocks, where the session's check at
     /// entry does not see the move.
-    fn recheck_direct_writes<M: PpcMemory + ?Sized>(&mut self, mem: &M, read_epoch: u64) {
-        if mem.code_epoch().unwrap_or(0) != read_epoch {
-            // SAFETY: no generated code runs during a chaining decision, and
-            // the session reaches the table through the same pointer.
-            unsafe { (*self.jit_direct.get()).validate_writes(mem) };
+    /// Returns whether the code epoch moved, in which case the chain ends:
+    /// the next block was chosen under the old epoch, and generated code
+    /// checks the epoch only after a helper has called into the memory.
+    fn recheck_direct_writes<M: PpcMemory + ?Sized>(&mut self, mem: &M, read_epoch: u64) -> bool {
+        if mem.code_epoch().unwrap_or(0) == read_epoch {
+            return false;
         }
+        // SAFETY: no generated code runs during a chaining decision, and
+        // the session reaches the table through the same pointer.
+        unsafe { (*self.jit_direct.get()).validate_writes(mem) };
+        true
     }
 
     /// The direct-access table generated code consults before a memory helper.
@@ -425,8 +430,7 @@ impl PpcCpu {
                 let current = mem.global_instruction_cache_token() == Some(token)
                     || mem.instruction_cache_token(pc) == Some(token)
                     || self.refresh_jit_token(mem, index, pc);
-                self.recheck_direct_writes(mem, epoch);
-                if !current {
+                if self.recheck_direct_writes(mem, epoch) || !current {
                     return None;
                 }
                 self.jit_table[index].epoch = epoch;
@@ -476,7 +480,9 @@ impl PpcCpu {
             })
         {
             self.form_jit_region(mem, from, epoch);
-            self.recheck_direct_writes(mem, epoch);
+            if self.recheck_direct_writes(mem, epoch) {
+                return None;
+            }
         }
         Some((link.code, index, epoch))
     }
