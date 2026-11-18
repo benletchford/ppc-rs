@@ -15,6 +15,11 @@ pub(crate) struct JitCtx {
     pub(crate) epoch: u64,
     /// Direct-read table, validated for `mem` when the session started.
     pub(crate) tlb: *mut super::direct::DirectTlb,
+    /// Set by every helper that may call into `mem`, cleared by
+    /// `code_changed`. Generated code skips the code-epoch check at a block
+    /// end while it is clear: only a call into the memory can move the epoch.
+    /// A flag left set from an earlier run only costs one extra check.
+    pub(crate) called_memory: u32,
 }
 
 /// Adapter that lets a `?Sized` memory bus be used as `dyn PpcMemory`.
@@ -159,6 +164,7 @@ pub(crate) fn with_session<M: PpcMemory + ?Sized, R>(
             budget: 0,
             epoch: 0,
             tlb,
+            called_memory: 0,
         },
         _marker: std::marker::PhantomData,
     };

@@ -1050,3 +1050,84 @@ fn a_cpu_with_its_direct_access_table_is_send_and_sync() {
     fn shareable<T: Send + Sync>() {}
     shareable::<PpcCpu>();
 }
+
+#[test]
+fn store_remapping_code_exits_a_hot_region() {
+    use ppc::PpcMemory;
+
+    // As `load_remapping_code_exits_a_hot_region`, with the remapping done by
+    // a store: one the JIT lowers (`stb`, `stw`) and one it interprets
+    // (`stwbrx`).
+    struct BankSwitchingBus {
+        memory: PpcSectionMem,
+        switch_on_write: bool,
+    }
+    impl PpcMemory for BankSwitchingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.memory.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            if (DATA..DATA + 8).contains(&addr) {
+                if std::mem::take(&mut self.switch_on_write) {
+                    self.memory
+                        .add_readonly_region(CODE + 8, d_form(14, 3, 3, 7).to_be_bytes().to_vec());
+                }
+                let _ = value;
+                Some(())
+            } else {
+                self.memory.write_u8(addr, value)
+            }
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.memory.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.memory.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.memory.code_epoch()
+        }
+    }
+
+    let run = |jit, store: u32| {
+        let words = [store, 0x4800_0004, d_form(14, 3, 3, 1), 0x4bff_fff4];
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, words.into_iter().flat_map(u32::to_be_bytes).collect());
+        let mut bus = BankSwitchingBus {
+            memory,
+            switch_on_write: false,
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.pc = CODE;
+        cpu.gpr[5] = DATA;
+        cpu.gpr[6] = 0;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                hot_threshold: 2,
+                background: false,
+                verify: true,
+                jitdump: false,
+            })
+            .unwrap();
+        }
+        cpu.run_with_imports(&mut bus, 400, 0, 0, 0, |_, _, _| unreachable!());
+        assert_eq!(cpu.pc, CODE);
+        if jit {
+            assert!(cpu.jit_stats().regions_compiled > 0);
+        }
+        let before = cpu.gpr[3];
+        bus.switch_on_write = true;
+        cpu.run_with_imports(&mut bus, 4, 0, 0, 0, |_, _, _| unreachable!());
+        (cpu.gpr[3] - before, cpu.pc, cpu.time_base())
+    };
+    for store in [
+        d_form(38, 4, 5, 0),         // stb r4,0(r5)
+        d_form(36, 4, 5, 0),         // stw r4,0(r5)
+        x_form(31, 4, 5, 6, 662, 0), // stwbrx r4,r5,r6
+    ] {
+        let interpreted = run(false, store);
+        assert_eq!(interpreted.0, 7, "{store:#010x}");
+        assert_eq!(run(true, store), interpreted, "{store:#010x}");
+    }
+}

@@ -397,7 +397,18 @@ impl Emitter<'_, '_> {
         let exit = self.b.create_block();
         if self.may_change_code {
             // A callback may have changed code later blocks were built from.
+            // Only a helper that called into the memory can have: skip the
+            // check when none has since the last one.
+            let check = self.b.create_block();
             let same = self.b.create_block();
+            let called = self.b.ins().load(
+                types::I32,
+                Self::flags(),
+                self.ctx,
+                offset_of!(super::JitCtx, called_memory) as i32,
+            );
+            self.b.ins().brif(called, check, &[], same, &[]);
+            self.b.switch_to_block(check);
             let callee = self
                 .b
                 .ins()

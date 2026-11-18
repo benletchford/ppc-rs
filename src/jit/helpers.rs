@@ -192,6 +192,7 @@ fn alignment(ctx: &mut JitCtx, pc: u32, ea: u32, size: u8, access: PpcMemoryAcce
 /// Interpret one instruction with `cpu.pc` set to its address.
 pub(super) extern "C" fn step(ctx: *mut JitCtx, word: u32, pc: u32) -> u64 {
     guard(ctx, Some(pc), |ctx| {
+        ctx.called_memory = 1;
         // SAFETY: generated code passes the context it was invoked with.
         let (cpu, mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
         cpu.pc = pc;
@@ -211,6 +212,7 @@ pub(super) extern "C" fn code_changed(ctx: *mut JitCtx) -> u64 {
     guard(ctx, None, |ctx| {
         // SAFETY: see `step`.
         let mem = unsafe { &*ctx.mem };
+        ctx.called_memory = 0;
         u64::from(mem.code_epoch().unwrap_or(0) != ctx.epoch)
     })
 }
@@ -219,6 +221,7 @@ macro_rules! load_helper {
     ($name:ident, $size:expr, |$mem:ident, $ea:ident| $read:expr) => {
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, pc: u32) -> u64 {
             guard(ctx, Some(pc), |ctx| {
+                ctx.called_memory = 1;
                 // SAFETY: see `step`.
                 let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
                 if $size > 1 && misaligned(cpu, $ea, $size) {
@@ -256,6 +259,7 @@ macro_rules! store_helper {
     ($name:ident, $size:expr, |$mem:ident, $ea:ident, $value:ident| $write:expr) => {
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, $value: u32, pc: u32) -> u64 {
             guard(ctx, Some(pc), |ctx| {
+                ctx.called_memory = 1;
                 // SAFETY: see `step`.
                 let (cpu, $mem) = unsafe { (&*ctx.cpu, &mut *ctx.mem) };
                 if $size > 1 && misaligned(cpu, $ea, $size) {
@@ -290,6 +294,7 @@ macro_rules! fp_helper {
         /// Floating-point load/store; the FPR is read or written in place.
         pub(super) extern "C" fn $name(ctx: *mut JitCtx, $ea: u32, $fr: u32, pc: u32) -> u64 {
             guard(ctx, Some(pc), |ctx| {
+                ctx.called_memory = 1;
                 // SAFETY: see `step`.
                 let ($cpu, $mem) = unsafe { (&mut *ctx.cpu, &mut *ctx.mem) };
                 if misaligned($cpu, $ea, $size) {
