@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.8.1...ppc-v0.9.0) (2026-11-18)
+
+
+### Features
+
+* **jit:** read and write plain guest pages directly from generated code ([#112](https://github.com/benletchford/ppc-rs/issues/112)) ([7f8701a](https://github.com/benletchford/ppc-rs/commit/7f8701a07261af6d3a8d782ac3d573e0ba8b4ef4))
+
+
+### Performance Improvements
+
+* **jit:** check the code epoch at a block end only after a helper ran ([2a87178](https://github.com/benletchford/ppc-rs/commit/2a87178184600fd3e3ce0bd954e20ca2813e3d0f))
+
 ## [0.8.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.8.0...ppc-v0.8.1) (2026-11-05)
 
 
