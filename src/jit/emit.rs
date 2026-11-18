@@ -49,6 +49,14 @@ enum Load {
 }
 
 impl Load {
+    fn size(self) -> u32 {
+        match self {
+            Load::Byte => 1,
+            Load::Half | Load::HalfAlgebraic => 2,
+            Load::Word => 4,
+        }
+    }
+
     fn helper(self) -> usize {
         match self {
             Load::Byte => helper!(lbz),
@@ -567,18 +575,179 @@ impl Emitter<'_, '_> {
     // ---- memory ---------------------------------------------------------
 
     fn load(&mut self, kind: Load, index: u32, pc: u32, rt: u8, ea: Value) {
+        use super::direct::{DIRECT_ENTRIES, DIRECT_PAGE_SHIFT, DirectTlb};
+        let size = kind.size();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I32);
+
+        // A naturally aligned access to a page in the direct-read table reads
+        // host memory; anything else calls the helper, which may fill the
+        // table.
+        let page = self.b.ins().ushr_imm(ea, i64::from(DIRECT_PAGE_SHIFT));
+        let slot = self.b.ins().band_imm(page, (DIRECT_ENTRIES - 1) as i64);
+        let slot = self.b.ins().uextend(self.ptr, slot);
+        let tlb = self.b.ins().load(
+            self.ptr,
+            Self::flags(),
+            self.ctx,
+            offset_of!(super::JitCtx, tlb) as i32,
+        );
+        let tag_offset = self.b.ins().ishl_imm(slot, 2);
+        let tag_address = self.b.ins().iadd(tlb, tag_offset);
+        let tag = self.b.ins().load(
+            types::I32,
+            Self::flags(),
+            tag_address,
+            offset_of!(DirectTlb, tags) as i32,
+        );
+        let wanted = self.b.ins().iadd_imm(page, 1);
+        let mut hit = self.b.ins().icmp(IntCC::Equal, tag, wanted);
+        if size > 1 {
+            let low = self.b.ins().band_imm(ea, i64::from(size - 1));
+            let aligned = self.b.ins().icmp_imm(IntCC::Equal, low, 0);
+            hit = self.b.ins().band(hit, aligned);
+        }
+        self.b.ins().brif(hit, fast, &[], slow, &[]);
+
+        self.b.switch_to_block(fast);
+        let base_offset = self
+            .b
+            .ins()
+            .ishl_imm(slot, i64::from(self.ptr.bytes().trailing_zeros()));
+        let base_address = self.b.ins().iadd(tlb, base_offset);
+        let base = self.b.ins().load(
+            self.ptr,
+            Self::flags(),
+            base_address,
+            offset_of!(DirectTlb, bases) as i32,
+        );
+        let within = self
+            .b
+            .ins()
+            .band_imm(ea, ((1u32 << DIRECT_PAGE_SHIFT) - 1) as i64);
+        let within = self.b.ins().uextend(self.ptr, within);
+        let address = self.b.ins().iadd(base, within);
+        // Host pointers into guest buffers need not be aligned.
+        let memory = MemFlags::new().with_notrap();
+        let value = match kind {
+            Load::Byte => self.b.ins().uload8(types::I32, memory, address, 0),
+            Load::Half | Load::HalfAlgebraic => {
+                let raw = self.b.ins().load(types::I16, memory, address, 0);
+                let swapped = self.b.ins().bswap(raw);
+                if matches!(kind, Load::HalfAlgebraic) {
+                    self.b.ins().sextend(types::I32, swapped)
+                } else {
+                    self.b.ins().uextend(types::I32, swapped)
+                }
+            }
+            Load::Word => {
+                let raw = self.b.ins().load(types::I32, memory, address, 0);
+                self.b.ins().bswap(raw)
+            }
+        };
+        self.b.ins().jump(merge, &[BlockArg::Value(value)]);
+
+        self.b.switch_to_block(slow);
         let pc_value = self.c32(pc);
         let result = self.call(kind.helper(), false, &[ea, pc_value]);
         self.may_change_code = true;
         self.check_fault(result, index);
         let value = self.b.ins().ireduce(types::I32, result);
+        self.b.ins().jump(merge, &[BlockArg::Value(value)]);
+
+        self.b.switch_to_block(merge);
+        let value = self.b.block_params(merge)[0];
         self.set(rt, value);
     }
 
     fn store(&mut self, helper: usize, index: u32, pc: u32, ea: Value, value: Value) {
+        use super::direct::{DIRECT_ENTRIES, DIRECT_PAGE_SHIFT, DirectTlb};
+        let size: u32 = if helper == helper!(stb) {
+            1
+        } else if helper == helper!(sth) {
+            2
+        } else {
+            assert_eq!(helper, helper!(stw), "store helper without a direct form");
+            4
+        };
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+
+        // As for loads: a naturally aligned store to a page in the
+        // direct-write table writes host memory; anything else calls the
+        // helper, which may fill the table.
+        let page = self.b.ins().ushr_imm(ea, i64::from(DIRECT_PAGE_SHIFT));
+        let slot = self.b.ins().band_imm(page, (DIRECT_ENTRIES - 1) as i64);
+        let slot = self.b.ins().uextend(self.ptr, slot);
+        let tlb = self.b.ins().load(
+            self.ptr,
+            Self::flags(),
+            self.ctx,
+            offset_of!(super::JitCtx, tlb) as i32,
+        );
+        let tag_offset = self.b.ins().ishl_imm(slot, 2);
+        let tag_address = self.b.ins().iadd(tlb, tag_offset);
+        let tag = self.b.ins().load(
+            types::I32,
+            Self::flags(),
+            tag_address,
+            offset_of!(DirectTlb, write_tags) as i32,
+        );
+        let wanted = self.b.ins().iadd_imm(page, 1);
+        let mut hit = self.b.ins().icmp(IntCC::Equal, tag, wanted);
+        if size > 1 {
+            let low = self.b.ins().band_imm(ea, i64::from(size - 1));
+            let aligned = self.b.ins().icmp_imm(IntCC::Equal, low, 0);
+            hit = self.b.ins().band(hit, aligned);
+        }
+        self.b.ins().brif(hit, fast, &[], slow, &[]);
+
+        self.b.switch_to_block(fast);
+        let base_offset = self
+            .b
+            .ins()
+            .ishl_imm(slot, i64::from(self.ptr.bytes().trailing_zeros()));
+        let base_address = self.b.ins().iadd(tlb, base_offset);
+        let base = self.b.ins().load(
+            self.ptr,
+            Self::flags(),
+            base_address,
+            offset_of!(DirectTlb, write_bases) as i32,
+        );
+        let within = self
+            .b
+            .ins()
+            .band_imm(ea, ((1u32 << DIRECT_PAGE_SHIFT) - 1) as i64);
+        let within = self.b.ins().uextend(self.ptr, within);
+        let address = self.b.ins().iadd(base, within);
+        // Host pointers into guest buffers need not be aligned.
+        let memory = MemFlags::new().with_notrap();
+        match size {
+            1 => {
+                self.b.ins().istore8(memory, value, address, 0);
+            }
+            2 => {
+                let half = self.b.ins().ireduce(types::I16, value);
+                let swapped = self.b.ins().bswap(half);
+                self.b.ins().store(memory, swapped, address, 0);
+            }
+            _ => {
+                let swapped = self.b.ins().bswap(value);
+                self.b.ins().store(memory, swapped, address, 0);
+            }
+        }
+        self.b.ins().jump(done, &[]);
+
+        self.b.switch_to_block(slow);
         let pc_value = self.c32(pc);
         let result = self.call(helper, true, &[ea, value, pc_value]);
         self.check_fault(result, index);
+        self.b.ins().jump(done, &[]);
+
+        self.b.switch_to_block(done);
         self.may_change_code = true;
     }
 

@@ -13,6 +13,8 @@ pub(crate) struct JitCtx {
     pub(crate) budget: u64,
     /// Code epoch the running region was entered under.
     pub(crate) epoch: u64,
+    /// Direct-read table, validated for `mem` when the session started.
+    pub(crate) tlb: *mut super::direct::DirectTlb,
 }
 
 /// Adapter that lets a `?Sized` memory bus be used as `dyn PpcMemory`.
@@ -54,6 +56,18 @@ impl<M: PpcMemory + ?Sized> PpcMemory for MemAdapter<'_, M> {
     }
     fn code_epoch(&self) -> Option<u64> {
         self.0.code_epoch()
+    }
+    fn direct_read_page(&mut self, page: u32) -> Option<*const u8> {
+        self.0.direct_read_page(page)
+    }
+    fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+        self.0.direct_read_epoch()
+    }
+    fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+        self.0.direct_write_page(page)
+    }
+    fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+        self.0.direct_write_epoch()
     }
 }
 
@@ -97,6 +111,7 @@ impl Session<'_> {
         // Completed counts share a `u32` with `STOPPED`.
         self.ctx.budget = budget.min(u64::from(STOPPED >> 1));
         self.ctx.epoch = epoch;
+
         // SAFETY: guaranteed by the caller.
         let function: extern "C" fn(*mut PpcCpu, *mut JitCtx) -> u32 =
             unsafe { std::mem::transmute(code) };
@@ -123,6 +138,10 @@ pub(crate) fn with_session<M: PpcMemory + ?Sized, R>(
     mem: &mut M,
     body: impl FnOnce(&mut Session<'_>) -> R,
 ) -> R {
+    let tlb: *mut super::direct::DirectTlb = cpu.jit_direct_tlb();
+    // SAFETY: the table lives in its own allocation owned by `cpu`, which
+    // outlives the session; only this session's helpers and code touch it.
+    unsafe { (*tlb).validate(&*mem) };
     let mut adapter = MemAdapter(mem);
     let dyn_mem: *mut (dyn PpcMemory + '_) = &mut adapter;
     // SAFETY: the pointer is only dereferenced while `adapter` is alive, which
@@ -139,6 +158,7 @@ pub(crate) fn with_session<M: PpcMemory + ?Sized, R>(
             stop_pc: 0,
             budget: 0,
             epoch: 0,
+            tlb,
         },
         _marker: std::marker::PhantomData,
     };

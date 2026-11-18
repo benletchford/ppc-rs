@@ -225,7 +225,12 @@ macro_rules! load_helper {
                     return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Load);
                 }
                 match $read {
-                    Some(value) => u64::from(value),
+                    Some(value) => {
+                        // SAFETY: the session validated the table for this
+                        // memory; nothing else holds it during the call.
+                        unsafe { (*ctx.tlb).fill(&mut *ctx.mem, $ea) };
+                        u64::from(value)
+                    }
                     None => stop(
                         ctx,
                         pc,
@@ -257,7 +262,11 @@ macro_rules! store_helper {
                     return alignment(ctx, pc, $ea, $size, PpcMemoryAccess::Store);
                 }
                 match $write {
-                    Some(()) => 0,
+                    Some(()) => {
+                        // SAFETY: see the load helpers.
+                        unsafe { (*ctx.tlb).fill_write(&mut *ctx.mem, $ea) };
+                        0
+                    }
                     None => stop(
                         ctx,
                         pc,
