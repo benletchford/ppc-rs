@@ -102,6 +102,18 @@ const PPC_JIT_REGION_MAX_INSTRUCTIONS: usize = 512;
 /// threshold in standalone runs to start a region of its own.
 const PPC_JIT_COVERED_HOT_FACTOR: u32 = 8;
 
+/// Inactive JIT engine and per-CPU table retained for the opposite
+/// [`crate::PpcAlignmentPolicy`], bounding compiled allocations to at most two
+/// engines across repeated policy switches.
+#[derive(Debug, Clone)]
+pub(crate) struct JitStandby {
+    jit: std::sync::Arc<jit::JitShared>,
+    table: Box<[PpcJitEntry]>,
+    pending_regions: Vec<usize>,
+    finished_seen: usize,
+    link_gen: u32,
+}
+
 impl PpcCpu {
     /// Enable the Cranelift baseline JIT for cached basic blocks.
     ///
@@ -110,8 +122,15 @@ impl PpcCpu {
     /// generate code.
     pub fn enable_jit(&mut self, config: PpcJitConfig) -> Result<(), String> {
         jit::diag::enabled();
-        self.jit = Some(std::sync::Arc::new(jit::JitShared::new(config)?));
+        let emulate_data = self.alignment_policy == crate::PpcAlignmentPolicy::EmulateData;
+        self.jit = Some(std::sync::Arc::new(jit::JitShared::new(
+            config,
+            emulate_data,
+        )?));
+        self.jit_standby = None;
         self.jit_pending_regions.clear();
+        // The new engine counts finished jobs from zero.
+        self.jit_finished_seen = 0;
         self.jit_table = std::iter::repeat_with(PpcJitEntry::default)
             .take(PPC_JIT_TABLE_ENTRIES)
             .collect();
@@ -122,8 +141,58 @@ impl PpcCpu {
     /// handle is dropped.
     pub fn disable_jit(&mut self) {
         self.jit = None;
+        self.jit_standby = None;
         self.jit_pending_regions.clear();
         self.jit_table = Box::default();
+    }
+
+    /// Keep the active engine matching `alignment_policy`: generated code is
+    /// compiled for one policy (see `JitShared::emulate_data`). The opposite
+    /// policy's engine and table are retained in `jit_standby` so switching
+    /// back and forth reuses them instead of leaking new compiled allocations.
+    #[inline]
+    fn jit_follow_alignment_policy(&mut self) {
+        let emulate_data = self.alignment_policy == crate::PpcAlignmentPolicy::EmulateData;
+        let Some(active) = self.jit.as_ref() else {
+            return;
+        };
+        if active.emulate_data == emulate_data {
+            return;
+        }
+        if let Some(standby) = self.jit_standby.as_mut()
+            && standby.jit.emulate_data == emulate_data
+        {
+            if let Some(current) = self.jit.as_mut() {
+                std::mem::swap(current, &mut standby.jit);
+            }
+            std::mem::swap(&mut self.jit_table, &mut standby.table);
+            std::mem::swap(&mut self.jit_pending_regions, &mut standby.pending_regions);
+            std::mem::swap(&mut self.jit_finished_seen, &mut standby.finished_seen);
+            std::mem::swap(&mut self.jit_link_gen, &mut standby.link_gen);
+            return;
+        }
+        let config = active.config.clone();
+        let Ok(replacement) = jit::JitShared::new(config, emulate_data) else {
+            self.disable_jit();
+            return;
+        };
+        let previous = self.jit.replace(std::sync::Arc::new(replacement)).unwrap();
+        let previous_table = std::mem::replace(
+            &mut self.jit_table,
+            std::iter::repeat_with(PpcJitEntry::default)
+                .take(PPC_JIT_TABLE_ENTRIES)
+                .collect(),
+        );
+        let previous_pending = std::mem::take(&mut self.jit_pending_regions);
+        let previous_finished = std::mem::replace(&mut self.jit_finished_seen, 0);
+        let previous_link_gen = std::mem::replace(&mut self.jit_link_gen, 0);
+        self.jit_standby = Some(Box::new(JitStandby {
+            jit: previous,
+            table: previous_table,
+            pending_regions: previous_pending,
+            finished_seen: previous_finished,
+            link_gen: previous_link_gen,
+        }));
     }
 
     /// JIT activity counters for this CPU.
@@ -169,6 +238,7 @@ impl PpcCpu {
         block_len: usize,
         limits: PpcJitLimits,
     ) -> Option<PpcBasicBlockRunResult> {
+        self.jit_follow_alignment_policy();
         let jit = self.jit.as_ref()?;
         if !self.jit_pending_regions.is_empty() {
             let finished = jit.finished();

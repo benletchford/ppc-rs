@@ -51,13 +51,16 @@ impl PpcMemory for PanickingMemory {
 }
 
 fn check_panic(word: u32, region: bool, epoch_panic: bool) {
-    let engine = JitShared::new(PpcJitConfig {
-        threshold: 0,
-        verify: true,
-        jitdump: false,
-        background: false,
-        hot_threshold: 1,
-    })
+    let engine = JitShared::new(
+        PpcJitConfig {
+            threshold: 0,
+            verify: true,
+            jitdump: false,
+            background: false,
+            hot_threshold: 1,
+        },
+        false,
+    )
     .unwrap();
     // The preceding instruction must complete; the following instructions must
     // not run after a memory panic. An epoch panic happens at the block boundary.

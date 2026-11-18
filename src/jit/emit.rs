@@ -107,6 +107,8 @@ struct Emitter<'a, 'f> {
     /// Instructions completed by earlier blocks of the region.
     done: Value,
     may_change_code: bool,
+    /// Compiling for `PpcAlignmentPolicy::EmulateData`; see `direct_access_fits`.
+    emulate_data: bool,
     fault: Block,
     normal_exit: Block,
     /// `(exit block, pending cycles, instruction index, prior completed count)`.
@@ -128,13 +130,20 @@ pub(super) fn build(
     ptr: Type,
     start_pc: u32,
     words: &[u32],
+    emulate_data: bool,
 ) {
     let block = RegionBlock {
         pc: start_pc,
         words,
         successors: Vec::new(),
     };
-    build_region(b, call_conv, ptr, std::slice::from_ref(&block));
+    build_region(
+        b,
+        call_conv,
+        ptr,
+        std::slice::from_ref(&block),
+        emulate_data,
+    );
 }
 
 /// Build one function for a region of blocks. Control enters at the first
@@ -149,6 +158,7 @@ pub(super) fn build_region(
     call_conv: CallConv,
     ptr: Type,
     blocks: &[RegionBlock<'_>],
+    emulate_data: bool,
 ) {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -219,6 +229,7 @@ pub(super) fn build_region(
         fault,
         normal_exit,
         fault_exits: Vec::new(),
+        emulate_data,
     };
     let mut line = 1;
     for (index, block) in blocks.iter().enumerate() {
@@ -258,6 +269,28 @@ impl Emitter<'_, '_> {
 
     fn flags() -> MemFlags {
         MemFlags::trusted()
+    }
+
+    /// `hit` narrowed to accesses of `size` bytes at `ea` that may use a
+    /// direct-table pointer. Under `Trap`, as before, a naturally aligned one
+    /// (which also stays within its page); under `EmulateData`, which lets
+    /// the helper take misaligned accesses too, any one that ends within its
+    /// page. The policy is fixed when the engine is made, so this costs the
+    /// same one mask and comparison either way.
+    fn direct_access_fits(&mut self, ea: Value, size: u32, hit: Value) -> Value {
+        let fits = if self.emulate_data {
+            let page_bytes = 1u32 << super::direct::DIRECT_PAGE_SHIFT;
+            let within = self.b.ins().band_imm(ea, i64::from(page_bytes - 1));
+            self.b.ins().icmp_imm(
+                IntCC::UnsignedLessThanOrEqual,
+                within,
+                i64::from(page_bytes - size),
+            )
+        } else {
+            let low = self.b.ins().band_imm(ea, i64::from(size - 1));
+            self.b.ins().icmp_imm(IntCC::Equal, low, 0)
+        };
+        self.b.ins().band(hit, fits)
     }
 
     fn c32(&mut self, value: u32) -> Value {
@@ -593,9 +626,9 @@ impl Emitter<'_, '_> {
         let merge = self.b.create_block();
         self.b.append_block_param(merge, types::I32);
 
-        // A naturally aligned access to a page in the direct-read table reads
-        // host memory; anything else calls the helper, which may fill the
-        // table.
+        // An access to a page in the direct-read table that fits there (see
+        // `direct_access_fits`) reads host memory; anything else calls the
+        // helper, which may fill the table.
         let page = self.b.ins().ushr_imm(ea, i64::from(DIRECT_PAGE_SHIFT));
         let slot = self.b.ins().band_imm(page, (DIRECT_ENTRIES - 1) as i64);
         let slot = self.b.ins().uextend(self.ptr, slot);
@@ -616,9 +649,7 @@ impl Emitter<'_, '_> {
         let wanted = self.b.ins().iadd_imm(page, 1);
         let mut hit = self.b.ins().icmp(IntCC::Equal, tag, wanted);
         if size > 1 {
-            let low = self.b.ins().band_imm(ea, i64::from(size - 1));
-            let aligned = self.b.ins().icmp_imm(IntCC::Equal, low, 0);
-            hit = self.b.ins().band(hit, aligned);
+            hit = self.direct_access_fits(ea, size, hit);
         }
         self.b.ins().brif(hit, fast, &[], slow, &[]);
 
@@ -687,9 +718,9 @@ impl Emitter<'_, '_> {
         let slow = self.b.create_block();
         let done = self.b.create_block();
 
-        // As for loads: a naturally aligned store to a page in the
-        // direct-write table writes host memory; anything else calls the
-        // helper, which may fill the table.
+        // As for loads: a store to a page in the direct-write table that fits
+        // there writes host memory; anything else calls the helper, which may
+        // fill the table.
         let page = self.b.ins().ushr_imm(ea, i64::from(DIRECT_PAGE_SHIFT));
         let slot = self.b.ins().band_imm(page, (DIRECT_ENTRIES - 1) as i64);
         let slot = self.b.ins().uextend(self.ptr, slot);
@@ -710,9 +741,7 @@ impl Emitter<'_, '_> {
         let wanted = self.b.ins().iadd_imm(page, 1);
         let mut hit = self.b.ins().icmp(IntCC::Equal, tag, wanted);
         if size > 1 {
-            let low = self.b.ins().band_imm(ea, i64::from(size - 1));
-            let aligned = self.b.ins().icmp_imm(IntCC::Equal, low, 0);
-            hit = self.b.ins().band(hit, aligned);
+            hit = self.direct_access_fits(ea, size, hit);
         }
         self.b.ins().brif(hit, fast, &[], slow, &[]);
 

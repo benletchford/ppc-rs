@@ -936,12 +936,143 @@ fn direct_page_loads_and_stores_match_the_interpreter_and_skip_the_bus() {
     let (interpreted, interpreted_accesses) = run(false);
     let (jitted, jitted_accesses) = run(true);
     assert!(interpreted == jitted, "direct accesses changed the result");
-    // The two misaligned accesses (8 of the 24 byte accesses per pass) and
-    // table misses still use the methods; the aligned ones must not.
+    // No access crosses a page, so with misaligned accesses allowed only
+    // table misses (once per page and epoch) may use the methods.
     assert!(
-        jitted_accesses * 2 < interpreted_accesses,
+        jitted_accesses * 20 < interpreted_accesses,
         "{jitted_accesses} of {interpreted_accesses} accesses used the methods"
     );
+}
+
+#[test]
+fn misaligned_direct_accesses_match_the_interpreter_at_page_ends() {
+    use ppc::PpcMemory;
+
+    struct CountingBus {
+        memory: PpcSectionMem,
+        method_accesses: u64,
+    }
+    impl PpcMemory for CountingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.method_accesses += u64::from(addr >= DATA);
+            self.memory.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            self.method_accesses += u64::from(addr >= DATA);
+            self.memory.write_u8(addr, value)
+        }
+        fn direct_read_page(&mut self, page: u32) -> Option<*const u8> {
+            self.memory.direct_read_page(page)
+        }
+        fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+            self.memory.direct_read_epoch()
+        }
+        fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+            self.memory.direct_write_page(page)
+        }
+        fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+            self.memory.direct_write_epoch()
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.memory.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.memory.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.memory.code_epoch()
+        }
+    }
+    // Three one-page regions. r5 walks one byte at a time across the end of
+    // the first page, so every load width meets every offset near it; the
+    // stores, 4 KiB further on, cross the end of the second page:
+    //   lwz r3,0(r5); lhz r4,1(r5); lha r6,2(r5)
+    //   stw r3,0x1000(r5); sth r4,0x1005(r5)
+    //   add r7,r7,r3; add r7,r7,r4; add r7,r7,r6 (every value loaded counts)
+    //   addi r5,r5,1; bdnz loop; b .
+    let words = [
+        d_form(32, 3, 5, 0),
+        d_form(40, 4, 5, 1),
+        d_form(42, 6, 5, 2),
+        d_form(36, 3, 5, 0x1000),
+        d_form(44, 4, 5, 0x1005),
+        x_form(31, 7, 7, 3, 266, 0),
+        x_form(31, 7, 7, 4, 266, 0),
+        x_form(31, 7, 7, 6, 266, 0),
+        d_form(14, 5, 5, 1),
+        0x4200_ffdc,
+        0x4800_0000,
+    ];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    const LEN: usize = 0x3000;
+    let data: Vec<u8> = (0..LEN).map(|i| (i * 37 + 11) as u8).collect();
+    let run = |jit, policy| {
+        // Each page is its own region, so the host bytes after a page are
+        // not the next page: they are spare capacity holding a sentinel,
+        // which an access running past the page would read or overwrite.
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, code.clone());
+        for page in 0..3 {
+            let mut bytes = data[page * 0x1000..(page + 1) * 0x1000].to_vec();
+            bytes.resize(0x1000 + 16, 0xa5);
+            bytes.truncate(0x1000);
+            memory.add_region(DATA + page as u32 * 0x1000, bytes);
+        }
+        let mut bus = CountingBus {
+            memory,
+            method_accesses: 0,
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.alignment_policy = policy;
+        cpu.pc = CODE;
+        // Under `Trap`, the first pass's word load is the last aligned one
+        // in the page, and its halfword load, one byte into that word, traps.
+        cpu.gpr[5] = DATA + 0x1000
+            - if policy == PpcAlignmentPolicy::Trap {
+                4
+            } else {
+                48
+            };
+        cpu.ctr = 64;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                background: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let result = cpu.run_with_imports(&mut bus, 2000, 0, 0, 0, |_, _, _| unreachable!());
+        let mut bytes = vec![0; LEN];
+        bus.memory.read_bytes_into(DATA, &mut bytes).unwrap();
+        (
+            (format!("{result:?}"), cpu.pc, cpu.gpr, cpu.ctr, bytes),
+            bus.method_accesses,
+        )
+    };
+    for policy in [PpcAlignmentPolicy::Trap, PpcAlignmentPolicy::EmulateData] {
+        let (interpreted, interpreted_accesses) = run(false, policy);
+        let (jitted, jitted_accesses) = run(true, policy);
+        assert!(
+            interpreted == jitted,
+            "{policy:?}: direct accesses changed the result"
+        );
+        if policy == PpcAlignmentPolicy::EmulateData {
+            assert_eq!(interpreted.3, 0, "the loop must finish");
+            // Only accesses that cross into the second page (and table
+            // misses) may use the methods.
+            assert!(
+                jitted_accesses * 10 < interpreted_accesses,
+                "{jitted_accesses} of {interpreted_accesses} accesses used the methods"
+            );
+        } else {
+            assert!(interpreted.0.contains("Alignment"), "{}", interpreted.0);
+            assert_eq!(
+                interpreted.2[3],
+                u32::from_be_bytes(data[0xffc..0x1000].try_into().unwrap())
+            );
+        }
+    }
 }
 
 #[test]
@@ -1130,4 +1261,109 @@ fn store_remapping_code_exits_a_hot_region() {
         assert_eq!(interpreted.0, 7, "{store:#010x}");
         assert_eq!(run(true, store), interpreted, "{store:#010x}");
     }
+}
+
+#[test]
+fn code_compiled_for_misaligned_access_is_not_run_after_the_policy_traps() {
+    // A loop of misaligned loads, hot under `EmulateData`, then run again
+    // under `Trap`: the first load must raise the alignment exception.
+    //   lwz r3,1(r5); bdnz loop; b .
+    let words = [d_form(32, 3, 5, 1), 0x4200_fffc, 0x4800_0000];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, code.clone());
+        memory.add_region(DATA, (0..DATA_LEN).map(|i| i as u8).collect());
+        let mut cpu = PpcCpu::new();
+        cpu.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        cpu.pc = CODE;
+        cpu.gpr[5] = DATA;
+        cpu.ctr = 1000;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                hot_threshold: 2,
+                background: false,
+                verify: true,
+                jitdump: false,
+            })
+            .unwrap();
+        }
+        cpu.run_with_imports(&mut memory, 400, 0, 0, 0, |_, _, _| unreachable!());
+        if jit {
+            assert!(cpu.jit_stats().regions_compiled > 0);
+        }
+        cpu.alignment_policy = PpcAlignmentPolicy::Trap;
+        cpu.pc = CODE;
+        let result = cpu.run_with_imports(&mut memory, 400, 0, 0, 0, |_, _, _| unreachable!());
+        (format!("{result:?}"), cpu.pc, cpu.gpr[3], cpu.ctr)
+    };
+    let interpreted = run(false);
+    assert!(interpreted.0.contains("Alignment"), "{}", interpreted.0);
+    assert_eq!(run(true), interpreted);
+}
+
+#[test]
+fn repeated_alignment_policy_switches_reuse_compiled_engines_and_match_interpreter() {
+    // Switch between `EmulateData` and `Trap` multiple times on the same CPU:
+    // every run matches the interpreter, and once both policy engines have
+    // compiled the hot loop, later switches reuse them without recompiling.
+    //   lwz r3,1(r5); bdnz loop; b .
+    let words = [d_form(32, 3, 5, 1), 0x4200_fffc, 0x4800_0000];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let policies = [
+        PpcAlignmentPolicy::EmulateData,
+        PpcAlignmentPolicy::Trap,
+        PpcAlignmentPolicy::EmulateData,
+        PpcAlignmentPolicy::Trap,
+        PpcAlignmentPolicy::EmulateData,
+        PpcAlignmentPolicy::Trap,
+    ];
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, code.clone());
+        memory.add_region(DATA, (0..DATA_LEN).map(|i| i as u8).collect());
+        let mut cpu = PpcCpu::new();
+        cpu.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        cpu.gpr[5] = DATA;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                hot_threshold: 2,
+                background: false,
+                verify: true,
+                jitdump: false,
+            })
+            .unwrap();
+        }
+        let mut outcomes = Vec::new();
+        let mut compiled_after_first_pair = None;
+        for (step, policy) in policies.into_iter().enumerate() {
+            cpu.alignment_policy = policy;
+            cpu.pc = CODE;
+            cpu.ctr = 200;
+            let result = cpu.run_with_imports(&mut memory, 400, 0, 0, 0, |_, _, _| unreachable!());
+            outcomes.push((format!("{result:?}"), cpu.pc, cpu.gpr[3], cpu.ctr));
+            if jit && step == 1 {
+                let stats = cpu.jit_stats();
+                assert!(stats.blocks_compiled > 0);
+                assert!(stats.regions_compiled > 0);
+                compiled_after_first_pair = Some((stats.blocks_compiled, stats.regions_compiled));
+            }
+        }
+        if jit {
+            let stats = cpu.jit_stats();
+            assert_eq!(
+                Some((stats.blocks_compiled, stats.regions_compiled)),
+                compiled_after_first_pair,
+                "later policy switches must reuse the retained engines without recompiling"
+            );
+        }
+        outcomes
+    };
+    let interpreted = run(false);
+    assert!(interpreted[1].0.contains("Alignment"));
+    assert!(interpreted[3].0.contains("Alignment"));
+    assert!(interpreted[5].0.contains("Alignment"));
+    assert_eq!(run(true), interpreted);
 }
