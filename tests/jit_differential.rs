@@ -799,3 +799,254 @@ fn load_remapping_code_exits_a_hot_region() {
         assert_eq!(run(true, load_opcode), interpreted);
     }
 }
+
+#[test]
+fn a_region_mapped_between_runs_is_read_instead_of_a_stale_direct_page() {
+    // lbz r3,0(r5); stb r3,1(r5); b .
+    let words = [d_form(34, 3, 5, 0), d_form(38, 3, 5, 1), 0x48000000];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, code.clone());
+        memory.add_region(DATA, vec![1; 4096]);
+        let mut cpu = PpcCpu::new();
+        cpu.gpr[5] = DATA;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                background: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let mut seen = Vec::new();
+        // The first run compiles the block, the second runs it natively and
+        // fills the direct-access table, the third follows a remapping.
+        for value in [1, 1, 7] {
+            if value == 7 {
+                // The host maps a new page over the data between runs. Its
+                // byte at 1 differs from the one the program stores there,
+                // so a store to the old page would show.
+                let mut page = vec![7; 4096];
+                page[1] = 9;
+                memory.add_region(DATA, page);
+            }
+            cpu.pc = CODE;
+            cpu.run_with_imports(&mut memory, 20, 0, 0, 0, |_, _, _| unreachable!());
+            let mut byte = [0];
+            memory.read_bytes_into(DATA + 1, &mut byte).unwrap();
+            seen.push((cpu.gpr[3], byte[0]));
+        }
+        if jit {
+            assert!(cpu.jit_stats().instructions > 0);
+        }
+        seen
+    };
+    assert_eq!(run(false), [(1, 1), (1, 1), (7, 7)]);
+    assert_eq!(run(true), run(false));
+}
+
+#[test]
+fn direct_page_loads_and_stores_match_the_interpreter_and_skip_the_bus() {
+    use ppc::PpcMemory;
+
+    /// A plain memory that counts the accesses it serves through its methods
+    /// and offers its data page for direct reads and writes.
+    struct CountingBus {
+        memory: PpcSectionMem,
+        method_accesses: u64,
+    }
+    impl PpcMemory for CountingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.method_accesses += u64::from(addr >= DATA);
+            self.memory.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            self.method_accesses += 1;
+            self.memory.write_u8(addr, value)
+        }
+        fn direct_read_page(&mut self, page: u32) -> Option<*const u8> {
+            self.memory.direct_read_page(page)
+        }
+        fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+            self.memory.direct_read_epoch()
+        }
+        fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+            self.memory.direct_write_page(page)
+        }
+        fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+            self.memory.direct_write_epoch()
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.memory.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.memory.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.memory.code_epoch()
+        }
+    }
+    // A loop over every access width, aligned and not:
+    //   lwz r3,0(r5); lhz r4,6(r5); lha r6,10(r5); lbz r7,13(r5)
+    //   stw r3,64(r5); sth r4,70(r5); stb r6,77(r5); stw r7,81(r5) (misaligned)
+    //   lwz r8,1(r5) (misaligned); addi r5,r5,96; bdnz loop; b .
+    let words = [
+        d_form(32, 3, 5, 0),
+        d_form(40, 4, 5, 6),
+        d_form(42, 6, 5, 10),
+        d_form(34, 7, 5, 13),
+        d_form(36, 3, 5, 64),
+        d_form(44, 4, 5, 70),
+        d_form(38, 6, 5, 77),
+        d_form(36, 7, 5, 81),
+        d_form(32, 8, 5, 1),
+        d_form(14, 5, 5, 96),
+        0x4200_ffd8,
+        0x4800_0000,
+    ];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+    let data: Vec<u8> = (0..DATA_LEN).map(|i| (i * 37 + 11) as u8).collect();
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, code.clone());
+        memory.add_region(DATA, data.clone());
+        let mut bus = CountingBus {
+            memory,
+            method_accesses: 0,
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        cpu.pc = CODE;
+        cpu.gpr[5] = DATA;
+        cpu.ctr = 60;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                background: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        cpu.run_with_imports(&mut bus, 2000, 0, 0, 0, |_, _, _| unreachable!());
+        let mut bytes = vec![0; DATA_LEN];
+        bus.memory.read_bytes_into(DATA, &mut bytes).unwrap();
+        ((cpu.gpr, bytes), bus.method_accesses)
+    };
+    let (interpreted, interpreted_accesses) = run(false);
+    let (jitted, jitted_accesses) = run(true);
+    assert!(interpreted == jitted, "direct accesses changed the result");
+    // The two misaligned accesses (8 of the 24 byte accesses per pass) and
+    // table misses still use the methods; the aligned ones must not.
+    assert!(
+        jitted_accesses * 2 < interpreted_accesses,
+        "{jitted_accesses} of {interpreted_accesses} accesses used the methods"
+    );
+}
+
+#[test]
+fn a_page_first_executed_between_chained_blocks_leaves_the_direct_write_table() {
+    use ppc::PpcMemory;
+
+    /// Writable memory that, once `marking` is set, marks a page executed
+    /// the first time its instruction token is asked for, moving its code
+    /// and direct-write epochs. It counts the stores that reach `write_u8`
+    /// on executed pages.
+    struct MarkingBus {
+        memory: PpcSectionMem,
+        marking: bool,
+        generation: u64,
+        executed: std::collections::BTreeSet<u32>,
+        writes_to_executed: u64,
+    }
+    impl PpcMemory for MarkingBus {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.memory.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            if self.executed.contains(&(addr >> 12)) {
+                self.writes_to_executed += 1;
+            }
+            self.memory.write_u8(addr, value)
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            if self.marking {
+                self.executed.insert(addr >> 12);
+            }
+            Some(1 + u64::from(addr >> 12))
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            Some(self.generation + self.executed.len() as u64)
+        }
+        fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+            if self.executed.contains(&page) {
+                return None;
+            }
+            self.memory.direct_write_page(page)
+        }
+        fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+            let [identity, mapping, ..] = self.memory.direct_write_epoch()?;
+            Some([identity, mapping, self.executed.len() as u64, 0])
+        }
+    }
+    const SECOND: u32 = CODE + 0x1000;
+    // First page: stw r4,0(r5); b SECOND. Second page, where r5 points:
+    // stw r4,0(r5); b CODE. Running the second block marks its page
+    // executed, so later stores to it must reach the memory.
+    let mut code = vec![0u8; 0x2000];
+    for (at, word) in [
+        (0, d_form(36, 4, 5, 0)),
+        (4, 0x4800_0000 | (SECOND - CODE - 4)),
+        (0x1000, d_form(36, 4, 5, 0)),
+        (
+            0x1004,
+            0x4800_0000 | ((CODE.wrapping_sub(SECOND + 4)) & 0x03ff_fffc),
+        ),
+    ] {
+        code[at..at + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_region(CODE, code.clone());
+        let mut bus = MarkingBus {
+            memory,
+            marking: false,
+            generation: 0,
+            executed: Default::default(),
+            writes_to_executed: 0,
+        };
+        let mut cpu = PpcCpu::new();
+        cpu.pc = CODE;
+        cpu.gpr[4] = 0x6000_0000;
+        cpu.gpr[5] = SECOND + 0x800;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 0,
+                background: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        // Both blocks compile and chain while no page counts as executed.
+        cpu.run_with_imports(&mut bus, 400, 0, 0, 0, |_, _, _| unreachable!());
+        // The host turns marking on and moves the code epoch, so the next
+        // run checks the blocks' tokens again, from inside the chaining loop
+        // for the second block.
+        bus.marking = true;
+        bus.generation += 100;
+        cpu.run_with_imports(&mut bus, 400, 0, 0, 0, |_, _, _| unreachable!());
+        if jit {
+            assert!(cpu.jit_stats().instructions > 600, "{:?}", cpu.jit_stats());
+        }
+        bus.writes_to_executed
+    };
+    let interpreted = run(false);
+    assert!(interpreted > 0);
+    assert_eq!(run(true), interpreted);
+}
+
+#[test]
+fn a_cpu_with_its_direct_access_table_is_send_and_sync() {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<PpcCpu>();
+}

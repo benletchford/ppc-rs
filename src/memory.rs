@@ -116,6 +116,68 @@ pub trait PpcMemory {
         None
     }
 
+    /// A host pointer to the first byte of the 4 KiB guest page
+    /// `page << 12`, if generated code may load any byte of that page by
+    /// reading the pointer directly instead of calling [`Self::read_u8`] and
+    /// friends.
+    ///
+    /// Only offer a page whose every byte is mapped, reads the same bytes
+    /// through the pointer as through the read methods, and has no read side
+    /// effects. The pointer must stay valid, and keep showing what the read
+    /// methods would, for as long as [`Self::direct_read_epoch`] returns the
+    /// same value. The default offers nothing.
+    ///
+    /// The pointed-to bytes must not move when the memory value itself is
+    /// moved (keep them on the heap).
+    ///
+    /// The JIT checks the epochs each time the run loop enters generated
+    /// code, so host code between entries (import and cycle handlers, for
+    /// example) may remap memory freely. In no call the CPU makes into this
+    /// memory may either epoch change, so a memory whose own accesses can
+    /// remap memory must not offer the pages they can affect. The one
+    /// exception: [`Self::instruction_cache_token`] may move
+    /// [`Self::direct_write_epoch`] if it also moves [`Self::code_epoch`],
+    /// which must then be `Some`.
+    #[inline]
+    fn direct_read_page(&mut self, _page: u32) -> Option<*const u8> {
+        None
+    }
+
+    /// A value that stays the same only while every pointer returned by
+    /// [`Self::direct_read_page`] stays valid. It must differ between
+    /// independent memories, including clones; see [`Self::direct_read_page`]
+    /// for when it may change. `None` (the default) means no page is offered.
+    #[inline]
+    fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+        None
+    }
+
+    /// A host pointer to the first byte of the 4 KiB guest page
+    /// `page << 12`, if generated code may store to any byte of that page by
+    /// writing through the pointer instead of calling [`Self::write_u8`] and
+    /// friends.
+    ///
+    /// Only offer a page whose every byte is mapped and writable, where a
+    /// store through the pointer has exactly the effect of the write methods
+    /// (no observer, no code that must notice the change). The pointer must
+    /// stay valid, and keep that property, for as long as
+    /// [`Self::direct_write_epoch`] returns the same value; see
+    /// [`Self::direct_read_page`] for when the epochs may change. The default
+    /// offers nothing.
+    #[inline]
+    fn direct_write_page(&mut self, _page: u32) -> Option<*mut u8> {
+        None
+    }
+
+    /// A value that stays the same only while every pointer returned by
+    /// [`Self::direct_write_page`] stays valid. It must differ between
+    /// independent memories, including clones; see [`Self::direct_read_page`]
+    /// for when it may change. `None` (the default) means no page is offered.
+    #[inline]
+    fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+        None
+    }
+
     /// Write a big-endian 32-bit value. Default impl falls through
     /// to four byte writes.
     fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
@@ -163,8 +225,11 @@ impl PpcMemory for NullMemory {
 /// the host via [`Self::add_readonly_region`]; writes to read-only
 /// regions return `None` and surface as a `MemoryFault` rather
 /// than silently mutating the shared backing store.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PpcSectionMem {
+    /// Distinguishes this memory from every other, clones included, in
+    /// [`PpcMemory::direct_read_epoch`].
+    identity: u64,
     regions: Vec<PpcMemRegion>,
     page_cache: Box<[Option<(u32, usize)>]>,
     overlap_span_cache: Box<[Option<(u32, u32, usize)>]>,
@@ -191,6 +256,8 @@ const PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES: usize = 4_096;
 const PPC_SECTION_MEM_REGION_CACHE_ENTRIES: usize = 4;
 const PPC_SECTION_MEM_INSTRUCTION_CACHE_ENTRIES: usize = 4_096;
 const PPC_SECTION_MEM_PAGE_SHIFT: u32 = 12;
+// `PpcMemory::direct_*_page` pages are 4 KiB; this memory offers its own.
+const _: () = assert!(PPC_SECTION_MEM_PAGE_SHIFT == 12);
 const PPC_SECTION_MEM_PAGE_CACHE_INDEX_MASK: usize = PPC_SECTION_MEM_PAGE_CACHE_ENTRIES - 1;
 const PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_INDEX_MASK: usize =
     PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES - 1;
@@ -224,9 +291,31 @@ struct PpcMemRegion {
     writable: bool,
 }
 
+static NEXT_SECTION_MEM_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_section_mem_identity() -> u64 {
+    NEXT_SECTION_MEM_IDENTITY.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Clone for PpcSectionMem {
+    fn clone(&self) -> Self {
+        Self {
+            identity: next_section_mem_identity(),
+            regions: self.regions.clone(),
+            page_cache: self.page_cache.clone(),
+            overlap_span_cache: self.overlap_span_cache.clone(),
+            region_cache: self.region_cache,
+            instruction_cache: self.instruction_cache.clone(),
+            instruction_mapping_token: self.instruction_mapping_token,
+            has_overlapping_regions: self.has_overlapping_regions,
+        }
+    }
+}
+
 impl Default for PpcSectionMem {
     fn default() -> Self {
         Self {
+            identity: next_section_mem_identity(),
             regions: Vec::new(),
             page_cache: vec![None; PPC_SECTION_MEM_PAGE_CACHE_ENTRIES].into_boxed_slice(),
             overlap_span_cache: vec![None; PPC_SECTION_MEM_OVERLAP_SPAN_CACHE_ENTRIES]
@@ -721,6 +810,44 @@ impl PpcSectionMem {
 }
 
 impl PpcMemory for PpcSectionMem {
+    fn direct_read_page(&mut self, page: u32) -> Option<*const u8> {
+        // Overlapping mappings can show different regions within one page.
+        if self.has_overlapping_regions {
+            return None;
+        }
+        let start = page.checked_mul(1 << PPC_SECTION_MEM_PAGE_SHIFT)?;
+        let (index, offset) = self.locate_cached(start)?;
+        let bytes = &self.regions[index].bytes;
+        (bytes.len().checked_sub(offset)? >= 1 << PPC_SECTION_MEM_PAGE_SHIFT)
+            .then(|| bytes[offset..].as_ptr())
+    }
+
+    fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+        // Every new region takes a fresh token, and region buffers never
+        // move or change size otherwise.
+        Some([self.identity, self.instruction_mapping_token])
+    }
+
+    fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+        if self.has_overlapping_regions {
+            return None;
+        }
+        let start = page.checked_mul(1 << PPC_SECTION_MEM_PAGE_SHIFT)?;
+        let (index, offset) = self.locate_cached(start)?;
+        let region = &mut self.regions[index];
+        // Instruction caching covers read-only regions only, so a store to a
+        // writable one never has a cached decoding to invalidate.
+        if !region.writable {
+            return None;
+        }
+        (region.bytes.len().checked_sub(offset)? >= 1 << PPC_SECTION_MEM_PAGE_SHIFT)
+            .then(|| region.bytes[offset..].as_mut_ptr())
+    }
+
+    fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+        Some([self.identity, self.instruction_mapping_token, 0, 0])
+    }
+
     fn read_u8(&mut self, addr: u32) -> Option<u8> {
         let (i, off) = self.locate_cached(addr)?;
         Some(self.regions[i].bytes[off])
@@ -865,6 +992,48 @@ impl PpcMemory for PpcSectionMem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_pages_cover_whole_pages_of_one_region() {
+        let mut memory = PpcSectionMem::new();
+        memory.add_region(0x1000, vec![1; 0x2800]);
+        memory.add_readonly_region(0x8000, vec![2; 0x1000]);
+        // A whole writable page, at its first byte.
+        let page = memory.direct_read_page(1).unwrap();
+        assert_eq!(unsafe { *page }, 1);
+        assert_eq!(
+            memory.direct_write_page(2).map(|p| p as *const u8),
+            Some(unsafe { page.add(0x1000) })
+        );
+        // The region ends 0x800 into page 3, and page 4 is unmapped.
+        assert!(memory.direct_read_page(3).is_none());
+        assert!(memory.direct_read_page(4).is_none());
+        // Read-only pages are offered for reads only.
+        assert!(memory.direct_read_page(8).is_some());
+        assert!(memory.direct_write_page(8).is_none());
+    }
+
+    #[test]
+    fn direct_page_epochs_move_with_new_regions_and_differ_between_clones() {
+        let mut memory = PpcSectionMem::new();
+        memory.add_region(0x1000, vec![0; 0x1000]);
+        let (read, write) = (memory.direct_read_epoch(), memory.direct_write_epoch());
+        let clone = memory.clone();
+        assert_ne!(clone.direct_read_epoch(), read);
+        assert_ne!(clone.direct_write_epoch(), write);
+        memory.add_region(0x4000, vec![0; 0x1000]);
+        assert_ne!(memory.direct_read_epoch(), read);
+        assert_ne!(memory.direct_write_epoch(), write);
+    }
+
+    #[test]
+    fn overlapping_regions_offer_no_direct_pages() {
+        let mut memory = PpcSectionMem::new();
+        memory.add_region(0x1000, vec![1; 0x2000]);
+        memory.add_region(0x1800, vec![2; 0x100]);
+        assert!(memory.direct_read_page(1).is_none());
+        assert!(memory.direct_write_page(2).is_none());
+    }
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]

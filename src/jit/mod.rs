@@ -19,6 +19,8 @@ pub(crate) use compiler::{
 };
 mod config;
 pub use config::{PpcJitConfig, PpcJitStats};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod direct;
 
 #[cfg(target_family = "wasm")]
 mod unsupported;

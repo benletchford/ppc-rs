@@ -520,6 +520,8 @@ pub struct PpcCpu {
     jit: Option<std::sync::Arc<jit::JitShared>>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_stats: PpcJitStats,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_direct: jit::direct::DirectTable,
     /// Allocated while the JIT is enabled.
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_table: Box<[PpcJitEntry]>,
@@ -608,6 +610,8 @@ impl PpcCpu {
             jit: None,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_stats: PpcJitStats::default(),
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_direct: Default::default(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_table: Box::default(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]

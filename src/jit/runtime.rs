@@ -131,6 +131,23 @@ impl PpcCpu {
         self.jit_stats
     }
 
+    /// Instruction-token lookups may move the code epoch, and with it the
+    /// direct-write epoch (see `PpcMemory::direct_read_page`). Called after
+    /// lookups made between chained blocks, where the session's check at
+    /// entry does not see the move.
+    fn recheck_direct_writes<M: PpcMemory + ?Sized>(&mut self, mem: &M, read_epoch: u64) {
+        if mem.code_epoch().unwrap_or(0) != read_epoch {
+            // SAFETY: no generated code runs during a chaining decision, and
+            // the session reaches the table through the same pointer.
+            unsafe { (*self.jit_direct.get()).validate_writes(mem) };
+        }
+    }
+
+    /// The direct-access table generated code consults before a memory helper.
+    pub(crate) fn jit_direct_tlb(&mut self) -> *mut jit::direct::DirectTlb {
+        self.jit_direct.get()
+    }
+
     #[inline]
     pub(crate) fn jit_table_index(pc: u32) -> usize {
         ((pc >> 2) as usize) & (PPC_JIT_TABLE_ENTRIES - 1)
@@ -405,10 +422,11 @@ impl PpcCpu {
             }
             if epoch == 0 || slot.epoch != epoch {
                 let token = slot.memory_token;
-                if mem.global_instruction_cache_token() != Some(token)
-                    && mem.instruction_cache_token(pc) != Some(token)
-                    && !self.refresh_jit_token(mem, index, pc)
-                {
+                let current = mem.global_instruction_cache_token() == Some(token)
+                    || mem.instruction_cache_token(pc) == Some(token)
+                    || self.refresh_jit_token(mem, index, pc);
+                self.recheck_direct_writes(mem, epoch);
+                if !current {
                     return None;
                 }
                 self.jit_table[index].epoch = epoch;
@@ -458,6 +476,7 @@ impl PpcCpu {
             })
         {
             self.form_jit_region(mem, from, epoch);
+            self.recheck_direct_writes(mem, epoch);
         }
         Some((link.code, index, epoch))
     }

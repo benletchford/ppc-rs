@@ -1,0 +1,165 @@
+//! Direct guest-memory access for generated code.
+//!
+//! A small direct-mapped table maps guest pages to host pointers that loads
+//! and stores may use directly, skipping the memory helpers. Entries come
+//! only from [`PpcMemory::direct_read_page`] and [`PpcMemory::direct_write_page`]
+//! and are valid while the matching epoch is unchanged. Each entry into
+//! generated code from the run loop drops the entries whose epoch moved, and
+//! the chaining loop checks the write entries again whenever the code epoch
+//! has moved, the only change the memory may make while generated code runs
+//! (see the trait documentation).
+
+use crate::PpcMemory;
+
+/// Guest page size covered by one entry: the 4 KiB pages of the
+/// `PpcMemory::direct_*_page` methods.
+pub(crate) const DIRECT_PAGE_SHIFT: u32 = 12;
+/// Number of entries; a power of two.
+pub(crate) const DIRECT_ENTRIES: usize = 256;
+
+/// The table read by generated code. `tags[i]` is the page number plus one of
+/// the page whose first byte is at `bases[i]`, or zero for an empty entry.
+#[repr(C)]
+#[derive(Clone)]
+pub(crate) struct DirectTlb {
+    pub(crate) tags: [u32; DIRECT_ENTRIES],
+    pub(crate) bases: [usize; DIRECT_ENTRIES],
+    /// Pages stores may write directly, laid out like `tags`/`bases`.
+    pub(crate) write_tags: [u32; DIRECT_ENTRIES],
+    pub(crate) write_bases: [usize; DIRECT_ENTRIES],
+    /// Per slot, the page (plus one) last refused for direct reads or
+    /// writes, so a page that is never offered costs one lookup per epoch.
+    refused: [u32; DIRECT_ENTRIES],
+    write_refused: [u32; DIRECT_ENTRIES],
+    /// The epoch the read entries were filled under; `None` disables filling.
+    epoch: Option<[u64; 2]>,
+    /// The epoch the write entries were filled under; `None` disables filling.
+    write_epoch: Option<[u64; 4]>,
+}
+
+impl Default for DirectTlb {
+    fn default() -> Self {
+        Self {
+            tags: [0; DIRECT_ENTRIES],
+            bases: [0; DIRECT_ENTRIES],
+            write_tags: [0; DIRECT_ENTRIES],
+            write_bases: [0; DIRECT_ENTRIES],
+            refused: [0; DIRECT_ENTRIES],
+            write_refused: [0; DIRECT_ENTRIES],
+            epoch: None,
+            write_epoch: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for DirectTlb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectTlb")
+            .field("epoch", &self.epoch)
+            .field(
+                "entries",
+                &self.tags.iter().filter(|&&tag| tag != 0).count(),
+            )
+            .finish()
+    }
+}
+
+impl DirectTlb {
+    /// Keep the entries only if `mem` is still under the epoch they were
+    /// filled under.
+    pub(crate) fn validate<M: PpcMemory + ?Sized>(&mut self, mem: &M) {
+        // Generated code byte-swaps guest values for a little-endian host.
+        let epoch = mem
+            .direct_read_epoch()
+            .filter(|_| cfg!(target_endian = "little"));
+        if epoch != self.epoch {
+            self.tags = [0; DIRECT_ENTRIES];
+            self.refused = [0; DIRECT_ENTRIES];
+            self.epoch = epoch;
+        }
+        self.validate_writes(mem);
+    }
+
+    /// Keep the write entries only if `mem` is still under their epoch.
+    pub(crate) fn validate_writes<M: PpcMemory + ?Sized>(&mut self, mem: &M) {
+        let epoch = mem
+            .direct_write_epoch()
+            .filter(|_| cfg!(target_endian = "little"));
+        if epoch != self.write_epoch {
+            self.write_tags = [0; DIRECT_ENTRIES];
+            self.write_refused = [0; DIRECT_ENTRIES];
+            self.write_epoch = epoch;
+        }
+    }
+
+    /// Record the page holding `addr` if `mem` offers it for direct writes.
+    pub(crate) fn fill_write(&mut self, mem: &mut dyn PpcMemory, addr: u32) {
+        if self.write_epoch.is_none() {
+            return;
+        }
+        let page = addr >> DIRECT_PAGE_SHIFT;
+        let slot = page as usize & (DIRECT_ENTRIES - 1);
+        if self.write_tags[slot] == page + 1 || self.write_refused[slot] == page + 1 {
+            return;
+        }
+        match mem.direct_write_page(page) {
+            Some(base) => {
+                self.write_tags[slot] = page + 1;
+                self.write_bases[slot] = base as usize;
+            }
+            None => self.write_refused[slot] = page + 1,
+        }
+    }
+
+    /// Record the page holding `addr` if `mem` offers it for direct reads.
+    pub(crate) fn fill(&mut self, mem: &mut dyn PpcMemory, addr: u32) {
+        if self.epoch.is_none() {
+            return;
+        }
+        let page = addr >> DIRECT_PAGE_SHIFT;
+        let slot = page as usize & (DIRECT_ENTRIES - 1);
+        if self.tags[slot] == page + 1 || self.refused[slot] == page + 1 {
+            return;
+        }
+        match mem.direct_read_page(page) {
+            Some(base) => {
+                self.tags[slot] = page + 1;
+                self.bases[slot] = base as usize;
+            }
+            None => self.refused[slot] = page + 1,
+        }
+    }
+}
+
+/// The table as `PpcCpu` holds it. Generated code and helpers reach it
+/// through a raw pointer that stays valid across sessions, so the CPU never
+/// forms a `&mut` to it while one may be in use.
+#[derive(Default)]
+pub(crate) struct DirectTable(Box<std::cell::UnsafeCell<DirectTlb>>);
+
+// SAFETY: the table is only written through `&mut PpcCpu` (a session, or a
+// chaining decision inside one); shared references only read it (`Clone`,
+// `Debug`), so sharing a `&PpcCpu` across threads cannot race.
+unsafe impl Sync for DirectTable {}
+
+impl DirectTable {
+    pub(crate) fn get(&self) -> *mut DirectTlb {
+        self.0.get()
+    }
+}
+
+impl Clone for DirectTable {
+    fn clone(&self) -> Self {
+        // SAFETY: no generated code runs while the CPU is being cloned.
+        Self(Box::new(std::cell::UnsafeCell::new(unsafe {
+            (*self.get()).clone()
+        })))
+    }
+}
+
+impl std::fmt::Debug for DirectTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SAFETY: as for `clone`.
+        unsafe { (*self.get()).fmt(f) }
+    }
+}
