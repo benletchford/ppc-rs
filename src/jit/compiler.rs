@@ -66,6 +66,11 @@ struct Job {
 /// Engine state shared by every [`crate::PpcCpu`] cloned from one another.
 pub(crate) struct JitShared {
     pub(crate) config: PpcJitConfig,
+    /// Whether code is compiled for `PpcAlignmentPolicy::EmulateData`, whose
+    /// direct accesses need not be aligned. Code compiled for it would skip
+    /// `Trap`'s alignment exceptions, so a CPU whose policy differs restarts
+    /// the engine (see `PpcCpu::jit_follow_alignment_policy`).
+    pub(crate) emulate_data: bool,
     compiler: Arc<Mutex<Compiler>>,
     queue: Option<Arc<Queue>>,
 }
@@ -123,11 +128,12 @@ fn lock(compiler: &Mutex<Compiler>) -> std::sync::MutexGuard<'_, Compiler> {
 }
 
 impl JitShared {
-    pub(crate) fn new(config: PpcJitConfig) -> Result<Self, String> {
-        let compiler = Arc::new(Mutex::new(Compiler::new(&config)?));
+    pub(crate) fn new(config: PpcJitConfig, emulate_data: bool) -> Result<Self, String> {
+        let compiler = Arc::new(Mutex::new(Compiler::new(&config, emulate_data)?));
         let queue = config.background.then(|| Self::spawn(&compiler)).flatten();
         Ok(Self {
             config,
+            emulate_data,
             compiler,
             queue,
         })
@@ -224,10 +230,11 @@ struct Compiler {
     block_dump: Option<jitdump::Writer>,
     region_dump: Option<jitdump::Writer>,
     signature: Signature,
+    emulate_data: bool,
 }
 
 impl Compiler {
-    fn new(config: &PpcJitConfig) -> Result<Self, String> {
+    fn new(config: &PpcJitConfig, emulate_data: bool) -> Result<Self, String> {
         let builder = JITBuilder::with_flags(
             &[
                 (
@@ -263,6 +270,7 @@ impl Compiler {
             block_dump,
             region_dump,
             signature,
+            emulate_data,
         })
     }
 
@@ -275,12 +283,13 @@ impl Compiler {
             None
         } else {
             let instrs = listing(pc, words);
+            let emulate_data = self.emulate_data;
             self.compile_uncached(
                 false,
                 &jitdump::block_name(pc),
                 &instrs,
                 |b, call_conv, ptr| {
-                    emit::build(b, call_conv, ptr, pc, words);
+                    emit::build(b, call_conv, ptr, pc, words, emulate_data);
                 },
             )
         };
@@ -308,8 +317,9 @@ impl Compiler {
                 })
                 .collect();
             let name = jitdump::region_name(region[0].0, region.len());
+            let emulate_data = self.emulate_data;
             self.compile_uncached(true, &name, &instrs, |b, call_conv, ptr| {
-                emit::build_region(b, call_conv, ptr, &blocks);
+                emit::build_region(b, call_conv, ptr, &blocks, emulate_data);
             })
         };
         self.regions.insert(region.clone(), code);

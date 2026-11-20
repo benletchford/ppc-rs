@@ -518,6 +518,10 @@ pub struct PpcCpu {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit: Option<std::sync::Arc<jit::JitShared>>,
+    /// Inactive engine and table retained for the opposite alignment policy so
+    /// repeated `Trap`/`EmulateData` switches reuse existing allocations.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    jit_standby: Option<Box<jit::runtime::JitStandby>>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit_stats: PpcJitStats,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -608,6 +612,8 @@ impl PpcCpu {
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit: None,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            jit_standby: None,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit_stats: PpcJitStats::default(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
