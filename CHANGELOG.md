@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.9.0...ppc-v0.9.1) (2026-11-20)
+
+
+### Performance Improvements
+
+* **jit:** read and write misaligned guest data directly when it fits in the page ([#115](https://github.com/benletchford/ppc-rs/issues/115)) ([38c24b5](https://github.com/benletchford/ppc-rs/commit/38c24b5ea8d2c50adddc9f5e082e9bbf4d42bc9c))
+
 ## [0.9.0](https://github.com/benletchford/ppc-rs/compare/ppc-v0.8.1...ppc-v0.9.0) (2026-11-18)
 
 
