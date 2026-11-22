@@ -1367,3 +1367,62 @@ fn repeated_alignment_policy_switches_reuse_compiled_engines_and_match_interpret
     assert!(interpreted[5].0.contains("Alignment"));
     assert_eq!(run(true), interpreted);
 }
+
+#[test]
+fn word_copy_blocks_compile_and_join_hot_regions() {
+    use ppc::PpcMemory;
+    const CODE: u32 = 0x1000;
+    const DATA: u32 = 0x2000;
+    // Block 0: lwz r3, 0(r5); stw r3, 4(r5) (`word_copy` shape, 2 instructions).
+    // Block 1: addi r3, r3, 1; stw r3, 0(r5) (2 instructions).
+    // Block 2: bdnz CODE (loops across the `word_copy` block).
+    let words = [
+        d_form(32, 3, 5, 0),
+        d_form(36, 3, 5, 4),
+        d_form(14, 3, 3, 1),
+        d_form(36, 3, 5, 0),
+        0x4200_fff0, // bdnz -16 -> CODE
+        0x4e80_0020, // blr -> halt_pc = 0
+    ];
+    let run = |jit| {
+        let mut memory = PpcSectionMem::new();
+        memory.add_readonly_region(CODE, words.into_iter().flat_map(u32::to_be_bytes).collect());
+        let mut data = vec![0u8; 4096];
+        data[0..4].copy_from_slice(&10u32.to_be_bytes());
+        memory.add_region(DATA, data);
+
+        let mut cpu = PpcCpu::new();
+        cpu.alignment_policy = PpcAlignmentPolicy::EmulateData;
+        cpu.pc = CODE;
+        cpu.lr = 0;
+        cpu.ctr = 64;
+        cpu.gpr[5] = DATA;
+        if jit {
+            cpu.enable_jit(PpcJitConfig {
+                threshold: 2,
+                hot_threshold: 4,
+                background: false,
+                verify: true,
+                jitdump: false,
+            })
+            .unwrap();
+        }
+        let result = cpu.run_with_imports(&mut memory, 1000, 0, 0, 0, |_, _, _| unreachable!());
+        if jit {
+            let stats = cpu.jit_stats();
+            assert_eq!(stats.blocks_compiled, 3, "{stats:?}");
+            assert!(stats.regions_compiled >= 1, "{stats:?}");
+        }
+        (
+            result,
+            cpu.gpr[3],
+            memory.read_u32_be(DATA),
+            memory.read_u32_be(DATA + 4),
+            cpu.time_base(),
+        )
+    };
+    let expected = run(false);
+    assert_eq!(expected.2, Some(74));
+    assert_eq!(expected.3, Some(73));
+    assert_eq!(run(true), expected);
+}

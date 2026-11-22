@@ -1370,3 +1370,232 @@ fn run_with_imports_cycle_handler_reports_elapsed_cycles() {
     assert_eq!(observed_cycles, Some((3, 0)));
     assert!(matches!(result, PpcRunResult::Halted { cycles: 3, .. }));
 }
+
+#[test]
+fn run_with_imports_cached_cfm_stub_skips_repeat_instruction_fetches_and_revalidates() {
+    struct CountingCfmMemory {
+        inner: PpcSectionMem,
+        instruction_fetches: usize,
+        data_reads: usize,
+        data_writes: usize,
+    }
+
+    impl PpcMemory for CountingCfmMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.data_reads += 1;
+            self.inner.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            self.data_writes += 1;
+            self.inner.write_u8(addr, value)
+        }
+        fn read_u32_be(&mut self, addr: u32) -> Option<u32> {
+            self.data_reads += 1;
+            self.inner.read_u32_be(addr)
+        }
+        fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
+            self.data_writes += 1;
+            self.inner.write_u32_be(addr, value)
+        }
+        fn read_instruction_u32_be(&mut self, addr: u32) -> Option<u32> {
+            self.instruction_fetches += 1;
+            self.inner.read_instruction_u32_be(addr)
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            self.inner.instruction_cache_token(addr)
+        }
+        fn global_instruction_cache_token(&self) -> Option<u64> {
+            self.inner.global_instruction_cache_token()
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            self.inner.code_epoch()
+        }
+        fn direct_read_page(&mut self, page: u32) -> Option<*const u8> {
+            self.inner.direct_read_page(page)
+        }
+        fn direct_read_epoch(&self) -> Option<[u64; 2]> {
+            self.inner.direct_read_epoch()
+        }
+        fn direct_write_page(&mut self, page: u32) -> Option<*mut u8> {
+            self.inner.direct_write_page(page)
+        }
+        fn direct_write_epoch(&self) -> Option<[u64; 4]> {
+            self.inner.direct_write_epoch()
+        }
+    }
+
+    let mut inner = PpcSectionMem::new();
+    let code = cfm_import_stub_words(CFM_TOC_SLOT_DISP)
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    inner.add_readonly_region(CFM_CODE_BASE, code);
+    inner.add_region(CFM_TOC_BASE, vec![0; 0x1000]);
+    inner.add_region(CFM_STACK_BASE, vec![0; 0x1000]);
+    inner.add_region(CFM_TVECTOR, vec![0; 0x1000]);
+    inner
+        .write_u32_be(CFM_TOC_BASE + u32::from(CFM_TOC_SLOT_DISP), CFM_TVECTOR)
+        .unwrap();
+    inner.write_u32_be(CFM_TVECTOR, CFM_TRAP_BASE).unwrap();
+    inner
+        .write_u32_be(CFM_TVECTOR + 4, CFM_IMPORT_RTOC)
+        .unwrap();
+
+    let mut mem = CountingCfmMemory {
+        inner,
+        instruction_fetches: 0,
+        data_reads: 0,
+        data_writes: 0,
+    };
+    let mut cpu = cfm_cpu();
+    let mut calls = 0u32;
+
+    for expected_return in [0x1111_2222u32, 0x3333_4444, 0x5555_6666] {
+        cpu.pc = CFM_CODE_BASE;
+        cpu.lr = CFM_HALT_PC;
+        cpu.gpr[1] = CFM_STACK_BASE;
+        cpu.gpr[2] = CFM_TOC_BASE;
+        let fetches_before = mem.instruction_fetches;
+        let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+            calls += 1;
+            PpcImportAction::Return(expected_return)
+        });
+        assert_eq!(
+            result,
+            PpcRunResult::Halted {
+                pc: CFM_HALT_PC,
+                cycles: 7,
+            }
+        );
+        assert_eq!(cpu.gpr[3], expected_return);
+        if calls > 1 {
+            assert_eq!(
+                mem.instruction_fetches, fetches_before,
+                "cached CFM stub must not refetch immutable stub words"
+            );
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            {
+                assert_eq!(
+                    mem.data_reads, 0,
+                    "direct pages should serve TOC and TVector reads"
+                );
+                assert_eq!(
+                    mem.data_writes, 0,
+                    "direct pages should serve stack RTOC save"
+                );
+            }
+        }
+    }
+    assert_eq!(calls, 3);
+
+    // Overlaying an interior word advances `code_epoch` and invalidates the
+    // cached stub; the next run must refetch and stop dispatching the import.
+    mem.inner
+        .add_readonly_region(CFM_CODE_BASE + 8, 0x6000_0000u32.to_be_bytes().to_vec());
+    reset_cfm_cpu_for_unaccelerated_return(&mut cpu);
+    let fetches_before = mem.instruction_fetches;
+    let result = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(
+        result,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 6,
+        }
+    );
+    assert_eq!(calls, 3);
+    assert!(
+        mem.instruction_fetches > fetches_before,
+        "epoch change must revalidate and refetch the overwritten stub"
+    );
+}
+
+#[test]
+fn run_with_imports_cfm_stub_across_page_boundary_handles_moving_code_epoch() {
+    struct EvictingEpochMemory {
+        inner: PpcSectionMem,
+        epoch: u64,
+        page1_token: Option<u64>,
+        page2_token: Option<u64>,
+    }
+
+    impl PpcMemory for EvictingEpochMemory {
+        fn read_u8(&mut self, addr: u32) -> Option<u8> {
+            self.inner.read_u8(addr)
+        }
+        fn write_u8(&mut self, addr: u32, value: u8) -> Option<()> {
+            self.inner.write_u8(addr, value)
+        }
+        fn instruction_cache_token(&mut self, addr: u32) -> Option<u64> {
+            match addr >> 12 {
+                1 => self.page1_token,
+                2 => {
+                    if self.page1_token.take().is_some() {
+                        // Probing page 2 unprotects page 1 and advances the epoch.
+                        self.epoch += 1;
+                    }
+                    self.page2_token
+                }
+                _ => None,
+            }
+        }
+        fn code_epoch(&self) -> Option<u64> {
+            Some(self.epoch)
+        }
+    }
+
+    const STUB_PC: u32 = 0x1ff0; // 4 words in page 1, 2 words in page 2
+    let mut inner = cfm_data_memory();
+    let code: Vec<u8> = cfm_import_stub_words(CFM_TOC_SLOT_DISP)
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    inner.add_region(STUB_PC, code);
+
+    let mut mem = EvictingEpochMemory {
+        inner,
+        epoch: 10,
+        page1_token: Some(101),
+        page2_token: Some(202),
+    };
+    let mut cpu = cfm_cpu();
+    cpu.pc = STUB_PC;
+    let mut calls = 0u32;
+
+    let first = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0x1234_5678)
+    });
+    assert_eq!(
+        first,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 7,
+        }
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(mem.epoch, 11);
+
+    // Page 1 already had `instruction_cache_token == None` in epoch 11, so a
+    // guest store to `STUB_PC + 20` or `STUB_PC + 4` in page 1 leaves `epoch`
+    // at 11. The torn epoch during stub population must not skip rechecking.
+    mem.write_u32_be(STUB_PC + 4, 0x4e80_0020).unwrap(); // blr in page 1
+    cpu.pc = STUB_PC;
+    cpu.lr = CFM_HALT_PC;
+    cpu.gpr[1] = CFM_STACK_BASE;
+    cpu.gpr[2] = CFM_TOC_BASE;
+    let second = cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+        calls += 1;
+        PpcImportAction::Return(0)
+    });
+    assert_eq!(
+        second,
+        PpcRunResult::Halted {
+            pc: CFM_HALT_PC,
+            cycles: 2,
+        }
+    );
+    assert_eq!(calls, 1);
+}
