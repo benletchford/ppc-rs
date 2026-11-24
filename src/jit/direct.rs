@@ -202,36 +202,6 @@ impl DirectTlb {
         mem.read_u32_be(addr)
     }
 
-    /// Read two consecutive big-endian 32-bit words (`addr` and `addr + 4`),
-    /// sharing one direct-page lookup when all eight bytes fit in one page.
-    ///
-    /// # Safety
-    /// As for [`Self::read_u32_be`].
-    #[inline]
-    pub(crate) unsafe fn read_u32_pair_be<M: PpcMemory + ?Sized>(
-        &mut self,
-        mem: &mut M,
-        addr: u32,
-    ) -> (Option<u32>, Option<u32>) {
-        let offset = (addr as usize) & ((1usize << DIRECT_PAGE_SHIFT) - 1);
-        if offset <= (1usize << DIRECT_PAGE_SHIFT) - 8
-            && let Some(base) = self.read_page_base(mem, addr >> DIRECT_PAGE_SHIFT)
-        {
-            let ptr = (base + offset) as *const u64;
-            // SAFETY: `validate` confirmed the epoch; `offset + 8 <= 4096` keeps
-            // all eight bytes inside the offered 4 KiB page.
-            let pair = u64::from_be(unsafe { ptr.read_unaligned() });
-            return (Some((pair >> 32) as u32), Some(pair as u32));
-        }
-        // SAFETY: upheld by caller.
-        unsafe {
-            (
-                self.read_u32_be(mem, addr),
-                self.read_u32_be(mem, addr.wrapping_add(4)),
-            )
-        }
-    }
-
     /// Write a big-endian 32-bit word via a validated direct-write page when
     /// the word fits inside one 4 KiB page, falling back to `mem.write_u32_be`.
     ///

@@ -133,11 +133,8 @@ impl<M: PpcMemory + ?Sized> DirectStep<'_, M> {
     }
 
     #[inline]
-    fn read_u32_pair_be(&mut self, addr: u32) -> (Option<u32>, Option<u32>) {
-        (
-            self.mem.read_u32_be(addr),
-            self.mem.read_u32_be(addr.wrapping_add(4)),
-        )
+    fn code_epoch(&self) -> Option<u64> {
+        self.mem.code_epoch()
     }
 
     #[inline]
@@ -4817,17 +4814,13 @@ impl PpcCpu {
                 cycles += completed;
                 continue;
             }
-            if import_count > 0
+            let accelerate_stub = import_count > 0
+                && (halt_pc & 3 != 0 || halt_pc.wrapping_sub(pc) >= 24)
+                && trap_base.wrapping_sub(pc) >= 24
+                && self.import_call_stack.is_empty();
+            if accelerate_stub
                 && remaining >= 7
-                && let Some(result) = self.try_cached_cfm_import_stub(
-                    mem,
-                    pc,
-                    trap_base,
-                    import_count,
-                    &mut handler,
-                    &mut cycles,
-                    max_cycles,
-                )
+                && let Some(result) = self.try_cached_cfm_import_stub(mem, pc, &mut cycles)
             {
                 match result {
                     PpcFastImportStubResult::Continue => continue,
@@ -4877,19 +4870,10 @@ impl PpcCpu {
                     return PpcRunResult::FetchFault { pc, cycles };
                 }
             };
-            if import_count > 0
+            if accelerate_stub
                 && max_cycles.saturating_sub(cycles) >= 7
                 && (word & 0xFFFF_0000) == 0x8182_0000
-                && let Some(result) = self.try_fast_cfm_import_stub(
-                    mem,
-                    pc,
-                    word,
-                    trap_base,
-                    import_count,
-                    &mut handler,
-                    &mut cycles,
-                    max_cycles,
-                )
+                && let Some(result) = self.try_fast_cfm_import_stub(mem, pc, word, &mut cycles)
             {
                 match result {
                     PpcFastImportStubResult::Continue => continue,
@@ -4946,21 +4930,13 @@ impl PpcCpu {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn try_cached_cfm_import_stub<M: PpcMemory + ?Sized, F>(
+    fn try_cached_cfm_import_stub<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
         pc: u32,
-        trap_base: u32,
-        import_count: u32,
-        handler: &mut F,
         cycles: &mut u64,
-        max_cycles: u64,
-    ) -> Option<PpcFastImportStubResult>
-    where
-        F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
-    {
+    ) -> Option<PpcFastImportStubResult> {
         let cache_index = Self::cfm_stub_cache_index(pc);
         let slot = self.cfm_stub_cache[cache_index];
         if !slot.valid || slot.pc != pc {
@@ -4994,33 +4970,16 @@ impl PpcCpu {
                     };
             }
         }
-        self.execute_cfm_import_stub(
-            mem,
-            pc,
-            slot.displacement,
-            trap_base,
-            import_count,
-            handler,
-            cycles,
-            max_cycles,
-        )
+        self.execute_cfm_import_stub(mem, pc, slot.displacement, cycles)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_fast_cfm_import_stub<M: PpcMemory + ?Sized, F>(
+    fn try_fast_cfm_import_stub<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
         pc: u32,
         first_word: u32,
-        trap_base: u32,
-        import_count: u32,
-        handler: &mut F,
         cycles: &mut u64,
-        max_cycles: u64,
-    ) -> Option<PpcFastImportStubResult>
-    where
-        F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
-    {
+    ) -> Option<PpcFastImportStubResult> {
         if mem.read_instruction_u32_be(pc.wrapping_add(4))? != 0x9041_0014
             || mem.read_instruction_u32_be(pc.wrapping_add(8))? != 0x800C_0000
             || mem.read_instruction_u32_be(pc.wrapping_add(12))? != 0x804C_0004
@@ -5059,168 +5018,184 @@ impl PpcCpu {
             }
         }
 
-        self.execute_cfm_import_stub(
-            mem,
-            pc,
-            displacement,
-            trap_base,
-            import_count,
-            handler,
-            cycles,
-            max_cycles,
-        )
+        self.execute_cfm_import_stub(mem, pc, displacement, cycles)
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn execute_cfm_import_stub<M: PpcMemory + ?Sized, F>(
+    fn execute_cfm_import_stub<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
         pc: u32,
         displacement: i16,
-        trap_base: u32,
-        import_count: u32,
-        handler: &mut F,
         cycles: &mut u64,
-        max_cycles: u64,
-    ) -> Option<PpcFastImportStubResult>
-    where
-        F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
-    {
+    ) -> Option<PpcFastImportStubResult> {
+        enum CfmStubStep {
+            Done {
+                tvector: u32,
+                entry: u32,
+                rtoc: u32,
+            },
+            ResumeAt {
+                completed: u64,
+                tvector: u32,
+                entry: Option<u32>,
+                rtoc: Option<u32>,
+            },
+            Fault {
+                completed: u64,
+                tvector: Option<u32>,
+                entry: Option<u32>,
+                addr: u32,
+                was_write: bool,
+            },
+        }
+
         let (r1, r2) = (self.gpr[1], self.gpr[2]);
         let toc_slot = r2.wrapping_add(i32::from(displacement) as u32);
         let save_addr = r1.wrapping_add(20);
-        let (tvector, entry, rtoc, off) = {
+        // Accelerate a stable instruction view. An accessor may remap code,
+        // so resume at the next scalar instruction if the epoch moves.
+        let epoch = mem.code_epoch()?;
+        let trap_align = self.alignment_policy == PpcAlignmentPolicy::Trap;
+        if trap_align && (toc_slot | save_addr) & 3 != 0 {
+            return None;
+        }
+        let step = {
             let mut direct = self.cfm_direct_step(mem);
-            let Some(tvector) = direct.read_u32_be(toc_slot) else {
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
+            match direct.read_u32_be(toc_slot) {
+                None => CfmStubStep::Fault {
+                    completed: 0,
+                    tvector: None,
+                    entry: None,
                     addr: toc_slot,
                     was_write: false,
-                    cycles: *cycles,
-                }));
-            };
-            let (entry, rtoc) = direct.read_u32_pair_be(tvector);
-            let Some(entry) = entry else {
-                if direct.write_u32_be(save_addr, r2).is_none() {
-                    return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                        pc,
+                },
+                Some(tvector) if direct.code_epoch() != Some(epoch) => CfmStubStep::ResumeAt {
+                    completed: 1,
+                    tvector,
+                    entry: None,
+                    rtoc: None,
+                },
+                Some(tvector) => match direct.write_u32_be(save_addr, r2) {
+                    None => CfmStubStep::Fault {
+                        completed: 1,
+                        tvector: Some(tvector),
+                        entry: None,
                         addr: save_addr,
                         was_write: true,
-                        cycles: (*cycles).saturating_add(1),
-                    }));
-                }
-                *cycles = cycles.saturating_add(2);
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
-                    addr: tvector,
-                    was_write: false,
-                    cycles: *cycles,
-                }));
-            };
-            let off = entry.wrapping_sub(trap_base);
-            if entry < trap_base || (off & 0x3) != 0 || (off >> 2) >= import_count {
-                return None;
+                    },
+                    Some(())
+                        if direct.code_epoch() != Some(epoch)
+                            || save_addr.wrapping_sub(pc) < 24
+                            || pc.wrapping_sub(save_addr) < 4
+                            || (trap_align && tvector & 3 != 0) =>
+                    {
+                        CfmStubStep::ResumeAt {
+                            completed: 2,
+                            tvector,
+                            entry: None,
+                            rtoc: None,
+                        }
+                    }
+                    Some(()) => match direct.read_u32_be(tvector) {
+                        None => CfmStubStep::Fault {
+                            completed: 2,
+                            tvector: Some(tvector),
+                            entry: None,
+                            addr: tvector,
+                            was_write: false,
+                        },
+                        Some(entry) if direct.code_epoch() != Some(epoch) => {
+                            CfmStubStep::ResumeAt {
+                                completed: 3,
+                                tvector,
+                                entry: Some(entry),
+                                rtoc: None,
+                            }
+                        }
+                        Some(entry) => match direct.read_u32_be(tvector.wrapping_add(4)) {
+                            None => CfmStubStep::Fault {
+                                completed: 3,
+                                tvector: Some(tvector),
+                                entry: Some(entry),
+                                addr: tvector.wrapping_add(4),
+                                was_write: false,
+                            },
+                            Some(rtoc) if direct.code_epoch() != Some(epoch) => {
+                                CfmStubStep::ResumeAt {
+                                    completed: 4,
+                                    tvector,
+                                    entry: Some(entry),
+                                    rtoc: Some(rtoc),
+                                }
+                            }
+                            Some(rtoc) => CfmStubStep::Done {
+                                tvector,
+                                entry,
+                                rtoc,
+                            },
+                        },
+                    },
+                },
             }
-            let Some(rtoc) = rtoc else {
-                if direct.write_u32_be(save_addr, r2).is_none() {
-                    return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                        pc,
-                        addr: save_addr,
-                        was_write: true,
-                        cycles: (*cycles).saturating_add(1),
-                    }));
-                }
-                *cycles = cycles.saturating_add(2);
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
-                    addr: tvector.wrapping_add(4),
-                    was_write: false,
-                    cycles: *cycles,
-                }));
-            };
-            if direct.write_u32_be(save_addr, r2).is_none() {
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
-                    addr: save_addr,
-                    was_write: true,
-                    cycles: (*cycles).saturating_add(1),
-                }));
-            }
-            (tvector, entry, rtoc, off)
         };
-        self.gpr[12] = tvector;
-        self.gpr[0] = entry;
-        self.gpr[2] = rtoc;
-        self.ctr = entry;
-        self.pc = entry;
-        let index = off >> 2;
-        match handler(cycles.saturating_add(6), index, self, mem) {
-            PpcImportAction::Return(value) => {
-                self.gpr[3] = value;
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::ReturnPreserve => {
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::ReturnPreserveWithExtraCycles(extra_cycles) => {
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7).saturating_add(extra_cycles);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::ReturnWithExtraCycles(value, extra_cycles) => {
-                self.gpr[3] = value;
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7).saturating_add(extra_cycles);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::Continue => {
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::Yield(yield_cycles) => {
-                Some(PpcFastImportStubResult::Stop(PpcRunResult::CycleLimit {
-                    cycles: cycles
-                        .saturating_add(7)
-                        .saturating_add(yield_cycles)
-                        .min(max_cycles),
-                }))
-            }
-            PpcImportAction::CallNative {
+        match step {
+            CfmStubStep::Done {
+                tvector,
                 entry,
                 rtoc,
-                return_pc,
-                final_pc,
-                restore_rtoc,
-                return_gpr3,
             } => {
-                self.import_call_stack.push(PpcImportReturnFrame {
-                    return_pc,
-                    final_pc,
-                    restore_rtoc,
-                    return_gpr3,
-                });
-                self.pc = entry;
-                self.lr = return_pc;
+                self.gpr[12] = tvector;
+                self.gpr[0] = entry;
                 self.gpr[2] = rtoc;
-                *cycles = cycles.saturating_add(7);
+                self.ctr = entry;
+                self.pc = entry & !3;
+                self.time_base = self.time_base.wrapping_add(6);
+                *cycles += 6;
                 Some(PpcFastImportStubResult::Continue)
             }
-            PpcImportAction::RaiseException(exception) => {
-                Some(PpcFastImportStubResult::Stop(PpcRunResult::Exception {
-                    pc: entry,
-                    exception,
-                    cycles: (*cycles).saturating_add(6),
+            CfmStubStep::ResumeAt {
+                completed,
+                tvector,
+                entry,
+                rtoc,
+            } => {
+                self.gpr[12] = tvector;
+                if let Some(entry) = entry {
+                    self.gpr[0] = entry;
+                }
+                if let Some(rtoc) = rtoc {
+                    self.gpr[2] = rtoc;
+                }
+                self.pc = pc.wrapping_add((completed as u32) * 4);
+                self.time_base = self.time_base.wrapping_add(completed);
+                *cycles += completed;
+                Some(PpcFastImportStubResult::Continue)
+            }
+            CfmStubStep::Fault {
+                completed,
+                tvector,
+                entry,
+                addr,
+                was_write,
+            } => {
+                if let Some(tvector) = tvector {
+                    self.gpr[12] = tvector;
+                }
+                if let Some(entry) = entry {
+                    self.gpr[0] = entry;
+                }
+                let fault_pc = pc.wrapping_add((completed as u32) * 4);
+                self.pc = fault_pc;
+                self.time_base = self.time_base.wrapping_add(completed);
+                *cycles += completed;
+                Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
+                    pc: fault_pc,
+                    addr,
+                    was_write,
+                    cycles: *cycles,
                 }))
             }
-            PpcImportAction::Halt => Some(PpcFastImportStubResult::Stop(PpcRunResult::Halted {
-                pc: entry,
-                cycles: (*cycles).saturating_add(6),
-            })),
         }
     }
 

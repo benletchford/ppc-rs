@@ -117,9 +117,8 @@ impl<M: PpcMemory + ?Sized> DirectStep<'_, M> {
     }
 
     #[inline]
-    pub(crate) fn read_u32_pair_be(&mut self, addr: u32) -> (Option<u32>, Option<u32>) {
-        // SAFETY: as for `read_u32_be`.
-        unsafe { (*self.tlb).read_u32_pair_be(self.mem, addr) }
+    pub(crate) fn code_epoch(&self) -> Option<u64> {
+        self.mem.code_epoch()
     }
 
     #[inline]

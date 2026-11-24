@@ -1599,3 +1599,95 @@ fn run_with_imports_cfm_stub_across_page_boundary_handles_moving_code_epoch() {
     );
     assert_eq!(calls, 1);
 }
+
+#[test]
+fn cfm_stack_store_precedes_vector_loads_on_cold_and_warm_entry() {
+    let mut reference_mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut reference_cpu = cfm_cpu();
+    reference_cpu.gpr[1] = CFM_TVECTOR + 4 - 20;
+    let mut reference_handler_state = None;
+    for _ in 0..7 {
+        let step = reference_cpu.run_with_imports(
+            &mut reference_mem,
+            1,
+            CFM_HALT_PC,
+            CFM_TRAP_BASE,
+            1,
+            |_, cpu, _| {
+                reference_handler_state = Some((
+                    cpu.gpr[0],
+                    cpu.gpr[2],
+                    cpu.gpr[12],
+                    cpu.ctr,
+                    cpu.time_base(),
+                ));
+                PpcImportAction::ReturnPreserve
+            },
+        );
+        if matches!(step, PpcRunResult::Halted { .. }) {
+            break;
+        }
+    }
+    let expected = reference_handler_state.expect("single-step reference must reach import");
+    assert_eq!(expected.1, CFM_TOC_BASE);
+
+    let mut mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+    let mut cpu = cfm_cpu();
+    for _ in 0..2 {
+        mem.write_u32_be(CFM_TVECTOR + 4, CFM_IMPORT_RTOC).unwrap();
+        cpu.pc = CFM_CODE_BASE;
+        cpu.gpr[2] = CFM_TOC_BASE;
+        cpu.gpr[1] = CFM_TVECTOR + 4 - 20;
+        cpu.set_time_base(0);
+        let mut observed = None;
+        let result =
+            cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, cpu, _| {
+                observed = Some((
+                    cpu.gpr[0],
+                    cpu.gpr[2],
+                    cpu.gpr[12],
+                    cpu.ctr,
+                    cpu.time_base(),
+                ));
+                PpcImportAction::ReturnPreserve
+            });
+        assert_eq!(
+            result,
+            PpcRunResult::Halted {
+                pc: CFM_HALT_PC,
+                cycles: 7,
+            }
+        );
+        assert_eq!(observed, Some(expected));
+        assert_eq!(mem.read_u32_be(CFM_TVECTOR + 4), Some(CFM_TOC_BASE));
+    }
+}
+
+#[test]
+fn cfm_stops_at_each_interior_halt_on_first_visit_and_after_cache_fill() {
+    for instruction in 1..6 {
+        let mut cpu = cfm_cpu();
+        let mut mem = cfm_section_memory(cfm_import_stub_words(CFM_TOC_SLOT_DISP), true);
+        let stop = CFM_CODE_BASE + 4 * instruction;
+        for warmed in [false, true] {
+            if warmed {
+                cpu = cfm_cpu();
+                cpu.run_with_imports(&mut mem, 8, CFM_HALT_PC, CFM_TRAP_BASE, 1, |_, _, _| {
+                    PpcImportAction::ReturnPreserve
+                });
+            }
+            cpu.pc = CFM_CODE_BASE;
+            cpu.gpr[2] = CFM_TOC_BASE;
+            let result = cpu.run_with_imports(&mut mem, 7, stop, CFM_TRAP_BASE, 1, |_, _, _| {
+                panic!("passed interior halt")
+            });
+            assert_eq!(
+                result,
+                PpcRunResult::Halted {
+                    pc: stop,
+                    cycles: u64::from(instruction),
+                }
+            );
+        }
+    }
+}
