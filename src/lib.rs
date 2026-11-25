@@ -4962,12 +4962,10 @@ impl PpcCpu {
                     self.cfm_stub_cache[cache_index].valid = false;
                     return None;
                 }
-                self.cfm_stub_cache[cache_index].epoch =
-                    if epoch0 != 0 && mem.code_epoch().unwrap_or(0) == epoch0 {
-                        epoch0
-                    } else {
-                        0
-                    };
+                if epoch0 == 0 || mem.code_epoch() != Some(epoch0) {
+                    return None;
+                }
+                self.cfm_stub_cache[cache_index].epoch = epoch0;
             }
         }
         self.execute_cfm_import_stub(mem, pc, slot.displacement, cycles)
@@ -4990,33 +4988,24 @@ impl PpcCpu {
         }
 
         let displacement = first_word as u16 as i16;
-        if let Some(tok0) = mem.instruction_cache_token(pc) {
-            let epoch0 = mem.code_epoch().unwrap_or(0);
-            let mut tokens = [tok0; 6];
-            let mut cacheable = true;
-            for (i, out) in tokens.iter_mut().enumerate().skip(1) {
-                if let Some(tok) = mem.instruction_cache_token(pc.wrapping_add(i as u32 * 4)) {
-                    *out = tok;
-                } else {
-                    cacheable = false;
-                    break;
-                }
-            }
-            if cacheable {
-                let epoch = if epoch0 != 0 && mem.code_epoch().unwrap_or(0) == epoch0 {
-                    epoch0
-                } else {
-                    0
-                };
-                self.cfm_stub_cache[Self::cfm_stub_cache_index(pc)] = PpcCfmStubCacheEntry {
-                    pc,
-                    displacement,
-                    valid: true,
-                    epoch,
-                    tokens,
-                };
-            }
+        // A stable epoch alone says nothing about writable, uncacheable
+        // instructions. Guest aliases can change them during the stack store.
+        let first_token = mem.instruction_cache_token(pc)?;
+        let epoch = mem.code_epoch()?;
+        let mut tokens = [first_token; 6];
+        for (i, token) in tokens.iter_mut().enumerate().skip(1) {
+            *token = mem.instruction_cache_token(pc.wrapping_add(i as u32 * 4))?;
         }
+        if epoch == 0 || mem.code_epoch() != Some(epoch) {
+            return None;
+        }
+        self.cfm_stub_cache[Self::cfm_stub_cache_index(pc)] = PpcCfmStubCacheEntry {
+            pc,
+            displacement,
+            valid: true,
+            epoch,
+            tokens,
+        };
 
         self.execute_cfm_import_stub(mem, pc, displacement, cycles)
     }
