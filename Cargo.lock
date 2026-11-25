@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "ppc"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
