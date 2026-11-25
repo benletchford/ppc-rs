@@ -129,6 +129,104 @@ impl DirectTlb {
             None => self.refused[slot] = page + 1,
         }
     }
+
+    #[inline]
+    fn read_page_base<M: PpcMemory + ?Sized>(&mut self, mem: &mut M, page: u32) -> Option<usize> {
+        let slot = page as usize & (DIRECT_ENTRIES - 1);
+        let tag = page + 1;
+        if self.tags[slot] == tag {
+            return Some(self.bases[slot]);
+        }
+        if self.epoch.is_none() || self.refused[slot] == tag {
+            return None;
+        }
+        match mem.direct_read_page(page) {
+            Some(base) => {
+                let base = base as usize;
+                self.tags[slot] = tag;
+                self.bases[slot] = base;
+                Some(base)
+            }
+            None => {
+                self.refused[slot] = tag;
+                None
+            }
+        }
+    }
+
+    #[inline]
+    fn write_page_base<M: PpcMemory + ?Sized>(&mut self, mem: &mut M, page: u32) -> Option<usize> {
+        let slot = page as usize & (DIRECT_ENTRIES - 1);
+        let tag = page + 1;
+        if self.write_tags[slot] == tag {
+            return Some(self.write_bases[slot]);
+        }
+        if self.write_epoch.is_none() || self.write_refused[slot] == tag {
+            return None;
+        }
+        match mem.direct_write_page(page) {
+            Some(base) => {
+                let base = base as usize;
+                self.write_tags[slot] = tag;
+                self.write_bases[slot] = base;
+                Some(base)
+            }
+            None => {
+                self.write_refused[slot] = tag;
+                None
+            }
+        }
+    }
+
+    /// Read a big-endian 32-bit word via a validated direct-read page when the
+    /// word fits inside one 4 KiB page, falling back to `mem.read_u32_be`.
+    ///
+    /// # Safety
+    /// [`Self::validate`] must have been called for `mem` since the last host
+    /// callback that could change `mem.direct_read_epoch()`.
+    #[inline]
+    pub(crate) unsafe fn read_u32_be<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        addr: u32,
+    ) -> Option<u32> {
+        let offset = (addr as usize) & ((1usize << DIRECT_PAGE_SHIFT) - 1);
+        if offset <= (1usize << DIRECT_PAGE_SHIFT) - 4
+            && let Some(base) = self.read_page_base(mem, addr >> DIRECT_PAGE_SHIFT)
+        {
+            let ptr = (base + offset) as *const u32;
+            // SAFETY: `validate` confirmed the epoch; `offset + 4 <= 4096` keeps
+            // all four bytes inside the offered 4 KiB page.
+            return Some(u32::from_be(unsafe { ptr.read_unaligned() }));
+        }
+        mem.read_u32_be(addr)
+    }
+
+    /// Write a big-endian 32-bit word via a validated direct-write page when
+    /// the word fits inside one 4 KiB page, falling back to `mem.write_u32_be`.
+    ///
+    /// # Safety
+    /// [`Self::validate`] must have been called for `mem` since the last host
+    /// callback that could change `mem.direct_write_epoch()`.
+    #[inline]
+    pub(crate) unsafe fn write_u32_be<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        addr: u32,
+        value: u32,
+    ) -> Option<()> {
+        let offset = (addr as usize) & ((1usize << DIRECT_PAGE_SHIFT) - 1);
+        if offset <= (1usize << DIRECT_PAGE_SHIFT) - 4
+            && let Some(base) = self.write_page_base(mem, addr >> DIRECT_PAGE_SHIFT)
+        {
+            let ptr = (base + offset) as *mut u32;
+            // SAFETY: `validate` confirmed the write epoch; `offset + 4 <= 4096`
+            // keeps all four bytes inside the offered writable 4 KiB page.
+            unsafe { ptr.write_unaligned(value.to_be()) };
+            return Some(());
+        }
+        mem.write_u32_be(addr, value)
+    }
 }
 
 /// The table as `PpcCpu` holds it. Generated code and helpers reach it

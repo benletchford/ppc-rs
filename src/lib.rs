@@ -79,7 +79,19 @@ type PpcDecodeCacheEntry = Option<(u32, Result<PpcInstr, PpcDecodeError>)>;
 const PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES: usize = 32768;
 const PPC_BASIC_BLOCK_CACHE_INDEX_MASK: usize = PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES - 1;
 const PPC_BASIC_BLOCK_MAX_INSTRUCTIONS: usize = 16;
+const PPC_CFM_STUB_CACHE_MAX_ENTRIES: usize = 1024;
+const PPC_CFM_STUB_CACHE_INDEX_MASK: usize = PPC_CFM_STUB_CACHE_MAX_ENTRIES - 1;
 type PpcDecodedInstruction = Result<PpcInstr, PpcDecodeError>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PpcCfmStubCacheEntry {
+    pc: u32,
+    displacement: i16,
+    valid: bool,
+    /// `PpcMemory::code_epoch` under which all six `tokens` matched (`0`: unknown).
+    epoch: u64,
+    tokens: [u64; 6],
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PpcCachedWordCopy {
@@ -106,12 +118,37 @@ impl PpcCachedWordCopy {
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-use jit::runtime::{PpcJitEntry, PpcJitLimits};
+use jit::runtime::{DirectStep, PpcJitEntry, PpcJitLimits};
+
+#[cfg(not(all(feature = "jit", not(target_family = "wasm"))))]
+struct DirectStep<'a, M: PpcMemory + ?Sized> {
+    mem: &'a mut M,
+}
+
+#[cfg(not(all(feature = "jit", not(target_family = "wasm"))))]
+impl<M: PpcMemory + ?Sized> DirectStep<'_, M> {
+    #[inline]
+    fn read_u32_be(&mut self, addr: u32) -> Option<u32> {
+        self.mem.read_u32_be(addr)
+    }
+
+    #[inline]
+    fn code_epoch(&self) -> Option<u64> {
+        self.mem.code_epoch()
+    }
+
+    #[inline]
+    fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
+        self.mem.write_u32_be(addr, value)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PpcBasicBlockCacheEntry {
     start_pc: u32,
     memory_token: u64,
+    /// `PpcMemory::code_epoch` under which `memory_token` last matched (`0`: unknown).
+    epoch: u64,
     words: [u32; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
     decoded: [Option<PpcDecodedInstruction>; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS],
     word_copy: Option<PpcCachedWordCopy>,
@@ -516,6 +553,8 @@ pub struct PpcCpu {
 
     basic_block_cache: Box<[Option<PpcBasicBlockCacheEntry>]>,
 
+    cfm_stub_cache: Box<[PpcCfmStubCacheEntry]>,
+
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     jit: Option<std::sync::Arc<jit::JitShared>>,
     /// Inactive engine and table retained for the opposite alignment policy so
@@ -610,6 +649,8 @@ impl PpcCpu {
             import_call_stack: Vec::new(),
             decode_cache: vec![None; PPC_DECODE_CACHE_MAX_ENTRIES].into_boxed_slice(),
             basic_block_cache: vec![None; PPC_BASIC_BLOCK_CACHE_MAX_ENTRIES].into_boxed_slice(),
+            cfm_stub_cache: vec![PpcCfmStubCacheEntry::default(); PPC_CFM_STUB_CACHE_MAX_ENTRIES]
+                .into_boxed_slice(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             jit: None,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -4227,12 +4268,13 @@ impl PpcCpu {
 
     /// Move the cached block at `cache_index` (shown to be unchanged) to
     /// `memory_token`, along with its JIT entry.
-    fn adopt_basic_block_token(&mut self, cache_index: usize, memory_token: u64) {
+    fn adopt_basic_block_token(&mut self, cache_index: usize, memory_token: u64, epoch: u64) {
         let Some(entry) = self.basic_block_cache[cache_index].as_mut() else {
             return;
         };
         let old_token = entry.memory_token;
         entry.memory_token = memory_token;
+        entry.epoch = epoch;
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
             let (start_pc, len) = (entry.start_pc, u32::from(entry.len));
@@ -4263,73 +4305,96 @@ impl PpcCpu {
     ) -> Option<PpcBasicBlockRunResult> {
         let start_pc = self.pc;
         let cache_index = Self::basic_block_cache_index(start_pc);
-        let global_token = mem.global_instruction_cache_token();
-        let global_hit = self.basic_block_cache[cache_index]
-            .as_ref()
-            .is_some_and(|entry| {
-                entry.start_pc == start_pc && global_token == Some(entry.memory_token)
-            });
-        let memory_token = if global_hit {
-            global_token?
-        } else {
-            mem.instruction_cache_token(start_pc)?
-        };
-        let cache_hit = global_hit
-            || self.basic_block_cache[cache_index]
+        let code_epoch = mem.code_epoch().unwrap_or(0);
+        let epoch_hit = code_epoch != 0
+            && self.basic_block_cache[cache_index]
+                .as_ref()
+                .is_some_and(|entry| entry.start_pc == start_pc && entry.epoch == code_epoch);
+        if !epoch_hit {
+            let global_token = mem.global_instruction_cache_token();
+            let global_hit = self.basic_block_cache[cache_index]
                 .as_ref()
                 .is_some_and(|entry| {
-                    entry.start_pc == start_pc && entry.memory_token == memory_token
+                    entry.start_pc == start_pc && global_token == Some(entry.memory_token)
                 });
-
-        if !cache_hit {
-            let mut words = [0; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
-            let mut decoded = [None; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
-            let mut len = 0usize;
-            let mut pc = start_pc;
-            while len < words.len() && mem.instruction_cache_token(pc) == Some(memory_token) {
-                let Some(word) = mem.read_instruction_u32_be(pc) else {
-                    break;
-                };
-                if import_count > 0 && (word & 0xffff_0000) == 0x8182_0000 {
-                    break;
-                }
-                words[len] = word;
-                decoded[len] = (!Self::fast_instruction(word)).then(|| decode(word));
-                len += 1;
-                if Self::instruction_ends_basic_block(word)
-                    || Self::instruction_may_write_memory(word)
-                {
-                    break;
-                }
-                pc = pc.wrapping_add(4);
-            }
-            if len == 0 {
-                return None;
-            }
-            // A write elsewhere in the page renewed its token: if the block
-            // is unchanged, keep the entry (and everything derived from it).
-            let unchanged = self.basic_block_cache[cache_index]
-                .as_ref()
-                .is_some_and(|entry| {
-                    entry.start_pc == start_pc
-                        && usize::from(entry.len) == len
-                        && entry.words[..len] == words[..len]
-                });
-            if unchanged {
-                #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-                jit::diag::count(jit::diag::Event::TokenAdopted);
-                self.adopt_basic_block_token(cache_index, memory_token);
+            let memory_token = if global_hit {
+                global_token?
             } else {
-                self.basic_block_cache[cache_index] = Some(PpcBasicBlockCacheEntry {
-                    start_pc,
-                    memory_token,
-                    words,
-                    decoded,
-                    word_copy: (len == 2)
-                        .then(|| PpcCachedWordCopy::from_words(words[0], words[1]))
-                        .flatten(),
-                    len: len as u8,
-                });
+                mem.instruction_cache_token(start_pc)?
+            };
+            let epoch0 = mem.code_epoch().unwrap_or(0);
+            let cache_hit = global_hit
+                || self.basic_block_cache[cache_index]
+                    .as_ref()
+                    .is_some_and(|entry| {
+                        entry.start_pc == start_pc && entry.memory_token == memory_token
+                    });
+
+            if cache_hit {
+                if let Some(entry) = self.basic_block_cache[cache_index].as_mut() {
+                    entry.epoch = epoch0;
+                }
+            } else {
+                let mut words = [0; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
+                let mut decoded = [None; PPC_BASIC_BLOCK_MAX_INSTRUCTIONS];
+                let mut len = 0usize;
+                let mut pc = start_pc;
+                while len < words.len()
+                    && (len == 0 || mem.instruction_cache_token(pc) == Some(memory_token))
+                {
+                    let Some(word) = mem.read_instruction_u32_be(pc) else {
+                        break;
+                    };
+                    if import_count > 0 && (word & 0xffff_0000) == 0x8182_0000 {
+                        break;
+                    }
+                    words[len] = word;
+                    decoded[len] = (!Self::fast_instruction(word)).then(|| decode(word));
+                    len += 1;
+                    if Self::instruction_ends_basic_block(word)
+                        || Self::instruction_may_write_memory(word)
+                    {
+                        break;
+                    }
+                    pc = pc.wrapping_add(4);
+                }
+                if len == 0 {
+                    return None;
+                }
+                // A later `instruction_cache_token` probe (for example across a
+                // page boundary) may have moved `code_epoch` and invalidated the
+                // start page's token; only record `epoch0` when it held steady.
+                let epoch = if epoch0 != 0 && mem.code_epoch().unwrap_or(0) == epoch0 {
+                    epoch0
+                } else {
+                    0
+                };
+                // A write elsewhere in the page renewed its token: if the block
+                // is unchanged, keep the entry (and everything derived from it).
+                let unchanged = self.basic_block_cache[cache_index]
+                    .as_ref()
+                    .is_some_and(|entry| {
+                        entry.start_pc == start_pc
+                            && usize::from(entry.len) == len
+                            && entry.words[..len] == words[..len]
+                    });
+                if unchanged {
+                    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+                    jit::diag::count(jit::diag::Event::TokenAdopted);
+                    self.adopt_basic_block_token(cache_index, memory_token, epoch);
+                } else {
+                    self.basic_block_cache[cache_index] = Some(PpcBasicBlockCacheEntry {
+                        start_pc,
+                        memory_token,
+                        epoch,
+                        words,
+                        decoded,
+                        word_copy: (len == 2)
+                            .then(|| PpcCachedWordCopy::from_words(words[0], words[1]))
+                            .flatten(),
+                        len: len as u8,
+                    });
+                }
             }
         }
 
@@ -4350,6 +4415,24 @@ impl PpcCpu {
         }
         if import_count > 0 {
             stop_before = stop_before.min(special_index(trap_base).unwrap_or(block_len));
+        }
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        if stop_before == block_len
+            && max_cycles >= block_len as u64
+            && let Some(result) = self.run_jit_block(
+                mem,
+                cache_index,
+                block_len,
+                PpcJitLimits {
+                    max_cycles,
+                    halt_pc,
+                    trap_base,
+                    import_count,
+                    chain,
+                },
+            )
+        {
+            return Some(result);
         }
         if stop_before >= 2
             && max_cycles >= 2
@@ -4416,24 +4499,6 @@ impl PpcCpu {
             self.pc = start_pc.wrapping_add(8);
             self.time_base = self.time_base.wrapping_add(1);
             return Some(PpcBasicBlockRunResult::Advanced(2));
-        }
-        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-        if stop_before == block_len
-            && max_cycles >= block_len as u64
-            && let Some(result) = self.run_jit_block(
-                mem,
-                cache_index,
-                block_len,
-                PpcJitLimits {
-                    max_cycles,
-                    halt_pc,
-                    trap_base,
-                    import_count,
-                    chain,
-                },
-            )
-        {
-            return Some(result);
         }
         let mut completed = 0u64;
         let mut write_observer = PpcNoopMemoryWriteObserver;
@@ -4749,6 +4814,19 @@ impl PpcCpu {
                 cycles += completed;
                 continue;
             }
+            let accelerate_stub = import_count > 0
+                && (halt_pc & 3 != 0 || halt_pc.wrapping_sub(pc) >= 24)
+                && trap_base.wrapping_sub(pc) >= 24
+                && self.import_call_stack.is_empty();
+            if accelerate_stub
+                && remaining >= 7
+                && let Some(result) = self.try_cached_cfm_import_stub(mem, pc, &mut cycles)
+            {
+                match result {
+                    PpcFastImportStubResult::Continue => continue,
+                    PpcFastImportStubResult::Stop(result) => return result,
+                }
+            }
             if let Some(block_result) =
                 self.run_cached_basic_block(mem, remaining, halt_pc, trap_base, import_count, chain)
             {
@@ -4792,19 +4870,10 @@ impl PpcCpu {
                     return PpcRunResult::FetchFault { pc, cycles };
                 }
             };
-            if import_count > 0
+            if accelerate_stub
                 && max_cycles.saturating_sub(cycles) >= 7
                 && (word & 0xFFFF_0000) == 0x8182_0000
-                && let Some(result) = self.try_fast_cfm_import_stub(
-                    mem,
-                    pc,
-                    word,
-                    trap_base,
-                    import_count,
-                    &mut handler,
-                    &mut cycles,
-                    max_cycles,
-                )
+                && let Some(result) = self.try_fast_cfm_import_stub(mem, pc, word, &mut cycles)
             {
                 match result {
                     PpcFastImportStubResult::Continue => continue,
@@ -4841,24 +4910,74 @@ impl PpcCpu {
         PpcRunResult::CycleLimit { cycles }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_fast_cfm_import_stub<M: PpcMemory + ?Sized, F>(
+    #[inline]
+    fn cfm_stub_cache_index(pc: u32) -> usize {
+        (((pc >> 2) ^ (pc >> 12)) as usize) & PPC_CFM_STUB_CACHE_INDEX_MASK
+    }
+
+    #[inline]
+    fn cfm_direct_step<'a, M: PpcMemory + ?Sized>(
+        &'a mut self,
+        mem: &'a mut M,
+    ) -> DirectStep<'a, M> {
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        {
+            self.direct_step(mem)
+        }
+        #[cfg(not(all(feature = "jit", not(target_family = "wasm"))))]
+        {
+            DirectStep { mem }
+        }
+    }
+
+    #[inline]
+    fn try_cached_cfm_import_stub<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        pc: u32,
+        cycles: &mut u64,
+    ) -> Option<PpcFastImportStubResult> {
+        let cache_index = Self::cfm_stub_cache_index(pc);
+        let slot = self.cfm_stub_cache[cache_index];
+        if !slot.valid || slot.pc != pc {
+            return None;
+        }
+        let code_epoch = mem.code_epoch().unwrap_or(0);
+        if code_epoch == 0 || slot.epoch != code_epoch {
+            if mem
+                .global_instruction_cache_token()
+                .is_some_and(|tok| slot.tokens == [tok; 6])
+            {
+                self.cfm_stub_cache[cache_index].epoch = code_epoch;
+            } else {
+                if mem.instruction_cache_token(pc) != Some(slot.tokens[0]) {
+                    self.cfm_stub_cache[cache_index].valid = false;
+                    return None;
+                }
+                let epoch0 = mem.code_epoch().unwrap_or(0);
+                if !(1..6usize).all(|i| {
+                    mem.instruction_cache_token(pc.wrapping_add(i as u32 * 4))
+                        == Some(slot.tokens[i])
+                }) {
+                    self.cfm_stub_cache[cache_index].valid = false;
+                    return None;
+                }
+                if epoch0 == 0 || mem.code_epoch() != Some(epoch0) {
+                    return None;
+                }
+                self.cfm_stub_cache[cache_index].epoch = epoch0;
+            }
+        }
+        self.execute_cfm_import_stub(mem, pc, slot.displacement, cycles)
+    }
+
+    fn try_fast_cfm_import_stub<M: PpcMemory + ?Sized>(
         &mut self,
         mem: &mut M,
         pc: u32,
         first_word: u32,
-        trap_base: u32,
-        import_count: u32,
-        handler: &mut F,
         cycles: &mut u64,
-        max_cycles: u64,
-    ) -> Option<PpcFastImportStubResult>
-    where
-        F: FnMut(u64, u32, &mut PpcCpu, &mut M) -> PpcImportAction,
-    {
-        // Recheck the complete instruction-view pattern on every entry.
-        // Writable code, newer overlays, and a different memory object can
-        // all preserve the first word while changing any trailing word.
+    ) -> Option<PpcFastImportStubResult> {
         if mem.read_instruction_u32_be(pc.wrapping_add(4))? != 0x9041_0014
             || mem.read_instruction_u32_be(pc.wrapping_add(8))? != 0x800C_0000
             || mem.read_instruction_u32_be(pc.wrapping_add(12))? != 0x804C_0004
@@ -4869,139 +4988,203 @@ impl PpcCpu {
         }
 
         let displacement = first_word as u16 as i16;
-        let toc_slot = self.gpr[2].wrapping_add(i32::from(displacement) as u32);
-        let Some(tvector) = mem.read_u32_be(toc_slot) else {
-            return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                pc,
-                addr: toc_slot,
-                was_write: false,
-                cycles: *cycles,
-            }));
-        };
-        let entry = mem.read_u32_be(tvector);
-        let rtoc = mem.read_u32_be(tvector.wrapping_add(4));
-        let Some(entry) = entry else {
-            let save_addr = self.gpr[1].wrapping_add(20);
-            if mem.write_u32_be(save_addr, self.gpr[2]).is_none() {
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
-                    addr: save_addr,
-                    was_write: true,
-                    cycles: (*cycles).saturating_add(1),
-                }));
-            }
-            *cycles = cycles.saturating_add(2);
-            return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                pc,
-                addr: tvector,
-                was_write: false,
-                cycles: *cycles,
-            }));
-        };
-        let off = entry.wrapping_sub(trap_base);
-        if entry < trap_base || (off & 0x3) != 0 || (off >> 2) >= import_count {
+        // A stable epoch alone says nothing about writable, uncacheable
+        // instructions. Guest aliases can change them during the stack store.
+        let first_token = mem.instruction_cache_token(pc)?;
+        let epoch = mem.code_epoch()?;
+        let mut tokens = [first_token; 6];
+        for (i, token) in tokens.iter_mut().enumerate().skip(1) {
+            *token = mem.instruction_cache_token(pc.wrapping_add(i as u32 * 4))?;
+        }
+        if epoch == 0 || mem.code_epoch() != Some(epoch) {
             return None;
         }
-        let Some(rtoc) = rtoc else {
-            let save_addr = self.gpr[1].wrapping_add(20);
-            if mem.write_u32_be(save_addr, self.gpr[2]).is_none() {
-                return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                    pc,
-                    addr: save_addr,
-                    was_write: true,
-                    cycles: (*cycles).saturating_add(1),
-                }));
-            }
-            *cycles = cycles.saturating_add(2);
-            return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                pc,
-                addr: tvector.wrapping_add(4),
-                was_write: false,
-                cycles: *cycles,
-            }));
+        self.cfm_stub_cache[Self::cfm_stub_cache_index(pc)] = PpcCfmStubCacheEntry {
+            pc,
+            displacement,
+            valid: true,
+            epoch,
+            tokens,
         };
 
-        let save_addr = self.gpr[1].wrapping_add(20);
-        if mem.write_u32_be(save_addr, self.gpr[2]).is_none() {
-            return Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
-                pc,
-                addr: save_addr,
-                was_write: true,
-                cycles: (*cycles).saturating_add(1),
-            }));
+        self.execute_cfm_import_stub(mem, pc, displacement, cycles)
+    }
+
+    #[inline]
+    fn execute_cfm_import_stub<M: PpcMemory + ?Sized>(
+        &mut self,
+        mem: &mut M,
+        pc: u32,
+        displacement: i16,
+        cycles: &mut u64,
+    ) -> Option<PpcFastImportStubResult> {
+        enum CfmStubStep {
+            Done {
+                tvector: u32,
+                entry: u32,
+                rtoc: u32,
+            },
+            ResumeAt {
+                completed: u64,
+                tvector: u32,
+                entry: Option<u32>,
+                rtoc: Option<u32>,
+            },
+            Fault {
+                completed: u64,
+                tvector: Option<u32>,
+                entry: Option<u32>,
+                addr: u32,
+                was_write: bool,
+            },
         }
-        self.gpr[12] = tvector;
-        self.gpr[0] = entry;
-        self.gpr[2] = rtoc;
-        self.ctr = entry;
-        self.pc = entry;
-        let index = off >> 2;
-        match handler(cycles.saturating_add(6), index, self, mem) {
-            PpcImportAction::Return(value) => {
-                self.gpr[3] = value;
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
+
+        let (r1, r2) = (self.gpr[1], self.gpr[2]);
+        let toc_slot = r2.wrapping_add(i32::from(displacement) as u32);
+        let save_addr = r1.wrapping_add(20);
+        // Accelerate a stable instruction view. An accessor may remap code,
+        // so resume at the next scalar instruction if the epoch moves.
+        let epoch = mem.code_epoch()?;
+        let trap_align = self.alignment_policy == PpcAlignmentPolicy::Trap;
+        if trap_align && (toc_slot | save_addr) & 3 != 0 {
+            return None;
+        }
+        let step = {
+            let mut direct = self.cfm_direct_step(mem);
+            match direct.read_u32_be(toc_slot) {
+                None => CfmStubStep::Fault {
+                    completed: 0,
+                    tvector: None,
+                    entry: None,
+                    addr: toc_slot,
+                    was_write: false,
+                },
+                Some(tvector) if direct.code_epoch() != Some(epoch) => CfmStubStep::ResumeAt {
+                    completed: 1,
+                    tvector,
+                    entry: None,
+                    rtoc: None,
+                },
+                Some(tvector) => match direct.write_u32_be(save_addr, r2) {
+                    None => CfmStubStep::Fault {
+                        completed: 1,
+                        tvector: Some(tvector),
+                        entry: None,
+                        addr: save_addr,
+                        was_write: true,
+                    },
+                    Some(())
+                        if direct.code_epoch() != Some(epoch)
+                            || save_addr.wrapping_sub(pc) < 24
+                            || pc.wrapping_sub(save_addr) < 4
+                            || (trap_align && tvector & 3 != 0) =>
+                    {
+                        CfmStubStep::ResumeAt {
+                            completed: 2,
+                            tvector,
+                            entry: None,
+                            rtoc: None,
+                        }
+                    }
+                    Some(()) => match direct.read_u32_be(tvector) {
+                        None => CfmStubStep::Fault {
+                            completed: 2,
+                            tvector: Some(tvector),
+                            entry: None,
+                            addr: tvector,
+                            was_write: false,
+                        },
+                        Some(entry) if direct.code_epoch() != Some(epoch) => {
+                            CfmStubStep::ResumeAt {
+                                completed: 3,
+                                tvector,
+                                entry: Some(entry),
+                                rtoc: None,
+                            }
+                        }
+                        Some(entry) => match direct.read_u32_be(tvector.wrapping_add(4)) {
+                            None => CfmStubStep::Fault {
+                                completed: 3,
+                                tvector: Some(tvector),
+                                entry: Some(entry),
+                                addr: tvector.wrapping_add(4),
+                                was_write: false,
+                            },
+                            Some(rtoc) if direct.code_epoch() != Some(epoch) => {
+                                CfmStubStep::ResumeAt {
+                                    completed: 4,
+                                    tvector,
+                                    entry: Some(entry),
+                                    rtoc: Some(rtoc),
+                                }
+                            }
+                            Some(rtoc) => CfmStubStep::Done {
+                                tvector,
+                                entry,
+                                rtoc,
+                            },
+                        },
+                    },
+                },
             }
-            PpcImportAction::ReturnPreserve => {
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::ReturnPreserveWithExtraCycles(extra_cycles) => {
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7).saturating_add(extra_cycles);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::ReturnWithExtraCycles(value, extra_cycles) => {
-                self.gpr[3] = value;
-                self.pc = self.lr;
-                *cycles = cycles.saturating_add(7).saturating_add(extra_cycles);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::Continue => {
-                *cycles = cycles.saturating_add(7);
-                Some(PpcFastImportStubResult::Continue)
-            }
-            PpcImportAction::Yield(yield_cycles) => {
-                Some(PpcFastImportStubResult::Stop(PpcRunResult::CycleLimit {
-                    cycles: cycles
-                        .saturating_add(7)
-                        .saturating_add(yield_cycles)
-                        .min(max_cycles),
-                }))
-            }
-            PpcImportAction::CallNative {
+        };
+        match step {
+            CfmStubStep::Done {
+                tvector,
                 entry,
                 rtoc,
-                return_pc,
-                final_pc,
-                restore_rtoc,
-                return_gpr3,
             } => {
-                self.import_call_stack.push(PpcImportReturnFrame {
-                    return_pc,
-                    final_pc,
-                    restore_rtoc,
-                    return_gpr3,
-                });
-                self.pc = entry;
-                self.lr = return_pc;
+                self.gpr[12] = tvector;
+                self.gpr[0] = entry;
                 self.gpr[2] = rtoc;
-                *cycles = cycles.saturating_add(7);
+                self.ctr = entry;
+                self.pc = entry & !3;
+                self.time_base = self.time_base.wrapping_add(6);
+                *cycles += 6;
                 Some(PpcFastImportStubResult::Continue)
             }
-            PpcImportAction::RaiseException(exception) => {
-                Some(PpcFastImportStubResult::Stop(PpcRunResult::Exception {
-                    pc: entry,
-                    exception,
-                    cycles: (*cycles).saturating_add(6),
+            CfmStubStep::ResumeAt {
+                completed,
+                tvector,
+                entry,
+                rtoc,
+            } => {
+                self.gpr[12] = tvector;
+                if let Some(entry) = entry {
+                    self.gpr[0] = entry;
+                }
+                if let Some(rtoc) = rtoc {
+                    self.gpr[2] = rtoc;
+                }
+                self.pc = pc.wrapping_add((completed as u32) * 4);
+                self.time_base = self.time_base.wrapping_add(completed);
+                *cycles += completed;
+                Some(PpcFastImportStubResult::Continue)
+            }
+            CfmStubStep::Fault {
+                completed,
+                tvector,
+                entry,
+                addr,
+                was_write,
+            } => {
+                if let Some(tvector) = tvector {
+                    self.gpr[12] = tvector;
+                }
+                if let Some(entry) = entry {
+                    self.gpr[0] = entry;
+                }
+                let fault_pc = pc.wrapping_add((completed as u32) * 4);
+                self.pc = fault_pc;
+                self.time_base = self.time_base.wrapping_add(completed);
+                *cycles += completed;
+                Some(PpcFastImportStubResult::Stop(PpcRunResult::MemoryFault {
+                    pc: fault_pc,
+                    addr,
+                    was_write,
+                    cycles: *cycles,
                 }))
             }
-            PpcImportAction::Halt => Some(PpcFastImportStubResult::Stop(PpcRunResult::Halted {
-                pc: entry,
-                cycles: (*cycles).saturating_add(6),
-            })),
         }
     }
 

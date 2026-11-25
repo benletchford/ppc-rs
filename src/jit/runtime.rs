@@ -95,6 +95,39 @@ struct PpcJitRegion {
     blocks: Vec<(u32, u64, Vec<u32>)>,
 }
 
+/// Validated direct-page view over `mem` for one unremapped guest step.
+///
+/// Holding `&'a mut PpcCpu` (via `_owner`) and `&'a mut M` prevents concurrent
+/// `DirectTlb` access and prevents host callbacks from remapping `mem` while
+/// direct page pointers are in use.
+pub(crate) struct DirectStep<'a, M: PpcMemory + ?Sized> {
+    tlb: *mut jit::direct::DirectTlb,
+    mem: &'a mut M,
+    _owner: std::marker::PhantomData<&'a mut PpcCpu>,
+}
+
+impl<M: PpcMemory + ?Sized> DirectStep<'_, M> {
+    #[inline]
+    pub(crate) fn read_u32_be(&mut self, addr: u32) -> Option<u32> {
+        // SAFETY: `PpcCpu::direct_step` validated `self.tlb` for `self.mem`,
+        // exclusive borrows prevent concurrent access or host remapping, and
+        // `PpcMemory` forbids `direct_*_page`/`read_*`/`write_*` from moving
+        // direct epochs.
+        unsafe { (*self.tlb).read_u32_be(self.mem, addr) }
+    }
+
+    #[inline]
+    pub(crate) fn code_epoch(&self) -> Option<u64> {
+        self.mem.code_epoch()
+    }
+
+    #[inline]
+    pub(crate) fn write_u32_be(&mut self, addr: u32, value: u32) -> Option<()> {
+        // SAFETY: as for `read_u32_be`.
+        unsafe { (*self.tlb).write_u32_be(self.mem, addr, value) }
+    }
+}
+
 /// Region size limits.
 const PPC_JIT_REGION_MAX_BLOCKS: usize = 32;
 const PPC_JIT_REGION_MAX_INSTRUCTIONS: usize = 512;
@@ -222,6 +255,23 @@ impl PpcCpu {
         self.jit_direct.get()
     }
 
+    /// Validate the direct-access table against `mem` and return a step guard.
+    #[inline]
+    pub(crate) fn direct_step<'a, M: PpcMemory + ?Sized>(
+        &'a mut self,
+        mem: &'a mut M,
+    ) -> DirectStep<'a, M> {
+        let tlb = self.jit_direct.get();
+        // SAFETY: `&mut self` guarantees no generated code or other reference
+        // holds `self.jit_direct` during validation or while `DirectStep` lives.
+        unsafe { (*tlb).validate(&*mem) };
+        DirectStep {
+            tlb,
+            mem,
+            _owner: std::marker::PhantomData,
+        }
+    }
+
     #[inline]
     pub(crate) fn jit_table_index(pc: u32) -> usize {
         ((pc >> 2) as usize) & (PPC_JIT_TABLE_ENTRIES - 1)
@@ -250,11 +300,9 @@ impl PpcCpu {
         let jit = self.jit.as_ref()?;
         let hot_threshold = jit.config.hot_threshold;
         let entry = self.basic_block_cache[cache_index].as_ref()?;
-        if entry.word_copy.is_some() {
-            return None;
-        }
         // The caller validated this entry's token just now.
-        let (start_pc, memory_token) = (entry.start_pc, entry.memory_token);
+        let (start_pc, memory_token, entry_epoch) =
+            (entry.start_pc, entry.memory_token, entry.epoch);
         let index = Self::jit_table_index(start_pc);
         let slot = self.jit_table.get_mut(index)?;
         if slot.start_pc != start_pc
@@ -316,7 +364,7 @@ impl PpcCpu {
         let block_end = start_pc.wrapping_add(block_len as u32 * 4);
         let epoch = mem.code_epoch().unwrap_or(0);
         let mut first = slot.block_code;
-        slot.epoch = epoch;
+        slot.epoch = entry_epoch;
         if let Some(region) = slot.region.as_deref_mut()
             && region.epoch != epoch
         {
@@ -572,18 +620,24 @@ impl PpcCpu {
         let Some(now) = mem.instruction_cache_token(pc) else {
             return false;
         };
+        let epoch0 = mem.code_epoch().unwrap_or(0);
         let slot = &self.jit_table[index];
         let Some(words) = slot.words.as_deref() else {
             return false;
         };
         let same = words.iter().enumerate().all(|(offset, &word)| {
             let at = pc.wrapping_add(offset as u32 * 4);
-            mem.instruction_cache_token(at) == Some(now)
+            (offset == 0 || mem.instruction_cache_token(at) == Some(now))
                 && mem.read_instruction_u32_be(at) == Some(word)
         });
         if !same {
             return false;
         }
+        let refreshed_epoch = if epoch0 != 0 && mem.code_epoch().unwrap_or(0) == epoch0 {
+            epoch0
+        } else {
+            0
+        };
         let (old, len) = (slot.memory_token, slot.len);
         self.jit_table[index].memory_token = now;
         // Same token, so built from the same words.
@@ -593,6 +647,7 @@ impl PpcCpu {
             && entry.memory_token == old
         {
             entry.memory_token = now;
+            entry.epoch = refreshed_epoch;
         }
         true
     }
