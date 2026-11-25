@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/benletchford/ppc-rs/compare/ppc-v0.9.1...ppc-v0.9.2) (2026-11-25)
+
+
+### Performance Improvements
+
+* cache validated CFM import stubs and JIT-compile word-copy blocks ([#117](https://github.com/benletchford/ppc-rs/issues/117)) ([8774126](https://github.com/benletchford/ppc-rs/commit/87741265441347a3fe8eca5183f81aced97583a0))
+
 ## [0.9.1](https://github.com/benletchford/ppc-rs/compare/ppc-v0.9.0...ppc-v0.9.1) (2026-11-20)
 
 
